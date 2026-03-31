@@ -5764,6 +5764,11 @@ pub struct HeartbeatConfig {
     /// conversation history — just as if the user had sent a message.
     #[serde(default)]
     pub load_session_context: bool,
+    /// Maximum wall-clock seconds allowed for a single agent invocation
+    /// (Phase 1 decision or Phase 2 task execution). `0` disables.
+    /// Default: `600` (10 minutes).
+    #[serde(default = "default_heartbeat_task_timeout")]
+    pub task_timeout_secs: u64,
 }
 
 fn default_heartbeat_interval() -> u32 {
@@ -5786,6 +5791,10 @@ fn default_heartbeat_max_run_history() -> u32 {
     100
 }
 
+fn default_heartbeat_task_timeout() -> u64 {
+    600
+}
+
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
@@ -5803,6 +5812,7 @@ impl Default for HeartbeatConfig {
             deadman_to: None,
             max_run_history: default_heartbeat_max_run_history(),
             load_session_context: false,
+            task_timeout_secs: default_heartbeat_task_timeout(),
         }
     }
 }

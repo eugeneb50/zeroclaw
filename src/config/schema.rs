@@ -13621,6 +13621,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             ..Config::default()
@@ -13654,6 +13655,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             api_key: None,
@@ -13764,6 +13766,7 @@ requires_openai_auth = true
                     azure_openai_api_version: None,
                     api_path: None,
                     max_tokens: None,
+                    ..Default::default()
                 },
             )]),
             ..Config::default()

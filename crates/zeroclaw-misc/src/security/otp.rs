@@ -1,4 +1,4 @@
-use crate::config::OtpConfig;
+use zeroclaw_config::schema::OtpConfig;
 use crate::security::secrets::SecretStore;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -115,7 +115,7 @@ impl OtpValidator {
     }
 
     #[cfg(test)]
-    pub(crate) fn code_for_timestamp(&self, timestamp: u64) -> String {
+    pub fn code_for_timestamp(&self, timestamp: u64) -> String {
         let counter = timestamp / self.config.token_ttl_secs.max(1);
         compute_totp_code(&self.secret, counter)
     }

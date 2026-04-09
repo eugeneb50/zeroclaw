@@ -1,4 +1,4 @@
-use crate::config::EstopConfig;
+use zeroclaw_config::schema::EstopConfig;
 use crate::security::domain_matcher::DomainMatcher;
 use crate::security::otp::OtpValidator;
 use anyhow::{Context, Result};
@@ -300,7 +300,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OtpConfig;
+    use zeroclaw_config::schema::OtpConfig;
     use crate::security::SecretStore;
     use crate::security::otp::OtpValidator;
     use tempfile::tempdir;

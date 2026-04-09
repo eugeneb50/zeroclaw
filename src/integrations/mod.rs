@@ -1,3 +1,6 @@
+
+pub use zeroclaw_misc::integrations::*;
+
 pub mod registry;
 
 use crate::config::Config;

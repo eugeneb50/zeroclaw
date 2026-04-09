@@ -3,7 +3,7 @@
 //! Each audit entry is chained via a Merkle hash: `entry_hash = SHA-256(prev_hash || canonical_json)`.
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
-use crate::config::AuditConfig;
+use zeroclaw_config::schema::AuditConfig;
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;

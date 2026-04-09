@@ -1,6 +1,6 @@
 //! Auto-detection of available security features
 
-use crate::config::{SandboxBackend, SecurityConfig};
+use zeroclaw_config::schema::{SandboxBackend, SecurityConfig};
 use crate::security::traits::Sandbox;
 use std::sync::Arc;
 
@@ -135,7 +135,7 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SandboxConfig, SecurityConfig};
+    use zeroclaw_config::schema::{SandboxConfig, SecurityConfig};
 
     #[test]
     fn detect_best_sandbox_returns_something() {

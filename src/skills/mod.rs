@@ -1,3 +1,6 @@
+
+pub use zeroclaw_misc::skills::*;
+
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use reqwest::Url;

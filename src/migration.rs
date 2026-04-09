@@ -1,3 +1,6 @@
+
+pub use zeroclaw_misc::migration::*;
+
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
 use anyhow::{Context, Result, bail};

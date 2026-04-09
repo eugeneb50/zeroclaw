@@ -3,7 +3,7 @@
 //! Prevents cross-workspace data access and enforces per-workspace
 //! domain allowlists and tool restrictions.
 
-use crate::config::workspace::WorkspaceProfile;
+use zeroclaw_config::workspace::WorkspaceProfile;
 use std::path::Path;
 
 /// Outcome of a workspace boundary check.

@@ -3,6 +3,9 @@
 //! Peripherals extend the agent with physical capabilities. See
 //! `docs/hardware-peripherals-design.md` for the full design.
 
+pub use zeroclaw_misc::peripherals::*;
+
+
 pub mod traits;
 
 #[cfg(feature = "hardware")]

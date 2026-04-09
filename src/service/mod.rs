@@ -1,3 +1,6 @@
+
+pub use zeroclaw_misc::service::*;
+
 use crate::config::Config;
 use anyhow::{Context, Result, bail};
 use std::fs;

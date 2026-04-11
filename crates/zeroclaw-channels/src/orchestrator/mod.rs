@@ -15,7 +15,6 @@
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
 pub mod acp_server;
-pub mod cli;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod media_pipeline;
@@ -63,11 +62,11 @@ pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 pub use crate::link_enricher;
 #[cfg(feature = "whatsapp-web")]
 pub use crate::whatsapp_web::WhatsAppWebChannel;
-pub use cli::CliChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;
 #[cfg(feature = "channel-telegram")]
 pub use telegram::TelegramChannel;
+pub use zeroclaw_api::cli_channel::CliChannel;
 pub use zeroclaw_infra::debounce::MessageDebouncer;
 pub use zeroclaw_infra::session_backend::SessionBackend;
 pub use zeroclaw_infra::session_sqlite::SqliteSessionBackend;

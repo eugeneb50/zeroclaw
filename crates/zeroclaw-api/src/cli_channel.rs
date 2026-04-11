@@ -1,7 +1,7 @@
+use crate::channel::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 /// CLI channel — stdin/stdout, always available, zero deps
 pub struct CliChannel;

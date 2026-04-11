@@ -1281,7 +1281,7 @@ impl Agent {
         println!("Type /quit to exit.\n");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let cli = crate::cli_channel_impl::CliChannel::new();
+        let cli = zeroclaw_api::cli_channel::CliChannel::new();
 
         let listen_handle = tokio::spawn(async move {
             let _ = zeroclaw_api::channel::Channel::listen(&cli, tx).await;

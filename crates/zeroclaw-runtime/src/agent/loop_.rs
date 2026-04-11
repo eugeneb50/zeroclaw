@@ -2574,7 +2574,7 @@ pub async fn run(
     } else {
         println!("🦀 ZeroClaw Interactive Mode");
         println!("Type /help for commands.\n");
-        let cli = crate::cli_channel_impl::CliChannel::new();
+        let cli = zeroclaw_api::cli_channel::CliChannel::new();
 
         // Persistent conversation history across turns
         let mut history = if let Some(path) = session_state_file.as_deref() {

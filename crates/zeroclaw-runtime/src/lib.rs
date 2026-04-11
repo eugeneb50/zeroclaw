@@ -1,6 +1,5 @@
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
-pub mod cli_channel_impl;
 pub mod cli_input;
 pub mod i18n;
 pub mod identity;

@@ -10059,6 +10059,17 @@ impl Config {
             }
         }
 
+        // Providers — fallback reference check
+        if let Some(ref fallback_key) = self.providers.fallback {
+            if !self.providers.models.contains_key(fallback_key) {
+                tracing::warn!(
+                    "providers.fallback references '{}' which does not exist in providers.models; \
+                     provider resolution will fail at runtime",
+                    fallback_key
+                );
+            }
+        }
+
         // Ollama cloud-routing safety checks
         if self
             .providers

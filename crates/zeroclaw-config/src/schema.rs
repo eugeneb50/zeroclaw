@@ -14711,12 +14711,13 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    fn validate_rejects_out_of_range_temperature() {
+    async fn validate_rejects_out_of_range_temperature() {
         let mut config = Config::default();
         config.providers.fallback = Some("test".into());
         config.providers.models.insert(
             "test".into(),
             ModelProviderConfig {
+                name: Some("test-provider".into()),
                 temperature: Some(99.0),
                 ..Default::default()
             },
@@ -14729,12 +14730,13 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    fn validate_rejects_negative_temperature() {
+    async fn validate_rejects_negative_temperature() {
         let mut config = Config::default();
         config.providers.fallback = Some("test".into());
         config.providers.models.insert(
             "test".into(),
             ModelProviderConfig {
+                name: Some("test-provider".into()),
                 temperature: Some(-0.5),
                 ..Default::default()
             },
@@ -14747,12 +14749,13 @@ default_model = "persisted-profile"
     }
 
     #[test]
-    fn validate_accepts_valid_temperature() {
+    async fn validate_accepts_valid_temperature() {
         let mut config = Config::default();
         config.providers.fallback = Some("test".into());
         config.providers.models.insert(
             "test".into(),
             ModelProviderConfig {
+                name: Some("test-provider".into()),
                 temperature: Some(0.7),
                 ..Default::default()
             },

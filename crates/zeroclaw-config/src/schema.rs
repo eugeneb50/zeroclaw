@@ -535,6 +535,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub linkedin: LinkedInConfig,
 
+    /// Herdr terminal workspace manager integration (`[herdr]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Integrations"]
+    pub herdr: HerdrConfig,
+
     /// Standalone image generation tool configuration (`[image_gen]`).
     #[serde(default)]
     #[nested]
@@ -7514,6 +7520,52 @@ impl Default for LinkedInConfig {
 
 fn default_linkedin_api_version() -> String {
     "202602".to_string()
+}
+
+/// Herdr terminal workspace manager integration configuration (`[herdr]`).
+///
+/// When `enabled = true`, the agent reports its state (working/idle/blocked)
+/// to a running herdr instance via Unix socket. Requires herdr to be running
+/// and the agent to be spawned from within a herdr pane (which sets
+/// `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` environment variables).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "herdr"]
+pub struct HerdrConfig {
+    /// Enable herdr integration.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Automatically run `herdr integration install zeroclaw` when enabling.
+    #[serde(default = "default_herdr_auto_install")]
+    pub auto_install: bool,
+
+    /// Override herdr socket path (default: $HERDR_SOCKET_PATH from env).
+    #[serde(default)]
+    pub socket_path: String,
+
+    /// Debounce interval in milliseconds for state reports.
+    #[serde(default = "default_herdr_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+fn default_herdr_auto_install() -> bool {
+    true
+}
+
+fn default_herdr_debounce_ms() -> u64 {
+    500
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_install: default_herdr_auto_install(),
+            socket_path: String::new(),
+            debounce_ms: default_herdr_debounce_ms(),
+        }
+    }
 }
 
 /// Plugin system configuration.
@@ -15414,6 +15466,7 @@ impl Default for Config {
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            herdr: HerdrConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
@@ -20766,6 +20819,7 @@ auto_save = true
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            herdr: HerdrConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
@@ -21430,6 +21484,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            herdr: HerdrConfig::default(),
             image_gen: ImageGenConfig::default(),
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),

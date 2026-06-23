@@ -1,5 +1,7 @@
 pub mod platform;
 pub mod registry;
+pub mod herdr;
+pub mod herdr_hooks;
 
 use anyhow::Result;
 use zeroclaw_config::schema::Config;

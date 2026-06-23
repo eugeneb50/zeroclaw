@@ -764,6 +764,12 @@ Examples:
         integration_command: IntegrationCommands,
     },
 
+    /// Herdr terminal workspace manager integration
+    Herdr {
+        #[command(subcommand)]
+        herdr_command: commands::herdr::HerdrCommands,
+    },
+
     /// Manage skills (user-defined capabilities)
     Skills {
         #[command(subcommand)]
@@ -4638,6 +4644,10 @@ async fn main() -> Result<()> {
         Commands::Integrations {
             integration_command,
         } => integrations::handle_command(integration_command, &config),
+
+        Commands::Herdr { herdr_command } => {
+            commands::herdr::handle_herdr(herdr_command, &mut config).await
+        }
 
         Commands::Skills { skill_command } => skills::handle_command(skill_command, &config).await,
 

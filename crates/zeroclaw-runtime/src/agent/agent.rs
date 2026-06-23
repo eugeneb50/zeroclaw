@@ -1479,6 +1479,11 @@ impl Agent {
                         config.hooks.builtin.webhook_audit.clone(),
                     )));
                 }
+                if config.herdr.enabled {
+                    runner.register(Box::new(crate::integrations::herdr_hooks::HerdrHook::new(
+                        config.herdr.clone(),
+                    )));
+                }
                 Some(Arc::new(runner))
             } else {
                 None

@@ -50,6 +50,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 rustls-pki-types = "1.14.0"
 schemars = { version = "1.2", optional = true }
+interprocess = "2.4"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"

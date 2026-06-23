@@ -922,7 +922,7 @@ Examples:
         /// Only check for updates, don't install
         #[arg(long)]
         check: bool,
-        /// Skip confirmation prompt
+        /// Install even if the target is not newer (reinstall or downgrade/pin to --version)
         #[arg(long)]
         force: bool,
         /// Target version (default: latest)
@@ -3911,7 +3911,7 @@ async fn main() -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_tx, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -3921,7 +3921,7 @@ async fn main() -> Result<()> {
                                 port,
                                 config,
                                 tx,
-                                reload_tx,
+                                reload_controls,
                                 tui_registry,
                                 Some(canvas_store),
                                 sop_engine,
@@ -4867,15 +4867,22 @@ async fn main() -> Result<()> {
 
         Commands::Update {
             check,
-            force: _force,
+            force,
             version,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
                 if info.is_newer {
                     println!(
-                        "Update available: v{} -> v{}",
-                        info.current_version, info.latest_version
+                        "{}",
+                        ta(
+                            "cli-update-available",
+                            &[
+                                ("current", &info.current_version),
+                                ("latest", &info.latest_version)
+                            ],
+                            "Update available"
+                        )
                     );
                 } else {
                     println!(
@@ -4889,7 +4896,7 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             } else {
-                commands::update::run(version.as_deref()).await
+                commands::update::run(version.as_deref(), force).await
             }
         }
 

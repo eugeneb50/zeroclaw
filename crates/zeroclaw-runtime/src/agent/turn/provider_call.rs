@@ -86,7 +86,9 @@ pub(crate) async fn announce_llm_request(
     let llm_started_at = Instant::now();
 
     // Fire void hook before LLM call
+    eprintln!("[HERDR] fire_llm_input guard: ctx.hooks.is_some()={}", ctx.hooks.is_some());
     if let Some(hooks) = ctx.hooks {
+        eprintln!("[HERDR] calling fire_llm_input");
         hooks.fire_llm_input(history, ctx.model).await;
     }
 

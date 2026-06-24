@@ -750,3 +750,10 @@ cli-bundle-warn-archive = advertencia: falló el archivado del directorio del bu
 cli-bundle-deleted = eliminado skill_bundles.{$alias} (eliminado de {$count} agente(s))
 cli-bundle-warn-move = advertencia: falló el movimiento del directorio del bundle: {$error}
 cli-bundle-renamed = renombrado skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Herdr integration CLI — zeroclaw herdr ──
+cli-herdr-enabled = Herdr integration enabled.
+cli-herdr-disabled = Herdr integration disabled.
+cli-herdr-integrate-hint = Run `zeroclaw herdr integrate` to install the herdr integration asset.
+cli-herdr-installed = Herdr integration 'zeroclaw' installed successfully.
+cli-herdr-uninstalled = Herdr integration 'zeroclaw' uninstalled successfully.

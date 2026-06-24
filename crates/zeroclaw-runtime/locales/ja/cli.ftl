@@ -751,3 +751,10 @@ cli-bundle-deleted = skill_bundles.{$alias} を削除しました（{$count} 件
 cli-bundle-warn-move = 警告: バンドルディレクトリの移動に失敗しました: {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} にリネームしました
 cli-onboard-about = ワークスペースと設定を初期化
+
+# ── Herdr integration CLI — zeroclaw herdr ──
+cli-herdr-enabled = Herdr integration enabled.
+cli-herdr-disabled = Herdr integration disabled.
+cli-herdr-integrate-hint = Run `zeroclaw herdr integrate` to install the herdr integration asset.
+cli-herdr-installed = Herdr integration 'zeroclaw' installed successfully.
+cli-herdr-uninstalled = Herdr integration 'zeroclaw' uninstalled successfully.

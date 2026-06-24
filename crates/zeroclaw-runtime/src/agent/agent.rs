@@ -1482,24 +1482,30 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
-            .hook_runner(if config.hooks.enabled {
-                let mut runner = crate::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            .hook_runner({
+                eprintln!("[HERDR] hook_runner guard: hooks.enabled={}, herdr.enabled={}", config.hooks.enabled, config.herdr.enabled);
+                let runner: Option<Arc<crate::hooks::HookRunner>>;
+                if config.hooks.enabled {
+                    let mut r = crate::hooks::HookRunner::new();
+                    if config.hooks.builtin.command_logger {
+                        r.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+                    }
+                    if config.hooks.builtin.webhook_audit.enabled {
+                        r.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                            config.hooks.builtin.webhook_audit.clone(),
+                        )));
+                    }
+                    if config.herdr.enabled {
+                        r.register(Box::new(crate::integrations::herdr_hooks::HerdrHook::new(
+                            &config.herdr,
+                        )));
+                    }
+                    runner = Some(Arc::new(r));
+                } else {
+                    runner = None;
                 }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
-                        config.hooks.builtin.webhook_audit.clone(),
-                    )));
-                }
-                if config.herdr.enabled {
-                    runner.register(Box::new(crate::integrations::herdr_hooks::HerdrHook::new(
-                        config.herdr.clone(),
-                    )));
-                }
-                Some(Arc::new(runner))
-            } else {
-                None
+                eprintln!("[HERDR] hook_runner result: {:?}", runner.is_some());
+                runner
             })
             .approval_manager(Some(Arc::new(approval_manager)))
             .build()?;

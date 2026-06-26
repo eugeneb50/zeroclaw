@@ -58,6 +58,30 @@ pub(crate) fn require_auth(
     }
 }
 
+/// Extract and verify the Principal from bearer token.
+/// Returns `Principal::shared_operator()` on success, or an error.
+/// Use this instead of `require_auth` when the handler needs the caller's identity.
+pub(crate) fn require_auth_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<zeroclaw_api::principal::Principal, (StatusCode, Json<serde_json::Value>)> {
+    if !state.pairing.require_pairing() {
+        return Ok(zeroclaw_api::principal::Principal::shared_operator());
+    }
+
+    let token = extract_bearer_token(headers).unwrap_or("");
+    if state.pairing.is_authenticated(token) {
+        Ok(zeroclaw_api::principal::Principal::shared_operator())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ))
+    }
+}
+
 // ── Query parameters ─────────────────────────────────────────────
 
 #[derive(Deserialize)]

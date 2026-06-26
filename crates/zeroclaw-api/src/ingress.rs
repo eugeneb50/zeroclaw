@@ -14,6 +14,7 @@
 //! NOT stamp real identity (phase 2). Phase 1 ships these shapes and the
 //! always-on threading; only `Loop` is reachable under the default policy.
 
+use crate::principal::PrincipalId;
 use serde::{Deserialize, Serialize};
 
 /// Whether an inbound turn originates outside the agent (a transport peer) or
@@ -78,6 +79,10 @@ pub struct IngressContext {
     pub transport: Transport,
     /// The resolved trust class of the sender.
     pub trust: TrustClass,
+    /// Authenticated principal driving this turn. `None` for unauthenticated
+    /// channel webhook paths; `Some(PrincipalId::SHARED_OPERATOR)` for the
+    /// shared-bearer / trusted-local path. Added in RFC #7141 phase 0.
+    pub principal: Option<PrincipalId>,
 }
 
 impl IngressContext {
@@ -96,6 +101,7 @@ impl IngressContext {
             sender: None,
             transport: Transport::Internal,
             trust: TrustClass::Trusted,
+            principal: None,
         }
     }
 }
@@ -130,5 +136,6 @@ mod tests {
         assert_eq!(ctx.transport, Transport::Internal);
         assert!(ctx.sender.is_none());
         assert!(ctx.message_id.is_none());
+        assert!(ctx.principal.is_none());
     }
 }

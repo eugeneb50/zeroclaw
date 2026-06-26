@@ -17,6 +17,7 @@ pub mod a2a;
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
+pub mod auth;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -465,6 +466,9 @@ pub struct AppState {
     /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
     pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
+    /// Authentication provider registry for gateway bearer-token auth.
+    /// Wired with NativeAuthProvider at startup; OIDC provider added by the OIDC milestone.
+    pub auth_registry: Arc<zeroclaw_runtime::security::ProviderRegistry>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
@@ -1547,6 +1551,14 @@ pub async fn run_gateway(
         None
     };
 
+    let auth_registry = {
+        let mut registry = zeroclaw_runtime::security::ProviderRegistry::new();
+        registry.register(Arc::new(zeroclaw_runtime::security::NativeAuthProvider::new(
+            pairing.clone(),
+        )));
+        Arc::new(registry)
+    };
+
     let state = AppState {
         config: config_state,
         model_provider,
@@ -1557,6 +1569,7 @@ pub async fn run_gateway(
         auto_save: config.memory.auto_save,
         webhook_secret_hash,
         pairing,
+        auth_registry,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),

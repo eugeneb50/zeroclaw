@@ -5586,6 +5586,7 @@ mod tests {
                 alias: "gh".to_string(),
             },
             trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+            principal: None,
         })
         .await;
 

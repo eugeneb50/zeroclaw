@@ -76,6 +76,7 @@ mod tests {
                 alias: "gh".to_string(),
             },
             trust: TrustClass::Untrusted,
+            principal: None,
         };
         let policy = IngressPolicy::default();
         assert_eq!(

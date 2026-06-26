@@ -190,7 +190,7 @@ pub struct ToolLoop<'a> {
     /// consumed by the policy front door for the turn's lifetime.
     pub ingress: IngressContext,
     /// Observer metadata: agent alias and turn id, stamped onto every
-    /// turn-level observer event so OTel spans correlate across the loop.
+    /// turn-level observer event so OTel spans correlate across the turn.
     pub agent_alias: Option<&'a str>,
     pub turn_id: &'a str,
 }

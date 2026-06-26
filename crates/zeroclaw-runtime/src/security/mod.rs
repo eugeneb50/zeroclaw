@@ -20,6 +20,7 @@
 
 pub mod audit;
 pub mod auth_provider;
+pub mod native_auth_provider;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
@@ -75,6 +76,8 @@ pub use traits::{NoopSandbox, Sandbox};
 pub use iam_policy::{IamPolicy, PolicyDecision};
 #[allow(unused_imports)]
 pub use nevis::{NevisAuthProvider, NevisIdentity};
+pub use native_auth_provider::NativeAuthProvider;
+pub use auth_provider::ProviderRegistry;
 // Prompt injection defense exports
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};

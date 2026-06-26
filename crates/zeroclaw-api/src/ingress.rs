@@ -104,6 +104,16 @@ impl IngressContext {
             principal: None,
         }
     }
+
+    /// Attach an authenticated principal to an internal envelope.
+    /// Useful when a channel message carries a resolved principal
+    /// (e.g. from gateway auth) but otherwise uses the internal/trusted
+    /// base envelope.
+    #[must_use]
+    pub fn with_principal(mut self, principal: Option<PrincipalId>) -> Self {
+        self.principal = principal;
+        self
+    }
 }
 
 /// The SOP policy layer's disposition for one inbound turn (RFC #6971 §3/§5).

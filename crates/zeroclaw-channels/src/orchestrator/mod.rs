@@ -3978,7 +3978,7 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body, None).await;
         }
     )
     .await;
@@ -4029,6 +4029,7 @@ async fn process_channel_message_body(
     msg: zeroclaw_api::channel::ChannelMessage,
     cancellation_token: CancellationToken,
     channel_composite: String,
+    principal: Option<zeroclaw_api::principal::PrincipalId>,
 ) {
     ::zeroclaw_log::record!(
         INFO,
@@ -4833,7 +4834,8 @@ async fn process_channel_message_body(
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                ingress: zeroclaw_api::ingress::IngressContext::internal()
+                    .with_principal(principal.clone()),
                 agent_alias: Some(ctx.agent_alias.as_str()),
                 turn_id: &turn_id,
             });

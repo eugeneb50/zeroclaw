@@ -6,16 +6,25 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
 use zeroclaw_api::principal::{AuthOutcome, DenyReason, Principal};
 use zeroclaw_runtime::security::auth_provider::Credential;
 
+use super::api::extract_bearer_token;
+
 /// Request extension key for the authenticated Principal.
 #[derive(Clone, Debug)]
 pub struct AuthPrincipal(pub Principal);
+
+impl std::ops::Deref for AuthPrincipal {
+    type Target = Principal;
+    fn deref(&self) -> &Principal {
+        &self.0
+    }
+}
 
 /// Middleware that validates bearer tokens and attaches Principal.
 ///
@@ -33,8 +42,7 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let headers = req.headers().clone();
-    let token = extract_bearer_token(&headers).unwrap_or("");
+    let token = extract_bearer_token(req.headers()).unwrap_or("");
 
     let credential = Credential::Bearer(token.to_string());
     let outcome = registry.resolve(&credential).await;
@@ -74,14 +82,6 @@ pub async fn auth_middleware(
             (status, Json(serde_json::json!({ "error": msg }))).into_response()
         }
     }
-}
-
-/// Extract bearer token from Authorization header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
 /// Helper to extract Principal from request extensions in handlers.

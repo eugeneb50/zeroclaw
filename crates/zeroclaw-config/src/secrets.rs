@@ -512,6 +512,95 @@ fn resolve_onepassword_ref(reference: &str) -> Result<String> {
     Ok(secret)
 }
 
+/// Check if a value is a Vaultwarden (Bitwarden) secret reference.
+fn is_vaultwarden_ref(value: &str) -> bool {
+    value.starts_with("bw://")
+}
+
+/// Validate a Vaultwarden secret reference format.
+/// Expected format: bw://organization-id/collection-id/item-id/field
+fn validate_vaultwarden_ref(reference: &str) -> Result<()> {
+    let path = reference.strip_prefix("bw://").unwrap_or("");
+    let mut segments = path.split('/');
+    // At minimum: org-id/collection-id/item-id/field (4 segments)
+    let has_required_segments = (0..4).all(|_| segments.next().is_some_and(|s| !s.is_empty()));
+    anyhow::ensure!(
+        has_required_segments && segments.all(|segment| !segment.is_empty()),
+        "Invalid Vaultwarden reference \"{reference}\". Expected format: bw://org-id/collection-id/item-id/field"
+    );
+    Ok(())
+}
+
+/// Resolve a Vaultwarden secret reference via the vaultwarden API.
+///
+/// Requires the VAULTWARDEN_TOKEN environment variable to be set with a valid
+/// API token that has read access to the specified organization/collection.
+fn resolve_vaultwarden_ref(reference: &str) -> Result<String> {
+    validate_vaultwarden_ref(reference)?;
+
+    let token = std::env::var("VAULTWARDEN_TOKEN").map_err(|_| {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+            "VAULTWARDEN_TOKEN environment variable not set"
+        );
+        anyhow::Error::msg(
+            "VAULTWARDEN_TOKEN environment variable is required for bw:// secret references"
+        )
+    })?;
+
+    let base_url = std::env::var("VAULTWARDEN_URL").unwrap_or_else(|_| "https://vaultwarden.example.com".to_string());
+
+    let path = reference.strip_prefix("bw://").unwrap_or("");
+    let mut segments = path.split('/');
+    let org_id = segments.next().unwrap();
+    let collection_id = segments.next().unwrap();
+    let item_id = segments.next().unwrap();
+    let field = segments.next().unwrap();
+
+    // Vaultwarden API: GET /api/public/orgs/{orgId}/collections/{collectionId}/items/{itemId}
+    let url = format!(
+        "{base_url}/api/public/orgs/{org_id}/collections/{collection_id}/items/{item_id}",
+        base_url = base_url.trim_end_matches('/')
+    );
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to create HTTP client for Vaultwarden")?;
+
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .context("failed to call Vaultwarden API")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"status": status.as_u16(), "body": body})),
+            "Vaultwarden API request failed"
+        );
+        anyhow::bail!("Vaultwarden API returned {}: {}", status, body);
+    }
+
+    let item: serde_json::Value = response.json().context("failed to parse Vaultwarden response")?;
+
+    // Extract the field from the item
+    let field_value = item.get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Field '{}' not found in Vaultwarden item {}", field, item_id)
+        })?;
+
+    Ok(field_value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

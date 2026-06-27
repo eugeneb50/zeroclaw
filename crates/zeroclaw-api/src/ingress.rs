@@ -42,6 +42,8 @@ pub enum Transport {
     Acp,
     /// RPC socket turn (zerocode path).
     Rpc,
+    /// A2A (Agent-to-Agent) protocol task invocation.
+    A2a,
     /// An internally driven turn with no external transport.
     Internal,
 }

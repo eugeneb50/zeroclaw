@@ -14223,6 +14223,11 @@ pub struct SecurityConfig {
     #[nested]
     pub nevis: NevisConfig,
 
+    /// OIDC authentication provider (authentik, Keycloak, etc.).
+    #[serde(default)]
+    #[nested]
+    pub oidc: OidcConfig,
+
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     #[nested]
@@ -14545,6 +14550,52 @@ impl Default for NevisConfig {
             session_timeout_secs: default_nevis_session_timeout_secs(),
         }
     }
+}
+
+/// OIDC authentication provider configuration (authentik, Keycloak, etc.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.oidc"]
+#[serde(default)]
+pub struct OidcConfig {
+    /// Master switch for the OIDC provider.
+    pub enabled: bool,
+    /// OIDC issuer URL (e.g. "https://auth.example.com/application/o/zeroclaw/").
+    /// Must end with a trailing slash.
+    pub issuer_url: String,
+    /// OAuth2 client ID registered in the IdP.
+    pub client_id: String,
+    /// OAuth2 client secret (optional; encrypted via SecretStore when provided).
+    /// If omitted, the provider operates in public-client mode (no token introspection).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// JWKS endpoint override. If omitted, derived from issuer's
+    /// .well-known/openid-configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// Role-to-agent-alias mapping. Each entry maps an IdP group/role claim
+    /// to a list of agent aliases the authenticated principal may bind.
+    pub role_mapping: Vec<OidcRoleMapping>,
+    /// Whether to require MFA for authentication (checked via amr claim).
+    pub require_mfa: bool,
+    /// JWKS cache TTL in seconds. Default 3600 (1 hour).
+    #[serde(default = "default_oidc_jwks_cache_ttl")]
+    pub jwks_cache_ttl_secs: u64,
+}
+
+fn default_oidc_jwks_cache_ttl() -> u64 {
+    3600
+}
+
+/// Maps an OIDC group/role claim to allowed agent aliases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OidcRoleMapping {
+    /// The group/role claim value to match (case-sensitive).
+    pub group: String,
+    /// Agent aliases this group is entitled to. Use `"*"` for all.
+    pub allowed_aliases: Vec<String>,
 }
 
 /// Maps a Nevis role to ZeroClaw tool permissions and workspace access.

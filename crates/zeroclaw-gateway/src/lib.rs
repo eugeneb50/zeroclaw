@@ -1690,6 +1690,31 @@ pub async fn run_gateway(
         registry.register(Arc::new(zeroclaw_runtime::security::NativeAuthProvider::new(
             pairing.clone(),
         )));
+
+        // Register OIDC provider if enabled
+        if config.security.oidc.enabled {
+            match zeroclaw_runtime::security::OidcAuthProvider::new(&config) {
+                Ok(provider) => {
+                    registry.register(Arc::new(provider));
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                            .with_category(::zeroclaw_log::EventCategory::Auth),
+                        "OIDC authentication provider registered"
+                    );
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "Failed to create OIDC auth provider"
+                    );
+                }
+            }
+        }
+
         Arc::new(registry)
     };
 

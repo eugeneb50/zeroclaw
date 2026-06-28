@@ -152,6 +152,7 @@ use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
+use zeroclaw_runtime::security::auth_provider::{A2aPeerProvider, AuthProvider};
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
@@ -671,6 +672,9 @@ pub struct AppState {
     pub web_dist_dir: Option<std::path::PathBuf>,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// A2A peer authentication provider for inbound agent-to-agent calls.
+    #[cfg(feature = "a2a")]
+    pub a2a_peer_provider: Arc<dyn AuthProvider>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
@@ -1420,6 +1424,14 @@ pub async fn run_gateway(
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
+
+    // ── A2A peer provider ──────────────────────────────────
+    #[cfg(feature = "a2a")]
+    let a2a_peer_provider: Arc<dyn AuthProvider> = {
+        let provider =
+            A2aPeerProvider::from_config(&config.a2a, &config.peer_groups);
+        Arc::new(provider)
+    };
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -1724,6 +1736,8 @@ pub async fn run_gateway(
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
+        #[cfg(feature = "a2a")]
+        a2a_peer_provider,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
@@ -4689,6 +4703,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -5337,6 +5353,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5355,7 +5373,6 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("Prometheus backend not enabled"));
     }
-
     #[cfg(feature = "observability-prometheus")]
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
@@ -5424,6 +5441,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6016,6 +6035,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6121,6 +6142,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6241,6 +6264,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6342,6 +6367,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6461,6 +6488,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6546,6 +6575,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6636,6 +6667,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6733,6 +6766,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6826,6 +6861,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6969,6 +7006,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7806,6 +7845,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -7892,6 +7933,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -8052,6 +8095,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

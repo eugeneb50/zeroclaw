@@ -193,6 +193,9 @@ impl HasPropKind for Vec<crate::multi_agent::AgentAlias> {
 impl HasPropKind for Vec<crate::multi_agent::PeerUsername> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
+impl HasPropKind for crate::multi_agent::A2aPeerAuth {
+    const PROP_KIND: PropKind = PropKind::Enum;
+}
 impl HasPropKind
     for std::collections::BTreeMap<crate::multi_agent::AgentAlias, crate::multi_agent::AccessMode>
 {

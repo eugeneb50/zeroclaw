@@ -49,6 +49,9 @@ pub mod vulnerability;
 #[cfg(feature = "webauthn")]
 pub mod webauthn;
 
+// A2A peer authentication provider
+pub use auth_provider::A2aPeerProvider;
+
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};
 #[allow(unused_imports)]

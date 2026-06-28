@@ -102,6 +102,8 @@ pub enum AuthMethod {
     Peercred,
     /// The existing `PairingGuard` bearer token (continuity / operator bootstrap).
     Native,
+    /// A2A peer bearer/OIDC token resolved via `[a2a.server.peers]`.
+    A2aPeer,
 }
 
 /// The single authenticated subject, produced by an auth provider and consumed by
@@ -151,6 +153,20 @@ pub struct Principal {
     /// today's behaviour).
     #[serde(default)]
     pub allowed_aliases: Vec<AgentAlias>,
+    /// Optional A2A peer-group scope. When set, restricts the A2A discovery
+    /// surface and tool access to the peer-group's declared agents. Source of
+    /// truth: `[a2a.peers.<name>].peer_group` resolved at verify time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_group: Option<String>,
+    /// Config write paths this principal is authorized to mutate. Resolved by
+    /// `IamPolicy` from IdP claims. Source of truth: IamPolicy resolver
+    /// (PR #7142).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_write_paths: Vec<String>,
+    /// Whether this principal holds admin privileges (bypasses most policy
+    /// checks). Source of truth: IamPolicy resolver (PR #7142).
+    #[serde(default)]
+    pub admin: bool,
 }
 
 impl Principal {
@@ -170,6 +186,9 @@ impl Principal {
             mfa_verified: false,
             expires_at: 0,
             allowed_aliases: Vec::new(),
+            peer_group: None,
+            config_write_paths: Vec::new(),
+            admin: false,
         }
     }
 
@@ -192,6 +211,9 @@ impl Principal {
             mfa_verified: false,
             expires_at: 0,
             allowed_aliases: Vec::new(),
+            peer_group: None,
+            config_write_paths: Vec::new(),
+            admin: false,
         }
     }
 
@@ -227,6 +249,27 @@ impl Principal {
     #[must_use]
     pub fn with_allowed_aliases(mut self, allowed_aliases: Vec<AgentAlias>) -> Self {
         self.allowed_aliases = allowed_aliases;
+        self
+    }
+
+    /// Attach the A2A peer-group scope.
+    #[must_use]
+    pub fn with_peer_group(mut self, peer_group: impl Into<String>) -> Self {
+        self.peer_group = Some(peer_group.into());
+        self
+    }
+
+    /// Attach the config write paths this principal may mutate.
+    #[must_use]
+    pub fn with_config_write_paths(mut self, config_write_paths: Vec<String>) -> Self {
+        self.config_write_paths = config_write_paths;
+        self
+    }
+
+    /// Mark this principal as an admin (bypasses most policy checks).
+    #[must_use]
+    pub fn with_admin(mut self, admin: bool) -> Self {
+        self.admin = admin;
         self
     }
 
@@ -317,6 +360,9 @@ mod tests {
             mfa_verified: true,
             expires_at: 0,
             allowed_aliases: vec![AgentAlias("main".to_owned())],
+            peer_group: None,
+            config_write_paths: Vec::new(),
+            admin: false,
         };
         assert!(p.is_authenticated());
     }

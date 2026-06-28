@@ -22,7 +22,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason};
+use sha2::Digest;
+use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason, Principal};
 
 /// A credential presented for verification (the input to the #7141 `initialize`
 /// handshake). Secret material is **redacted** in `Debug` — never log it raw.
@@ -175,6 +176,179 @@ impl ProviderRegistry {
             reason: DenyReason::BadCredential,
         }
     }
+}
+
+// ── A2A Peer Provider ────────────────────────────────────────────────
+
+/// A2A peer authentication provider.
+///
+/// Authenticates A2A callers via bearer token or OIDC token, resolving to
+/// a peer identity that may be bound to a peer group for scoped discovery.
+pub struct A2aPeerProvider {
+    /// Resolved peer configurations from config.
+    peers: std::collections::HashMap<String, zeroclaw_config::multi_agent::A2aPeerConfig>,
+    /// Peer group configurations for resolving allowed aliases.
+    peer_groups: std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>,
+}
+
+impl A2aPeerProvider {
+    /// Create from config's `[a2a.peers]` map and `[peer_groups]` map.
+    pub fn from_config(
+        config: &zeroclaw_config::multi_agent::A2aServerSection,
+        peer_groups: &std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>,
+    ) -> Self {
+        Self {
+            peers: config.peers.clone(),
+            peer_groups: peer_groups.clone(),
+        }
+    }
+
+    /// Create an empty provider with no configured peers — every credential
+    /// is denied. Useful for unit/scaffold tests that don't exercise A2A
+    /// auth, so they can construct `Arc<dyn AuthProvider>` without standing up
+    /// a full `[a2a.peers]` config.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            peers: std::collections::HashMap::new(),
+            peer_groups: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl AuthProvider for A2aPeerProvider {
+    fn name(&self) -> &str {
+        "a2a-peer"
+    }
+
+    fn method(&self) -> AuthMethod {
+        AuthMethod::A2aPeer
+    }
+
+    fn accepts(&self, credential: &Credential) -> bool {
+        matches!(credential, Credential::Bearer(_))
+    }
+
+    async fn verify(&self, credential: &Credential) -> AuthOutcome {
+        let Credential::Bearer(token) = credential else {
+            return AuthOutcome::Denied {
+                reason: DenyReason::BadCredential,
+            };
+        };
+
+        for peer in self.peers.values() {
+            match &peer.auth {
+                zeroclaw_config::multi_agent::A2aPeerAuth::Bearer { token_hash } => {
+                    // Compare SHA-256 hash of presented token
+                    let presented_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+                    if constant_time_eq(&presented_hash, token_hash) {
+                        // Resolve allowed_aliases from peer's peer_group
+                        let allowed_aliases = if let Some(ref pg) = peer.peer_group {
+                            if let Some(group_config) = self.peer_groups.get(pg) {
+                                group_config.agents.iter().map(|a| a.clone()).collect()
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+
+                        let peer_group_value = peer.peer_group.clone().unwrap_or_default();
+
+                        return AuthOutcome::Authenticated(
+                            Principal::new(
+                                zeroclaw_api::principal::PrincipalId::from(peer.name.clone()),
+                                peer.name.clone(),
+                                AuthMethod::A2aPeer,
+                            )
+                            .with_peer_group(peer_group_value)
+                            .with_allowed_aliases(allowed_aliases),
+                        );
+                    }
+                }
+                zeroclaw_config::multi_agent::A2aPeerAuth::Oidc { issuer, subject } => {
+                    // OIDC bearer token verification would happen here
+                    // For now, return denied - OIDC verification is a follow-up
+                    let _ = (issuer, subject);
+                }
+                zeroclaw_config::multi_agent::A2aPeerAuth::OidcAny { issuer: _ } => {
+                    // OIDC any - would verify token against issuer
+                    // For now, return denied - OIDC verification is a follow-up
+                }
+            }
+        }
+
+        AuthOutcome::Denied {
+            reason: DenyReason::BadCredential,
+        }
+    }
+}
+
+// Expose constant_time_eq from pairing module for credential comparison
+pub use crate::security::pairing::constant_time_eq;
+
+/// Verify a credential through a provider and emit a structured audit
+/// record of the outcome through the canonical `zeroclaw_log::record!`
+/// channel. Never logs raw tokens (`obs-no-sensitive-data`): only the
+/// authentication method, the resolved peer identity (when known), and
+/// the deny reason are recorded.
+///
+/// The heavyweight hash-chained `AuditLogger` (`security::audit::AuditLogger`)
+/// is reserved for the future provider-registry rail in PR-D; this lighter
+/// path is enough for per-request audit coverage while keeping the helper
+/// itself allocation-free and file-free so it can sit on the verify hot
+/// path. `subagent: provider` implementation integrates here.
+pub async fn verify_with_audit<P>(
+    provider: &P,
+    credential: &Credential,
+    method_name: &'static str,
+) -> AuthOutcome
+where
+    P: AuthProvider + ?Sized,
+{
+    let outcome = provider.verify(credential).await;
+    match &outcome {
+        AuthOutcome::Authenticated(p) => {
+            zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": method_name,
+                        "outcome": "authenticated",
+                        "user_id": crate::security::redact(&p.user_id),
+                        "auth_method": format!("{:?}", p.auth_method),
+                    })),
+                "AuthProvider::verify success"
+            );
+        }
+        AuthOutcome::Trusted(p) => {
+            zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "provider": method_name,
+                        "outcome": "trusted",
+                        "user_id": crate::security::redact(&p.user_id),
+                    })),
+                "AuthProvider::verify trusted (shared-operator)"
+            );
+        }
+        AuthOutcome::Denied { reason } => {
+            zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "provider": method_name,
+                        "outcome": "denied",
+                        "reason": format!("{reason:?}"),
+                    })),
+                "AuthProvider::verify denied"
+            );
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]
@@ -332,5 +506,104 @@ mod tests {
         assert!(dbg.contains("alice"));
         assert!(dbg.contains("<redacted>"));
         assert!(!dbg.contains("222")); // 0xde — raw signature byte must not appear
+    }
+
+    // ── A2aPeerProvider Tests ────────────────────────────────────────────
+
+    fn a2a_section_with_bearer_peer(
+        name: &str,
+        token: &str,
+    ) -> (
+        zeroclaw_config::multi_agent::A2aServerSection,
+        std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>,
+    ) {
+        let token_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+        let mut section = zeroclaw_config::multi_agent::A2aServerSection::default();
+        section.peers.insert(
+            name.to_string(),
+            zeroclaw_config::multi_agent::A2aPeerConfig {
+                name: name.to_string(),
+                auth: zeroclaw_config::multi_agent::A2aPeerAuth::Bearer { token_hash },
+                peer_group: None,
+            },
+        );
+        (section, std::collections::HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_authenticates_matching_bearer() {
+        let (section, peer_groups) = a2a_section_with_bearer_peer("partner", "secret-token");
+        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+        assert_eq!(provider.name(), "a2a-peer");
+        assert_eq!(provider.method(), AuthMethod::A2aPeer);
+
+        let ok = provider
+            .verify(&Credential::Bearer("secret-token".into()))
+            .await;
+        assert!(ok.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_rejects_wrong_bearer() {
+        let (section, peer_groups) = a2a_section_with_bearer_peer("partner", "correct-token");
+        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+
+        let bad = provider
+            .verify(&Credential::Bearer("wrong-token".into()))
+            .await;
+        assert!(!bad.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_accepts_bearer_credential() {
+        let (section, peer_groups) = a2a_section_with_bearer_peer("partner", "token");
+        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+        assert!(provider.accepts(&Credential::Bearer("x".into())));
+        assert!(!provider.accepts(&Credential::None));
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_with_peer_group_assigns_principal_fields() {
+        use zeroclaw_config::multi_agent::{A2aServerSection, PeerGroupConfig, AgentAlias};
+        let token_hash = hex::encode(sha2::Sha256::digest("secret".as_bytes()));
+        let mut peer_groups = std::collections::HashMap::new();
+        peer_groups.insert(
+            "research-org".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("researcher"), AgentAlias::new("analyst")],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+            },
+        );
+
+        let mut section = A2aServerSection::default();
+        let peer_name = zeroclaw_config::multi_agent::PeerGroupName::new("research-org");
+        section.peers.insert(
+            "partner".to_string(),
+            zeroclaw_config::multi_agent::A2aPeerConfig {
+                name: "partner".to_string(),
+                auth: zeroclaw_config::multi_agent::A2aPeerAuth::Bearer { token_hash },
+                peer_group: Some(peer_name),
+            },
+        );
+        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+        let outcome = provider
+            .verify(&Credential::Bearer("secret".into()))
+            .await;
+        match outcome {
+            AuthOutcome::Authenticated(principal) => {
+                assert_eq!(principal.peer_group.as_deref(), Some("research-org"));
+                let aliases: Vec<&str> = principal
+                    .allowed_aliases
+                    .iter()
+                    .map(|a| a.as_str())
+                    .collect();
+                assert!(aliases.contains(&"researcher"));
+                assert!(aliases.contains(&"analyst"));
+            }
+            _ => panic!("expected Authenticated outcome"),
+        }
     }
 }

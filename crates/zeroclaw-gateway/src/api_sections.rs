@@ -1479,6 +1479,10 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: std::sync::Arc::new(
+                zeroclaw_runtime::security::auth_provider::A2aPeerProvider::empty(),
+            ),
         }
     }
 

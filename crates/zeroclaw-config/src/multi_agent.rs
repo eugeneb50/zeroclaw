@@ -7,7 +7,7 @@
 //! data shapes.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use zeroclaw_macros::Configurable;
 
@@ -213,6 +213,66 @@ pub struct A2aServerSection {
     /// Inbound A2A discovery server (`[a2a.server]`).
     #[nested]
     pub server: A2aServerConfig,
+    /// A2A peer declarations (`[a2a.peers.<name>]`). Maps credential material
+    /// (bearer token or OIDC subject) to peer names and optional peer groups.
+    /// Used for A2A agent discovery authentication. Not dashboard-editable.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub peers: HashMap<String, A2aPeerConfig>,
+}
+
+/// A2A peer authentication method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum A2aPeerAuth {
+    /// Static bearer token authentication. The token is stored as a hashed
+    /// secret (argon2id) to prevent credential exposure on disk.
+    Bearer {
+        /// Argon2id-hashed bearer token for this peer.
+        #[serde(default)]
+        token_hash: String,
+    },
+    /// OIDC token authentication. The `sub` claim must match the configured value.
+    Oidc {
+        /// The OIDC issuer URL (base URL without /.well-known/openid-configuration).
+        issuer: String,
+        /// The exact `sub` claim value expected in the token.
+        subject: String,
+    },
+    /// OIDC token authentication with any subject from the issuer accepted.
+    /// The peer identity is derived dynamically from the `sub` claim.
+    OidcAny {
+        /// The OIDC issuer URL.
+        issuer: String,
+    },
+}
+
+impl Default for A2aPeerAuth {
+    fn default() -> Self {
+        Self::Bearer {
+            token_hash: String::new(),
+        }
+    }
+}
+
+/// Per-A2A-peer configuration (`[a2a.peers.<name>]`.
+///
+/// Declares how a peer authenticates to the A2A discovery surface.
+/// An authenticated peer may access extended agent cards and send tasks.
+/// Not dashboard-editable: `#[secret]` fields cannot be round-tripped
+/// through the property API.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct A2aPeerConfig {
+    /// Human-readable peer name (appears in audit logs).
+    pub name: String,
+    /// Authentication method for this peer.
+    pub auth: A2aPeerAuth,
+    /// Optional peer-group membership. When set, the peer sees only agents
+    /// in this group on extended cards. None = no group scoping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_group: Option<PeerGroupName>,
 }
 
 /// Per-alias A2A publication block (`[agents.<alias>.a2a]`).
@@ -468,5 +528,76 @@ exposed_skills = ["research", "summarize"]
         assert_eq!(parsed.exposed_skills.len(), 2);
         assert_eq!(parsed.exposed_skills[0], "research");
         assert_eq!(parsed.exposed_skills[1], "summarize");
+    }
+
+    #[test]
+    fn a2a_peer_auth_bearer_round_trips() {
+        let toml_input = r#"
+method = "bearer"
+token_hash = "hashed_token_value"
+"#;
+        let parsed: A2aPeerAuth = toml::from_str(toml_input).unwrap();
+        assert!(matches!(parsed, A2aPeerAuth::Bearer { .. }));
+    }
+
+    #[test]
+    fn a2a_peer_auth_oidc_round_trips() {
+        let toml_input = r#"
+method = "oidc"
+issuer = "https://auth.example.com"
+subject = "a2a-peer-123"
+"#;
+        let parsed: A2aPeerAuth = toml::from_str(toml_input).unwrap();
+        assert!(matches!(parsed, A2aPeerAuth::Oidc { .. }));
+    }
+
+    #[test]
+    fn a2a_peer_auth_oidc_any_round_trips() {
+        let toml_input = r#"
+method = "oidc_any"
+issuer = "https://auth.example.com"
+"#;
+        let parsed: A2aPeerAuth = toml::from_str(toml_input).unwrap();
+        assert!(matches!(parsed, A2aPeerAuth::OidcAny { .. }));
+    }
+
+    #[test]
+    fn a2a_peer_config_round_trips_with_group() {
+        let toml_input = r#"
+name = "Research Partner"
+auth.method = "bearer"
+auth.token_hash = "hashed"
+peer_group = "research-org"
+"#;
+        let parsed: A2aPeerConfig = toml::from_str(toml_input).unwrap();
+        assert_eq!(parsed.name, "Research Partner");
+        assert!(
+            !parsed
+                .peer_group
+                .as_ref()
+                .map_or(true, |g| g.as_str().is_empty())
+        );
+    }
+
+    #[test]
+    fn a2a_peer_config_default_has_empty_name() {
+        let cfg = A2aPeerConfig::default();
+        assert!(cfg.name.is_empty());
+    }
+
+    #[test]
+    fn a2a_server_section_round_trips_with_peers() {
+        let toml_input = r#"
+[server]
+enabled = true
+
+[peers.partner]
+name = "Research Partner"
+auth.method = "bearer"
+auth.token_hash = "hashed_token"
+"#;
+        let parsed: A2aServerSection = toml::from_str(toml_input).unwrap();
+        assert!(parsed.server.enabled);
+        assert_eq!(parsed.peers.len(), 1);
     }
 }

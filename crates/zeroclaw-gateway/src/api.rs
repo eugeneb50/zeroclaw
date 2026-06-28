@@ -29,7 +29,7 @@ fn integration_entry_json(
 // ── Bearer token auth extractor ─────────────────────────────────
 
 /// Extract and validate bearer token from Authorization header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1919,6 +1919,7 @@ mod tests {
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
+    use zeroclaw_runtime::security::auth_provider::A2aPeerProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     #[derive(Default)]
@@ -2126,6 +2127,8 @@ mod tests {
             reload_tx: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

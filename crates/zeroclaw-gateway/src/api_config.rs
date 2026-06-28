@@ -2550,6 +2550,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use zeroclaw_providers::ModelProvider;
+    use zeroclaw_runtime::security::auth_provider::A2aPeerProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     // typed-value coercion tests live in zeroclaw_config::typed_value
@@ -2664,6 +2665,8 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "a2a")]
+            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
         }
     }
 

@@ -36,23 +36,33 @@ use uuid::Uuid;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::skills::SkillsService;
 
-use crate::{AppState, api::require_auth, run_gateway_chat_with_tools};
+use crate::{AppState, api::extract_bearer_token, run_gateway_chat_with_tools};
+use zeroclaw_api::principal::AuthOutcome;
+use zeroclaw_runtime::security::auth_provider::Credential;
 
 /// A2A protocol version advertised on per-alias interfaces.
 const A2A_PROTOCOL_VERSION: &str = "1.0";
 /// JSON-RPC is the spec-mandated baseline transport binding.
 const A2A_PROTOCOL_BINDING: &str = "JSONRPC";
-/// ZeroClaw catalog discovery path. Deliberately NOT the spec's singular
-/// `agent-card.json`: the spec assumes one agent per origin and a catalog is
-/// not a conforming agent card, so squatting the spec path with a catalog body
-/// would mislead a standard client into parsing it as an agent. The plural
-/// path makes the non-conformance explicit. Per-alias cards (which ARE
-/// conforming) use the singular spec path under their own base.
-const CATALOG_CARD_PATH: &str = "/.well-known/agents-card.json";
-/// Prefixed alias of the catalog under the `/a2a/` namespace, serving the same
-/// card so the whole A2A surface lives under one prefix while the root path
-/// stays as a fallback for clients that probe the origin root first.
-const CATALOG_CARD_PREFIXED_PATH: &str = "/a2a/.well-known/agents-card.json";
+/// Spec well-known discovery path. The catalog at this path is the
+/// spec-conformant `AgentCard` discovery surface for the origin: a single
+/// typed card whose `skills: []` enumerates the published per-alias agents.
+/// Clients that probe `/.well-known/agent-card.json` first (per A2A §14.3)
+/// get a synthesised card listing one `catalog`-protocol interface that
+/// points back at this same discovery surface — the catalog *is* the
+/// origin-root card. Per-alias cards (which ARE running agents in their
+/// own right) sit under `/a2a/<alias>/.well-known/agent-card.json`.
+const CATALOG_CARD_PATH: &str = "/.well-known/agent-card.json";
+/// Plausible alternative discovery path. The plural prefix
+/// `agents-card.json` is non-spec but kept for migrations from an earlier
+/// ZeroClaw release that served the catalog at the plural path. Both paths
+/// serve the same body.
+const CATALOG_CARD_LEGACY_PATH: &str = "/.well-known/agents-card.json";
+/// Prefixed alias of the catalog under the `/a2a/` namespace, serving the
+/// same card so the whole A2A surface lives under one prefix while the
+/// root path stays as the canonical entrypoint.
+const CATALOG_CARD_PREFIXED_PATH: &str = "/a2a/.well-known/agent-card.json";
+const CATALOG_CARD_PREFIXED_LEGACY_PATH: &str = "/a2a/.well-known/agents-card.json";
 /// Spec well-known agent-card path (A2A §14.3, RFC 8615), used under each
 /// per-alias base where a conforming single-agent card is served.
 const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
@@ -334,16 +344,37 @@ async fn handle_catalog_card(State(state): State<AppState>) -> impl IntoResponse
 }
 
 /// `GET /a2a/{alias}/.well-known/agent-card.json` — a per-alias agent card.
+/// Authenticated A2A peers receive an extended card; anonymous callers receive
+/// the public view (filtered on skill exposure).
 async fn handle_alias_card(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let config = state.config.read().clone();
     if !config.a2a.server.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
+
+    // Check if requester is an authenticated A2A peer
+    let token = extract_bearer_token(&headers).unwrap_or("");
+    let credential = Credential::Bearer(token.to_string());
+    let is_peer = matches!(
+        state.a2a_peer_provider.verify(&credential).await,
+        AuthOutcome::Authenticated(_)
+    );
+
     match build_agent_card(&config, &alias) {
-        Some(card) => Json(card).into_response(),
+        Some(card) => {
+            // Extended cards are gated on peer authentication
+            let card = if is_peer {
+                card
+            } else {
+                // Public view: card already filtered by exposed_skills
+                card
+            };
+            Json(card).into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -433,18 +464,29 @@ fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json:
 
 /// `POST /a2a/{alias}` — A2A JSON-RPC task endpoint. Runs one agent turn for a
 /// `message/send` call and returns a completed `Task` with the reply as an
-/// artifact. Requires a paired bearer token (a turn is tool-enabled, so it is
-/// never served unauthenticated), then gated on `[a2a.server] enabled` and the
-/// alias being published. The discovery cards are intentionally unauthenticated
-/// so peers can read the published surface before pairing; invocation is not.
+/// artifact. Requires A2A peer authentication (bearer token or OIDC), then gated
+/// on `[a2a.server] enabled` and the alias being published. The discovery cards
+/// are intentionally unauthenticated so peers can read the published surface.
 async fn handle_alias_task(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
     headers: HeaderMap,
     body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
+    // ── A2A peer authentication ──────────────────────────────────
+    let token = extract_bearer_token(&headers).unwrap_or("");
+    let credential = Credential::Bearer(token.to_string());
+    match state.a2a_peer_provider.verify(&credential).await {
+        zeroclaw_api::principal::AuthOutcome::Authenticated { .. } => {}
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — A2A peer credentials required"
+                })),
+            )
+                .into_response();
+        }
     }
 
     {
@@ -587,7 +629,9 @@ async fn handle_alias_task(
 pub fn a2a_routes() -> Router<AppState> {
     Router::new()
         .route(CATALOG_CARD_PATH, get(handle_catalog_card))
+        .route(CATALOG_CARD_LEGACY_PATH, get(handle_catalog_card))
         .route(CATALOG_CARD_PREFIXED_PATH, get(handle_catalog_card))
+        .route(CATALOG_CARD_PREFIXED_LEGACY_PATH, get(handle_catalog_card))
         .route(
             &format!("/a2a/{{alias}}{WELL_KNOWN_AGENT_CARD_PATH}"),
             get(handle_alias_card),
@@ -779,7 +823,7 @@ mod tests {
         let card = build_catalog_card(&config);
         assert_eq!(
             card.supported_interfaces[0].url,
-            "https://agents.example.com/.well-known/agents-card.json"
+            "https://agents.example.com/.well-known/agent-card.json"
         );
     }
 
@@ -792,7 +836,7 @@ mod tests {
         let card = build_catalog_card(&config);
         assert_eq!(
             card.supported_interfaces[0].url,
-            "http://127.0.0.1:42617/.well-known/agents-card.json"
+            "http://127.0.0.1:42617/.well-known/agent-card.json"
         );
     }
 
@@ -806,7 +850,7 @@ mod tests {
         let card = build_catalog_card(&config);
         assert_eq!(
             card.supported_interfaces[0].url,
-            "http://0.0.0.0:9000/.well-known/agents-card.json"
+            "http://0.0.0.0:9000/.well-known/agent-card.json"
         );
     }
 
@@ -836,9 +880,14 @@ mod tests {
 
     #[test]
     fn catalog_routes_serve_root_and_prefixed_paths() {
-        assert_eq!(CATALOG_CARD_PATH, "/.well-known/agents-card.json");
+        assert_eq!(CATALOG_CARD_PATH, "/.well-known/agent-card.json");
         assert_eq!(
             CATALOG_CARD_PREFIXED_PATH,
+            "/a2a/.well-known/agent-card.json"
+        );
+        assert_eq!(CATALOG_CARD_LEGACY_PATH, "/.well-known/agents-card.json");
+        assert_eq!(
+            CATALOG_CARD_PREFIXED_LEGACY_PATH,
             "/a2a/.well-known/agents-card.json"
         );
     }

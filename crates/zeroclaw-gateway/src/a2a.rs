@@ -360,7 +360,7 @@ async fn handle_alias_card(
     let token = extract_bearer_token(&headers).unwrap_or("");
     let credential = Credential::Bearer(token.to_string());
     let is_peer = matches!(
-        state.a2a_peer_provider.verify(&credential).await,
+        state.a2a_provider_resolver.verify(&credential).await,
         AuthOutcome::Authenticated(_)
     );
 
@@ -476,7 +476,7 @@ async fn handle_alias_task(
     // ── A2A peer authentication ──────────────────────────────────
     let token = extract_bearer_token(&headers).unwrap_or("");
     let credential = Credential::Bearer(token.to_string());
-    match state.a2a_peer_provider.verify(&credential).await {
+    match state.a2a_provider_resolver.verify(&credential).await {
         zeroclaw_api::principal::AuthOutcome::Authenticated { .. } => {}
         _ => {
             return (

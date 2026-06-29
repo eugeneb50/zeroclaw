@@ -1226,6 +1226,8 @@ pub async fn handle_section_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::RwLock;
+    use zeroclaw_runtime::security::LiveConfigA2aResolver;
 
     /// Regression guard: every alias-bearing map the handler exposes must
     /// be reachable from `Config::get_map_keys` using the kebab-case path
@@ -1480,8 +1482,10 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: std::sync::Arc::new(
-                zeroclaw_runtime::security::auth_provider::A2aPeerProvider::empty(),
+            a2a_provider_resolver: std::sync::Arc::new(
+                LiveConfigA2aResolver::new(std::sync::Arc::new(RwLock::new(
+                    zeroclaw_config::schema::Config::default(),
+                ))),
             ),
         }
     }

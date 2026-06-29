@@ -152,7 +152,8 @@ use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::platform;
-use zeroclaw_runtime::security::auth_provider::{A2aPeerProvider, AuthProvider};
+use zeroclaw_runtime::security::auth_provider::LiveConfigA2aResolver;
+use zeroclaw_runtime::security::A2aPeerResolver;
 use zeroclaw_runtime::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
@@ -672,9 +673,15 @@ pub struct AppState {
     pub web_dist_dir: Option<std::path::PathBuf>,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
-    /// A2A peer authentication provider for inbound agent-to-agent calls.
+    /// A2A peer authentication resolver for inbound agent-to-agent calls.
+    ///
+    /// Resolves peers against the live `AppState.config` (the canonical
+    /// `[a2a.peers]` / `[peer_groups]` source) on every verify. Live re-read
+    /// is required so config reload (SIGHUP / dashboard PATCH) picked up
+    /// without a process restart — see issue #7410 for the parallel
+    /// snapshot-pattern pay-down this generalizes.
     #[cfg(feature = "a2a")]
-    pub a2a_peer_provider: Arc<dyn AuthProvider>,
+    pub a2a_provider_resolver: Arc<dyn A2aPeerResolver>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
@@ -1427,10 +1434,9 @@ pub async fn run_gateway(
 
     // ── A2A peer provider ──────────────────────────────────
     #[cfg(feature = "a2a")]
-    let a2a_peer_provider: Arc<dyn AuthProvider> = {
-        let provider =
-            A2aPeerProvider::from_config(&config.a2a, &config.peer_groups);
-        Arc::new(provider)
+    let a2a_provider_resolver: Arc<dyn A2aPeerResolver> = {
+        let inner = Arc::clone(&config_state);
+        Arc::new(LiveConfigA2aResolver::new(inner))
     };
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
@@ -1737,7 +1743,7 @@ pub async fn run_gateway(
         device_registry,
         pending_pairings,
         #[cfg(feature = "a2a")]
-        a2a_peer_provider,
+        a2a_provider_resolver,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         web_dist_dir,
         canvas_store,
@@ -4704,7 +4710,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -5354,7 +5360,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5442,7 +5448,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6036,7 +6042,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6143,7 +6149,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6265,7 +6271,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6368,7 +6374,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6489,7 +6495,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6576,7 +6582,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6668,7 +6674,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6767,7 +6773,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6862,7 +6868,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7007,7 +7013,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7846,7 +7852,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -7934,7 +7940,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -8096,7 +8102,7 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_peer_provider: Arc::new(A2aPeerProvider::empty()),
+            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

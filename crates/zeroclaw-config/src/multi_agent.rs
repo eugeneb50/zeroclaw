@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use zeroclaw_macros::Configurable;
 
-crate::define_provider_ref!(AgentAlias, "agents");
+pub use zeroclaw_api::principal::AgentAlias;
+
 crate::define_provider_ref!(PeerGroupName, "peer_groups");
 crate::define_provider_ref!(PeerUsername, "channels.peers");
 

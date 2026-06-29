@@ -193,14 +193,44 @@ pub struct A2aPeerProvider {
 
 impl A2aPeerProvider {
     /// Create from config's `[a2a.peers]` map and `[peer_groups]` map.
+    ///
+    /// **Deprecated in favor of [`A2aPeerProvider::from_peers`] plus a live
+    /// resolver.** This constructor snapshots the maps by value, which is the
+    /// `ConfigSnapshot` pattern the gateway SIGHUP-reload story rejects: a
+    /// peer added to `[a2a.peers]` after `run_gateway()` boots will not be
+    /// honored until a full process restart. Use
+    /// [`LiveConfigA2aResolver`](crate::security::LiveConfigA2aResolver) (or
+    /// any other `A2aPeerResolver` impl) instead and read on every verify.
+    /// Kept for one minor release to give third-party tooling that calls it
+    /// directly time to migrate.
+    #[deprecated(
+        since = "0.9.0",
+        note = "snapshots config; read on every verify via LiveConfigA2aResolver instead"
+    )]
     pub fn from_config(
         config: &zeroclaw_config::multi_agent::A2aServerSection,
-        peer_groups: &std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>,
+        peer_groups: &std::collections::HashMap<
+            String,
+            zeroclaw_config::multi_agent::PeerGroupConfig,
+        >,
     ) -> Self {
         Self {
             peers: config.peers.clone(),
             peer_groups: peer_groups.clone(),
         }
+    }
+
+    /// Create a pure-data provider from already-resolved peer and peer-group
+    /// maps. No config reference is retained; construction is allocation-only
+    /// and stays out of any shared state. Use inside a resolver (`verify()`
+    /// reads the maps fresh from the canonical `Config`) or in tests where
+    /// the live-config wiring is irrelevant.
+    #[must_use]
+    pub fn from_peers(
+        peers: std::collections::HashMap<String, zeroclaw_config::multi_agent::A2aPeerConfig>,
+        peer_groups: std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>,
+    ) -> Self {
+        Self { peers, peer_groups }
     }
 
     /// Create an empty provider with no configured peers — every credential
@@ -245,8 +275,8 @@ impl AuthProvider for A2aPeerProvider {
                     if constant_time_eq(&presented_hash, token_hash) {
                         // Resolve allowed_aliases from peer's peer_group
                         let allowed_aliases = if let Some(ref pg) = peer.peer_group {
-                            if let Some(group_config) = self.peer_groups.get(pg) {
-                                group_config.agents.iter().map(|a| a.clone()).collect()
+                            if let Some(group_config) = self.peer_groups.get(pg.as_str()) {
+                                group_config.agents.to_vec()
                             } else {
                                 Vec::new()
                             }
@@ -254,17 +284,20 @@ impl AuthProvider for A2aPeerProvider {
                             Vec::new()
                         };
 
-                        let peer_group_value = peer.peer_group.clone().unwrap_or_default();
+                        let mut principal = Principal::new(
+                            zeroclaw_api::principal::PrincipalId::from(peer.name.clone()),
+                            peer.name.clone(),
+                            AuthMethod::A2aPeer,
+                        )
+                        .with_allowed_aliases(allowed_aliases);
+                        // Only stamp `Principal.peer_group` when the peer
+                        // declares one — otherwise leave it `None` so the
+                        // absence carries through (instead of `Some("")`).
+                        if let Some(pg) = peer.peer_group.as_ref() {
+                            principal = principal.with_peer_group(pg.as_str());
+                        }
 
-                        return AuthOutcome::Authenticated(
-                            Principal::new(
-                                zeroclaw_api::principal::PrincipalId::from(peer.name.clone()),
-                                peer.name.clone(),
-                                AuthMethod::A2aPeer,
-                            )
-                            .with_peer_group(peer_group_value)
-                            .with_allowed_aliases(allowed_aliases),
-                        );
+                        return AuthOutcome::Authenticated(principal);
                     }
                 }
                 zeroclaw_config::multi_agent::A2aPeerAuth::Oidc { issuer, subject } => {
@@ -282,6 +315,67 @@ impl AuthProvider for A2aPeerProvider {
         AuthOutcome::Denied {
             reason: DenyReason::BadCredential,
         }
+    }
+}
+
+// ── Live-config resolver ──────────────────────────────────────────────
+//
+// `A2aPeerProvider` is a pure-data type. Resolvers below make verify() reach
+// the canonical `Config` on every call, so SIGHUP-induced reload (or any other
+// writer to `Arc<RwLock<Config>>`) is honored without a process restart. This
+// is the path `AppState` carries in the gateway; the snapshot pattern
+// (`A2aPeerProvider::from_config`/`empty` placed on `AppState`) is prohibited
+// by AGENTS.md "single source of truth" and tracked against issue #7410
+// (the exact same violation pattern that is being paid down for webhook
+// signing secrets; we generalize it to the A2A peer material at the same time).
+
+/// Resolves A2A peer authentication against a live credential source.
+///
+/// Implementors own the canonical read path (typically `Arc<RwLock<Config>>`)
+/// and must not retain a snapshot — every `verify()` call is expected to read
+/// at-most-current data so config reload propagates without daemon restart.
+/// `#[non_exhaustive]` keeps the trait forward-compatible.
+#[async_trait::async_trait]
+pub trait A2aPeerResolver: Send + Sync {
+    /// Resolve a credential to an [`AuthOutcome`]. The credential is borrowed
+    /// for the call only; the resolver must clone any state it needs to survive
+    /// past the function (e.g., for use after the borrowed `credential`
+    /// lifetime ends).
+    async fn verify(&self, credential: &Credential) -> AuthOutcome;
+}
+
+/// Resolver that reads `[a2a.peers]` and `[peer_groups]` from a live
+/// `Arc<RwLock<Config>>` on every call.
+///
+/// **Lock discipline:** the read lock is acquired briefly to snapshot the two
+/// `HashMap`s, then released before any `await`. The constructed
+/// `A2aPeerProvider` is a pure-data type and `provider.verify(...)` runs
+/// without holding the `RwLock`. This honors `anti-lock-across-await`.
+pub struct LiveConfigA2aResolver {
+    config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+}
+
+impl LiveConfigA2aResolver {
+    /// Wrap a live-config handle. Typically constructed with
+    /// `state.config.clone()` from the gateway boot path, where `state.config`
+    /// is itself `Arc<RwLock<Config>>`.
+    #[must_use]
+    pub fn new(config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait::async_trait]
+impl A2aPeerResolver for LiveConfigA2aResolver {
+    async fn verify(&self, credential: &Credential) -> AuthOutcome {
+        // Acquire read lock briefly, snapshot two HashMaps, release.
+        // No await is held across this block.
+        let provider = {
+            let cfg = self.config.read();
+            A2aPeerProvider::from_peers(cfg.a2a.peers.clone(), cfg.peer_groups.clone())
+        };
+        // Provider is now pure data; verify may await freely.
+        provider.verify(credential).await
     }
 }
 
@@ -533,7 +627,7 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_authenticates_matching_bearer() {
         let (section, peer_groups) = a2a_section_with_bearer_peer("partner", "secret-token");
-        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+        let provider = A2aPeerProvider::from_peers(section.peers, peer_groups);
         assert_eq!(provider.name(), "a2a-peer");
         assert_eq!(provider.method(), AuthMethod::A2aPeer);
 
@@ -546,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_rejects_wrong_bearer() {
         let (section, peer_groups) = a2a_section_with_bearer_peer("partner", "correct-token");
-        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+        let provider = A2aPeerProvider::from_peers(section.peers, peer_groups);
 
         let bad = provider
             .verify(&Credential::Bearer("wrong-token".into()))
@@ -557,14 +651,14 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_accepts_bearer_credential() {
         let (section, peer_groups) = a2a_section_with_bearer_peer("partner", "token");
-        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
+        let provider = A2aPeerProvider::from_peers(section.peers, peer_groups);
         assert!(provider.accepts(&Credential::Bearer("x".into())));
         assert!(!provider.accepts(&Credential::None));
     }
 
     #[tokio::test]
     async fn a2a_peer_provider_with_peer_group_assigns_principal_fields() {
-        use zeroclaw_config::multi_agent::{A2aServerSection, PeerGroupConfig, AgentAlias};
+        use zeroclaw_config::multi_agent::{A2aServerSection, AgentAlias, PeerGroupConfig};
         let token_hash = hex::encode(sha2::Sha256::digest("secret".as_bytes()));
         let mut peer_groups = std::collections::HashMap::new();
         peer_groups.insert(
@@ -588,10 +682,8 @@ mod tests {
                 peer_group: Some(peer_name),
             },
         );
-        let provider = A2aPeerProvider::from_config(&section, &peer_groups);
-        let outcome = provider
-            .verify(&Credential::Bearer("secret".into()))
-            .await;
+        let provider = A2aPeerProvider::from_peers(section.peers, peer_groups);
+        let outcome = provider.verify(&Credential::Bearer("secret".into())).await;
         match outcome {
             AuthOutcome::Authenticated(principal) => {
                 assert_eq!(principal.peer_group.as_deref(), Some("research-org"));
@@ -605,5 +697,274 @@ mod tests {
             }
             _ => panic!("expected Authenticated outcome"),
         }
+    }
+
+    // ── LiveConfigA2aResolver regression tests (#7410) ─────────────────────
+    // These pin the "read on every verify against live config" invariant that
+    // #7410 mandates for the gateway webhook-secret pay-down; the same pattern
+    // generalizes to A2A peer resolution here. Failure mode: peer added via
+    // config mutation after construction is not honored at verify-time.
+
+    /// Build a sha256 hex digest for a plain token so the provider matches.
+    fn hex_token_hash(token: &str) -> String {
+        hex::encode(sha2::Sha256::digest(token.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn live_config_resolver_seeds_with_initial_peers() {
+        let (section, peer_groups) = a2a_section_with_bearer_peer("infra-initial", "tok-1");
+        // Convert section into the live config's `a2a.peers` map.
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.a2a.peers = section.peers;
+        cfg.peer_groups = peer_groups;
+
+        let state = Arc::new(parking_lot::RwLock::new(cfg));
+        let resolver = LiveConfigA2aResolver::new(Arc::clone(&state));
+
+        let outcome = resolver
+            .verify(&Credential::Bearer("tok-1".into()))
+            .await;
+        assert!(outcome.is_allowed(), "initial peer must verify");
+
+        let outcome = resolver
+            .verify(&Credential::Bearer("nonexistent-tok".into()))
+            .await;
+        assert!(!outcome.is_allowed(), "unknown token must be denied");
+    }
+
+    /// Regression #7410: rotating a peer in the live config must be honored
+    /// at the next `verify()` call WITHOUT a process restart. The previous
+    /// `A2aPeerProvider::from_config` snapshot failed exactly this case.
+    #[tokio::test]
+    async fn live_config_resolver_picks_up_newly_added_peer_after_config_reload() {
+        use zeroclaw_config::multi_agent::{A2aPeerAuth, A2aPeerConfig};
+
+        let initial_token = "tok-1";
+        let initial_hash = hex_token_hash(initial_token);
+        let mut initial_peers = std::collections::HashMap::new();
+        initial_peers.insert(
+            "infra-initial".to_string(),
+            A2aPeerConfig {
+                name: "Infra Initial".into(),
+                auth: A2aPeerAuth::Bearer {
+                    token_hash: initial_hash,
+                },
+                peer_group: None,
+            },
+        );
+
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.a2a.peers = initial_peers;
+        let state = Arc::new(parking_lot::RwLock::new(cfg));
+        let resolver = LiveConfigA2aResolver::new(Arc::clone(&state));
+
+        // Sanity: initial peer resolves.
+        assert!(
+            resolver
+                .verify(&Credential::Bearer("tok-1".into()))
+                .await
+                .is_allowed()
+        );
+
+        // Mutate config under the live lock: add a new peer. (No Arc::make_mut,
+        // no process restart — simulates a SIGHUP/editor PATCH.)
+        {
+            let mut cfg = state.write();
+            let new_token = "tok-2";
+            let new_hash = hex_token_hash(new_token);
+            cfg.a2a.peers.insert(
+                "infra-reloaded".to_string(),
+                A2aPeerConfig {
+                    name: "Infra Reloaded".into(),
+                    auth: A2aPeerAuth::Bearer {
+                        token_hash: new_hash,
+                    },
+                    peer_group: None,
+                },
+            );
+            assert!(cfg.a2a.peers.contains_key("infra-reloaded"));
+        } // write lock released; resolver's next verify() reads fresh.
+
+        // CRITICAL: new peer must be honored on next verify, without restart.
+        let outcome = resolver
+            .verify(&Credential::Bearer("tok-2".into()))
+            .await;
+        assert!(
+            outcome.is_allowed(),
+            "newly added peer must verify live (regression for #7410 snapshot pattern)"
+        );
+
+        // And the original peer still verifies (mutation didn't break the
+        // remaining entries).
+        assert!(
+            resolver
+                .verify(&Credential::Bearer("tok-1".into()))
+                .await
+                .is_allowed(),
+            "previously-added peer must keep verifying after reload mutation"
+        );
+
+        // Rotation: replace existing peer's token in place.
+        let rotated_token_hash = hex_token_hash("tok-1-rotated");
+        {
+            let mut cfg = state.write();
+            cfg.a2a.peers.insert(
+                "infra-initial".to_string(),
+                A2aPeerConfig {
+                    name: "Infra Initial".into(),
+                    auth: A2aPeerAuth::Bearer {
+                        token_hash: rotated_token_hash,
+                    },
+                    peer_group: None,
+                },
+            );
+        }
+        assert!(!resolver
+            .verify(&Credential::Bearer("tok-1".into()))
+            .await
+            .is_allowed(), "old token must be denied after rotation");
+        assert!(resolver
+            .verify(&Credential::Bearer("tok-1-rotated".into()))
+            .await
+            .is_allowed(), "rotated token must verify");
+    }
+
+    /// Resolve across `peer_groups` for a newly-added peer via live reload
+    /// (the flag that PR-B1 unlocked via `peer_group` plumbing).
+    #[tokio::test]
+    async fn live_config_resolver_picks_up_peer_groups_change() {
+        use zeroclaw_config::multi_agent::{
+            A2aPeerAuth, A2aPeerConfig, AgentAlias, PeerGroupConfig,
+            PeerGroupName,
+        };
+
+        let (state, resolver) = {
+            let state = Arc::new(parking_lot::RwLock::new(
+                zeroclaw_config::schema::Config::default(),
+            ));
+            let resolver = LiveConfigA2aResolver::new(Arc::clone(&state));
+            (state, resolver)
+        };
+        // Insert a peer with no peer_group initially.
+        let peer_token = "infra-tok";
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "infra-x".to_string(),
+            A2aPeerConfig {
+                name: "Infra X".into(),
+                auth: A2aPeerAuth::Bearer {
+                    token_hash: hex_token_hash(peer_token),
+                },
+                peer_group: None,
+            },
+        );
+        {
+            let mut w = state.write();
+            w.a2a.peers = peers.clone();
+        }
+
+        // First verify — no peer_group attached to the peer, so allowed_aliases
+        // on the principal is empty.
+        match resolver
+            .verify(&Credential::Bearer(peer_token.into()))
+            .await
+        {
+            AuthOutcome::Authenticated(p) => {
+                assert!(
+                    p.allowed_aliases.is_empty(),
+                    "no peer_group means no allowed aliases"
+                );
+                assert!(p.peer_group.is_none());
+            }
+            o => panic!("expected Authenticated, got {o:?}"),
+        }
+
+        // Now mutate config: attach a peer_group and a peer_groups map.
+        {
+            let mut w = state.write();
+            w.peer_groups.insert(
+                "shared".to_string(),
+                PeerGroupConfig {
+                    channel: "telegram".into(),
+                    agents: vec![AgentAlias::new("researcher"), AgentAlias::new("analyst")],
+                    external_peers: Vec::new(),
+                    ignore: Vec::new(),
+                    output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                },
+            );
+            w.a2a.peers.insert(
+                "infra-x".to_string(),
+                A2aPeerConfig {
+                    name: "Infra X".into(),
+                    auth: A2aPeerAuth::Bearer {
+                        token_hash: hex_token_hash(peer_token),
+                    },
+                    peer_group: Some(PeerGroupName::new("shared")),
+                },
+            );
+        }
+
+        // Second verify — should now resolve `peer_group` field and bring
+        // `researcher` / `analyst` into `allowed_aliases`.
+        match resolver
+            .verify(&Credential::Bearer(peer_token.into()))
+            .await
+        {
+            AuthOutcome::Authenticated(p) => {
+                assert_eq!(p.peer_group.as_deref(), Some("shared"));
+                let aliases: Vec<&str> =
+                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                assert!(aliases.contains(&"researcher"));
+                assert!(aliases.contains(&"analyst"));
+            }
+            o => panic!("expected Authenticated, got {o:?}"),
+        }
+    }
+
+    /// Lock discipline: the live-config resolver must NOT hold the
+    /// `parking_lot::RwLock` across an `.await`. `verify()` snapshots and
+    /// releases synchronously, then constructs a pure-data `A2aPeerProvider`
+    /// and runs the awaitable path on that. This regression pins the
+    /// `anti-lock-across-await` constraint that any future refactor must keep.
+    #[tokio::test]
+    async fn live_config_resolver_releases_read_lock_before_await() {
+        // Build a config that yields one peer.
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        let mut peers = std::collections::HashMap::new();
+        peers.insert(
+            "p".to_string(),
+            zeroclaw_config::multi_agent::A2aPeerConfig {
+                name: "P".into(),
+                auth: zeroclaw_config::multi_agent::A2aPeerAuth::Bearer {
+                    token_hash: hex_token_hash("any-tok"),
+                },
+                peer_group: None,
+            },
+        );
+        cfg.a2a.peers = peers;
+
+        let state = Arc::new(parking_lot::RwLock::new(cfg));
+        let resolver = LiveConfigA2aResolver::new(Arc::clone(&state));
+
+        // Acquire the WRITER lock first to prove the resolver does not hold
+        // any read lock during its await chain. If lock discipline regressed
+        // (resolver holds read across .await), this write acquisition would
+        // either deadlock or block until timeout — we use tokio::time::timeout
+        // for safety and rely on the rwlock being fair.
+        let cred = Credential::Bearer("any-tok".into());
+        let verify_task = resolver.verify(&cred);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            async {
+                // Try to acquire the write lock. If the resolver released its
+                // read lock before .await, this acquires immediately.
+                let _w = state.write();
+            },
+        )
+        .await
+        .expect("write-lock must be acquirable within 250ms — lock discipline broken");
+        // And the verify resolves successfully.
+        let outcome = verify_task.await;
+        assert!(outcome.is_allowed());
     }
 }

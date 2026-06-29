@@ -51,6 +51,9 @@ pub mod webauthn;
 
 // A2A peer authentication provider
 pub use auth_provider::A2aPeerProvider;
+// A2A peer live-config resolver (read [a2a.peers] / [peer_groups] from
+// the live `Arc<RwLock<Config>>` on every verify, so SIGHUP reload is honored)
+pub use auth_provider::{A2aPeerResolver, LiveConfigA2aResolver};
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};

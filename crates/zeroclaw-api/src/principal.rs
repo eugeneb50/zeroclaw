@@ -65,13 +65,89 @@ impl From<&str> for PrincipalId {
 
 /// An agent alias a principal may bind at session start. Newtype so it never gets
 /// confused with an arbitrary `String` in grant checks.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Mirrors the shape that `define_provider_ref!` in `zeroclaw-config` generates
+/// for other ref newtypes, so this is the single source of truth — other crates
+/// re-export or import this type rather than defining their own.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(transparent)]
 pub struct AgentAlias(pub String);
 
 impl AgentAlias {
     #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AgentAlias {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::ops::Deref for AgentAlias {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for AgentAlias {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AgentAlias {
+    fn from(v: String) -> Self {
+        Self(v)
+    }
+}
+
+impl From<&str> for AgentAlias {
+    fn from(v: &str) -> Self {
+        Self(v.to_owned())
+    }
+}
+
+impl From<AgentAlias> for String {
+    fn from(v: AgentAlias) -> Self {
+        v.0
+    }
+}
+
+impl PartialEq<str> for AgentAlias {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for AgentAlias {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for AgentAlias {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
     }
 }
 
@@ -359,7 +435,7 @@ mod tests {
             auth_method: AuthMethod::Oidc,
             mfa_verified: true,
             expires_at: 0,
-            allowed_aliases: vec![AgentAlias("main".to_owned())],
+            allowed_aliases: vec![AgentAlias::new("main")],
             peer_group: None,
             config_write_paths: Vec::new(),
             admin: false,

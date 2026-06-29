@@ -361,6 +361,53 @@ impl Principal {
     }
 }
 
+/// Error returned when a principal is not entitled to a specific agent alias.
+/// Pure data — no `StatusCode` coupling, status mapping lives at the gateway boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntitlementError {
+    /// Principal has no `allowed_aliases` claim at all → fail closed.
+    NoAllowedAliases,
+    /// `allowed_aliases` non-empty but does not contain the requested alias.
+    AliasNotEntitled {
+        alias: String,
+        allowed: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for EntitlementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAllowedAliases => write!(f, "principal has no allowed aliases"),
+            Self::AliasNotEntitled { alias, allowed } => {
+                write!(
+                    f,
+                    "principal not entitled for alias '{alias}', allowed: [{}]",
+                    allowed.join(", ")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EntitlementError {}
+
+impl Principal {
+    /// Returns `Ok(())` if this principal's `allowed_aliases` covers `alias`.
+    /// Pure data query — returns an api-crate error type, never a `StatusCode`.
+    pub fn ensure_entitled_to(&self, alias: &str) -> Result<(), EntitlementError> {
+        if self.allowed_aliases.is_empty() {
+            return Err(EntitlementError::NoAllowedAliases);
+        }
+        if !self.allowed_aliases.iter().any(|a| a.as_str() == alias) {
+            return Err(EntitlementError::AliasNotEntitled {
+                alias: alias.to_owned(),
+                allowed: self.allowed_aliases.iter().map(|a| a.as_str().to_owned()).collect(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Why a credential was rejected. Fail-closed: any ambiguity ⇒ a `Denied` variant,
 /// never a silent allow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,5 +515,57 @@ mod tests {
     fn auth_method_serializes_snake_case() {
         let j = serde_json::to_string(&AuthMethod::SshKey).expect("serialize");
         assert_eq!(j, "\"ssh_key\"");
+    }
+
+    #[test]
+    fn ensure_entitled_to_empty_is_no_allowed_aliases() {
+        let p = Principal::shared_operator();
+        let err = p.ensure_entitled_to("any-alias").unwrap_err();
+        assert_eq!(err, EntitlementError::NoAllowedAliases);
+    }
+
+    #[test]
+    fn ensure_entitled_to_matching_alias_returns_ok() {
+        let p = Principal::new("alice", "alice", AuthMethod::A2aPeer)
+            .with_allowed_aliases(vec![
+                AgentAlias::new("agent1"),
+                AgentAlias::new("agent2"),
+            ]);
+        assert!(p.ensure_entitled_to("agent1").is_ok());
+        assert!(p.ensure_entitled_to("agent2").is_ok());
+    }
+
+    #[test]
+    fn ensure_entitled_to_non_matching_alias_returns_error() {
+        let p = Principal::new("bob", "bob", AuthMethod::A2aPeer)
+            .with_allowed_aliases(vec![AgentAlias::new("agent1")]);
+        let err = p.ensure_entitled_to("agent3").unwrap_err();
+        assert!(matches!(err, EntitlementError::AliasNotEntitled { .. }));
+        if let EntitlementError::AliasNotEntitled { alias, allowed } = err {
+            assert_eq!(alias, "agent3");
+            assert!(allowed.contains(&"agent1".to_string()));
+        }
+    }
+
+    #[test]
+    fn ensure_entitled_to_alias_via_str_slice() {
+        let p = Principal::new("carol", "carol", AuthMethod::Oidc)
+            .with_allowed_aliases(vec![AgentAlias::new("main")]);
+        assert!(p.ensure_entitled_to("main").is_ok());
+        assert!(p.ensure_entitled_to("other").is_err());
+    }
+
+    #[test]
+    fn entitlement_error_implements_display() {
+        let e = EntitlementError::NoAllowedAliases;
+        assert!(!format!("{e}").is_empty());
+
+        let e = EntitlementError::AliasNotEntitled {
+            alias: "foo".into(),
+            allowed: vec!["bar".into()],
+        };
+        let msg = format!("{e}");
+        assert!(msg.contains("foo"));
+        assert!(msg.contains("bar"));
     }
 }

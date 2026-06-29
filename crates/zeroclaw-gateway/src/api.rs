@@ -1919,7 +1919,6 @@ mod tests {
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
-    use zeroclaw_runtime::security::LiveConfigA2aResolver;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
     #[derive(Default)]
@@ -2128,7 +2127,19 @@ mod tests {
             sop_engine: None,
             sop_audit: None,
             #[cfg(feature = "a2a")]
-            a2a_provider_resolver: Arc::new(LiveConfigA2aResolver::new(Arc::new(RwLock::new(Config::default())))),
+            auth_registry: {
+                let mut reg = zeroclaw_runtime::security::ProviderRegistry::new();
+                reg.register(std::sync::Arc::new(
+                    zeroclaw_runtime::security::LiveA2aPeerProvider::new(
+                        std::sync::Arc::new(parking_lot::RwLock::new(
+                            zeroclaw_config::schema::Config::default(),
+                        )),
+                    ),
+                ));
+                std::sync::Arc::new(
+                    zeroclaw_runtime::security::auth_provider::LiveAuthRegistry::new(reg),
+                )
+            },
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

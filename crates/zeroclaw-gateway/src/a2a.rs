@@ -24,8 +24,8 @@
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 #[cfg(feature = "schema-export")]
@@ -35,10 +35,12 @@ use uuid::Uuid;
 
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::skills::SkillsService;
+use zeroclaw_api::principal::EntitlementError;
 
-use crate::{AppState, api::extract_bearer_token, run_gateway_chat_with_tools};
-use zeroclaw_api::principal::AuthOutcome;
-use zeroclaw_runtime::security::auth_provider::Credential;
+use crate::{
+    AppState, run_gateway_chat_with_tools,
+    auth_middleware::{AuthPrincipal, OptPrincipal},
+};
 
 /// A2A protocol version advertised on per-alias interfaces.
 const A2A_PROTOCOL_VERSION: &str = "1.0";
@@ -345,24 +347,22 @@ async fn handle_catalog_card(State(state): State<AppState>) -> impl IntoResponse
 
 /// `GET /a2a/{alias}/.well-known/agent-card.json` — a per-alias agent card.
 /// Authenticated A2A peers receive an extended card; anonymous callers receive
-/// the public view (filtered on skill exposure).
+/// the public view (filtered on skill exposure). Auth is `Optional` at the
+/// middleware level — the middleware resolves the credential if present and
+/// injects a [`Principal`] into extensions; `OptPrincipal` reads it.
 async fn handle_alias_card(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
-    headers: HeaderMap,
+    principal: OptPrincipal,
 ) -> impl IntoResponse {
     let config = state.config.read().clone();
     if !config.a2a.server.enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Check if requester is an authenticated A2A peer
-    let token = extract_bearer_token(&headers).unwrap_or("");
-    let credential = Credential::Bearer(token.to_string());
-    let is_peer = matches!(
-        state.a2a_provider_resolver.verify(&credential).await,
-        AuthOutcome::Authenticated(_)
-    );
+    // Check if requester is an authenticated A2A peer (middleware already
+    // verified the credential and injected the Principal).
+    let is_peer = principal.0.as_ref().is_some_and(|p| p.is_authenticated());
 
     match build_agent_card(&config, &alias) {
         Some(card) => {
@@ -454,6 +454,21 @@ pub(crate) struct OutTask {
     kind: String,
 }
 
+/// Build a 403 JSON response from an [`EntitlementError`].
+fn entitlement_error_response(err: &EntitlementError) -> Response {
+    let status = StatusCode::FORBIDDEN;
+    let detail = err.to_string();
+    (
+        status,
+        Json(serde_json::json!({
+            "error": "forbidden",
+            "detail": detail,
+            "status": status.as_u16(),
+        })),
+    )
+        .into_response()
+}
+
 fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -467,26 +482,22 @@ fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json:
 /// artifact. Requires A2A peer authentication (bearer token or OIDC), then gated
 /// on `[a2a.server] enabled` and the alias being published. The discovery cards
 /// are intentionally unauthenticated so peers can read the published surface.
+///
+/// Auth is handled by the `AgentScoped` middleware, which guarantees a valid
+/// `Principal` was injected into request extensions before this handler runs.
+/// The handler is still responsible for the agent-alias entitlement check via
+/// [`Principal::ensure_entitled_to`].
 async fn handle_alias_task(
     State(state): State<AppState>,
     axum::extract::Path(alias): axum::extract::Path<String>,
-    headers: HeaderMap,
+    AuthPrincipal(principal): AuthPrincipal,
     body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    // ── A2A peer authentication ──────────────────────────────────
-    let token = extract_bearer_token(&headers).unwrap_or("");
-    let credential = Credential::Bearer(token.to_string());
-    match state.a2a_provider_resolver.verify(&credential).await {
-        zeroclaw_api::principal::AuthOutcome::Authenticated { .. } => {}
-        _ => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "Unauthorized — A2A peer credentials required"
-                })),
-            )
-                .into_response();
-        }
+    // ── Agent-scoped entitlement ─────────────────────────────────
+    // Middleware already verified the credential (Authenticated outcome).
+    // Now check that the principal is entitled for this specific alias.
+    if let Err(err) = principal.ensure_entitled_to(&alias) {
+        return entitlement_error_response(&err);
     }
 
     {

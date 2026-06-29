@@ -101,7 +101,7 @@ pub trait AuthProvider: Send + Sync {
 /// The configured set of providers, consulted in order. **Default-deny**: if no
 /// provider accepts-and-authenticates the credential, the outcome is
 /// [`AuthOutcome::Denied`]. An empty registry rejects everything.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProviderRegistry {
     providers: Vec<Arc<dyn AuthProvider>>,
 }
@@ -134,6 +134,14 @@ impl ProviderRegistry {
     #[must_use]
     pub fn names(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.name()).collect()
+    }
+
+    /// Whether any registered provider accepts the given credential kind.
+    /// Used for pre-screening in `Optional` auth policies before calling
+    /// the (potentially expensive) `verify` path.
+    #[must_use]
+    pub fn accepts_any(&self, credential: &Credential) -> bool {
+        self.providers.iter().any(|p| p.accepts(credential))
     }
 
     /// Resolve a presented credential to an [`AuthOutcome`], **default-deny and
@@ -375,6 +383,157 @@ impl A2aPeerResolver for LiveConfigA2aResolver {
             A2aPeerProvider::from_peers(cfg.a2a.peers.clone(), cfg.peer_groups.clone())
         };
         // Provider is now pure data; verify may await freely.
+        provider.verify(credential).await
+    }
+}
+
+// ── AuthRegistry (gateway-facing auth facade) ──────────────────────────
+
+/// Gateway-facing facade over the full set of registered auth providers.
+///
+/// Provides a single `verify()` dispatch for the route-level auth middleware
+/// (`AuthLayer` in `zeroclaw-gateway`) that delegates to `ProviderRegistry`.
+/// This is the trait the middleware depends on, keeping it decoupled from
+/// the concrete provider list and registry internals.
+///
+/// Fail-closed contract: `verify` returns [`AuthOutcome::Denied`] for anything
+/// that cannot be positively authenticated — never a silent allow.
+#[async_trait::async_trait]
+pub trait AuthRegistry: Send + Sync {
+    /// Resolve a credential through all registered providers, returning the
+    /// first authoritative [`AuthOutcome`]. Follows the same default-deny and
+    /// authoritative-deny semantics as [`ProviderRegistry::resolve`].
+    async fn verify(&self, credential: &Credential) -> AuthOutcome;
+
+    /// Whether any registered provider accepts the given credential kind.
+    /// Used by the `Optional` policy to skip verification when no credential
+    /// is presented and no provider would accept it anyway.
+    fn accepts(&self, credential: &Credential) -> bool;
+}
+
+/// Concrete [`AuthRegistry`] wrapping a [`ProviderRegistry`].
+///
+/// The registry is behind a `parking_lot::RwLock` so new providers can be
+/// added at runtime (e.g., after a config reload adds an OIDC provider) —
+/// reads are uncontended at gateway scale and the lock is only held during
+/// the synchronous `resolve()` call (no `.await` under the lock).
+pub struct LiveAuthRegistry {
+    registry: parking_lot::RwLock<ProviderRegistry>,
+}
+
+impl LiveAuthRegistry {
+    /// Wrap an already-populated registry.
+    #[must_use]
+    pub fn new(registry: ProviderRegistry) -> Self {
+        Self {
+            registry: parking_lot::RwLock::new(registry),
+        }
+    }
+
+    /// Register an additional provider at runtime.
+    pub fn register(&self, provider: Arc<dyn AuthProvider>) {
+        self.registry.write().register(provider);
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthRegistry for LiveAuthRegistry {
+    async fn verify(&self, credential: &Credential) -> AuthOutcome {
+        // Snapshot the provider registry under the lock, then release
+        // BEFORE any await — `parking_lot::RwLockReadGuard` is not `Send`.
+        let registry = {
+            let guard = self.registry.read();
+            guard.clone()
+        };
+        let outcome = registry.resolve(credential).await;
+        match &outcome {
+            AuthOutcome::Authenticated(p) => {
+                zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "registry",
+                            "outcome": "authenticated",
+                            "user_id": crate::security::redact(&p.user_id),
+                            "auth_method": format!("{:?}", p.auth_method),
+                        })),
+                    "AuthRegistry::verify success"
+                );
+            }
+            AuthOutcome::Trusted(p) => {
+                zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "registry",
+                            "outcome": "trusted",
+                            "user_id": crate::security::redact(&p.user_id),
+                        })),
+                    "AuthRegistry::verify trusted (shared-operator)"
+                );
+            }
+            AuthOutcome::Denied { reason } => {
+                zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "registry",
+                            "outcome": "denied",
+                            "reason": format!("{reason:?}"),
+                        })),
+                    "AuthRegistry::verify denied"
+                );
+            }
+        }
+        outcome
+    }
+
+    fn accepts(&self, credential: &Credential) -> bool {
+        self.registry.read().accepts_any(credential)
+    }
+}
+
+/// An [`AuthProvider`] that reads `[a2a.peers]` and `[peer_groups]` from a
+/// live `Arc<RwLock<Config>>` on every `verify()` call.
+///
+/// This is the live-config-aware provider registered in the gateway's
+/// `ProviderRegistry` (via `LiveAuthRegistry`). Unlike `A2aPeerProvider`
+/// which snapshots peer state once at construction, this provider re-reads
+/// the canonical `Config` on every call so SIGHUP reload / dashboard PATCH
+/// propagates without a process restart (the #7410 invariant).
+pub struct LiveA2aPeerProvider {
+    config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+}
+
+impl LiveA2aPeerProvider {
+    /// Wrap a live-config handle. Typically constructed with
+    /// `state.config.clone()` from the gateway boot path.
+    #[must_use]
+    pub fn new(config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait::async_trait]
+impl AuthProvider for LiveA2aPeerProvider {
+    fn name(&self) -> &str {
+        "a2a-peer"
+    }
+
+    fn method(&self) -> AuthMethod {
+        AuthMethod::A2aPeer
+    }
+
+    fn accepts(&self, credential: &Credential) -> bool {
+        matches!(credential, Credential::Bearer(_))
+    }
+
+    async fn verify(&self, credential: &Credential) -> AuthOutcome {
+        let provider = {
+            let cfg = self.config.read();
+            A2aPeerProvider::from_peers(cfg.a2a.peers.clone(), cfg.peer_groups.clone())
+        };
         provider.verify(credential).await
     }
 }

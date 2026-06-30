@@ -371,6 +371,14 @@ pub async fn run(
         .await;
     }
 
+    // Consume the pricing catalog (`<data_dir>/pricing.json`) if present so the
+    // cost engine can price models the operator never hand-priced in config.
+    // This is consumption only and vendor-neutral: a typical build populates the
+    // file from a public price feed, while an air-gapped build may ship no file
+    // (self-hosted/free models then stay $0). Refreshing the file is a CLI +
+    // scheduler concern, never a public-feed fetch inside this shared daemon.
+    crate::agent::pricing_catalog::load_global_pricing_catalog(&config.data_dir);
+
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
     // Reload channel: gateway's /admin/reload writes here; our wait loop
@@ -590,6 +598,14 @@ pub async fn run(
             }
         };
 
+        let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+            Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
+                &config.hooks,
+            )))
+        } else {
+            None
+        };
+
         Some(std::sync::Arc::new(RpcContext {
             config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
             sessions,
@@ -612,6 +628,7 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            hooks,
         }))
     } else {
         None

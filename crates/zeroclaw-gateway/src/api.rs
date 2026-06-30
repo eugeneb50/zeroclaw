@@ -3816,18 +3816,20 @@ mod tests {
 
         let registry = Arc::new(DeviceRegistry::new(&data_dir));
         let device_id = "dev-1".to_string();
-        registry.register(
-            token_hash,
-            DeviceInfo {
-                id: device_id.clone(),
-                name: None,
-                device_type: None,
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                token_hash,
+                DeviceInfo {
+                    id: device_id.clone(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let mut state = test_state(config);
         state.pairing = pairing;
@@ -3854,18 +3856,20 @@ mod tests {
 
         // A real, already-registered device with a name.
         let known_hash = "a".repeat(64);
-        registry.register(
-            known_hash.clone(),
-            DeviceInfo {
-                id: "known".into(),
-                name: Some("My Laptop".into()),
-                device_type: Some("desktop".into()),
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                known_hash.clone(),
+                DeviceInfo {
+                    id: "known".into(),
+                    name: Some("My Laptop".into()),
+                    device_type: Some("desktop".into()),
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let orphan_a = "b".repeat(64);
         let orphan_b = "c".repeat(64);
@@ -3878,6 +3882,7 @@ mod tests {
         // Existing metadata is preserved, not clobbered.
         let known = registry
             .list()
+            .expect("test device registry list")
             .into_iter()
             .find(|d| d.id == "known")
             .expect("known device still present");
@@ -3924,6 +3929,7 @@ mod tests {
         // revoking that hash from the guard actually de-authenticates the token.
         let device = registry
             .list()
+            .expect("test device registry list")
             .into_iter()
             .next()
             .expect("one backfilled device");
@@ -4149,18 +4155,20 @@ mod tests {
                 .generate_new_pairing_code()
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
-            registry.register(
-                PairingGuard::token_hash(&tok),
-                DeviceInfo {
-                    id: id.to_string(),
-                    name: None,
-                    device_type: None,
-                    paired_at: Utc::now(),
-                    last_seen: Utc::now(),
-                    ip_address: None,
-                    capabilities: None,
-                },
-            );
+            registry
+                .register(
+                    PairingGuard::token_hash(&tok),
+                    DeviceInfo {
+                        id: id.to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: Utc::now(),
+                        last_seen: Utc::now(),
+                        ip_address: None,
+                        capabilities: None,
+                    },
+                )
+                .expect("test device registry insert");
         }
 
         let mut state = test_state(config);

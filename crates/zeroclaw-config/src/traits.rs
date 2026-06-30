@@ -260,6 +260,20 @@ impl HasPropKind for Vec<crate::schema::ToolFilterGroup> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
 
+// PR-F: enterprise compliance posture types.
+// Note: `ComplianceRegime` derives `ConfigEnum`, which generates its own
+// `HasPropKind` impl (`PropKind::Enum`). We only need to add impls for
+// types the derive does not cover.
+impl HasPropKind for Vec<crate::compliance::ComplianceRegime> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
+}
+impl HasPropKind for crate::compliance::KillSwitchSigner {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+impl HasPropKind for Vec<crate::compliance::KillSwitchSigner> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+
 /// Security classification for credential-shaped config surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSurfaceClass {

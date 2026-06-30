@@ -197,6 +197,13 @@ pub struct Config {
     #[group = "Operations"]
     pub security_ops: SecurityOpsConfig,
 
+    /// Enterprise compliance posture (`[compliance]`). Drives
+    /// `zeroclaw compliance report` / `audit-trail` / `ai-bom`. PR-F.
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub compliance: crate::compliance::ComplianceConfig,
+
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
     #[nested]
@@ -15914,6 +15921,7 @@ impl Default for Config {
             conversational_ai: ConversationalAiConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
+            compliance: crate::compliance::ComplianceConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -21759,6 +21767,7 @@ auto_save = true
             conversational_ai: ConversationalAiConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
+            compliance: crate::compliance::ComplianceConfig::default(),
             runtime: RuntimeConfig {
                 kind: RuntimeKind::Docker,
                 ..RuntimeConfig::default()
@@ -22495,6 +22504,7 @@ default_temperature = 0.7
             conversational_ai: ConversationalAiConfig::default(),
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
+            compliance: crate::compliance::ComplianceConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),

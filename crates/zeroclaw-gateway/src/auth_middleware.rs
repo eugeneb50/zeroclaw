@@ -550,4 +550,58 @@ mod tests {
         let resp = app.oneshot(make_request(Some("any-token"))).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn auth_layer_accepts_external_peer_via_a2a_external_peers() {
+        use std::collections::HashMap;
+        use zeroclaw_config::multi_agent::{
+            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
+        };
+        use zeroclaw_runtime::security::auth_provider::A2aPeerProvider;
+
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "infra".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("ops-bot")],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: [(
+                    "ext-ci".to_string(),
+                    A2aExternalPeerEntry {
+                        credential: "ci-secret".into(),
+                        allowed_aliases_override: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(provider));
+        let registry: Arc<dyn AuthRegistry> = Arc::new(LiveAuthRegistry::new(reg));
+
+        let app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(AuthLayer::required(registry));
+
+        // Valid external peer credential → 200
+        let ok_resp = app
+            .clone()
+            .oneshot(make_request(Some("ci-secret")))
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), StatusCode::OK);
+
+        // Wrong credential → 401
+        let bad_resp = app
+            .oneshot(make_request(Some("wrong-token")))
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

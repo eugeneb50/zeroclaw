@@ -320,6 +320,34 @@ impl AuthProvider for A2aPeerProvider {
             }
         }
 
+        // Check peer-group-scoped A2A external peer credentials.
+        // Unlike top-level `[a2a.peers]` entries (which store a pre-computed
+        // token_hash), the credential here is stored in plaintext and hashed
+        // at verify time for operator ergonomics.
+        for (pg_name, group_config) in &self.peer_groups {
+            for (peer_id, entry) in &group_config.a2a_external_peers {
+                let presented_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+                let expected_hash =
+                    hex::encode(sha2::Sha256::digest(entry.credential.as_bytes()));
+                if constant_time_eq(&presented_hash, &expected_hash) {
+                    let allowed_aliases = entry
+                        .allowed_aliases_override
+                        .clone()
+                        .unwrap_or_else(|| group_config.agents.to_vec());
+
+                    let principal = Principal::new(
+                        zeroclaw_api::principal::PrincipalId::from(peer_id.clone()),
+                        peer_id.clone(),
+                        AuthMethod::A2aPeer,
+                    )
+                    .with_allowed_aliases(allowed_aliases)
+                    .with_peer_group(pg_name);
+
+                    return AuthOutcome::Authenticated(principal);
+                }
+            }
+        }
+
         AuthOutcome::Denied {
             reason: DenyReason::BadCredential,
         }
@@ -817,9 +845,10 @@ mod tests {
 
     #[tokio::test]
     async fn a2a_peer_provider_with_peer_group_assigns_principal_fields() {
+        use std::collections::HashMap;
         use zeroclaw_config::multi_agent::{A2aServerSection, AgentAlias, PeerGroupConfig};
         let token_hash = hex::encode(sha2::Sha256::digest("secret".as_bytes()));
-        let mut peer_groups = std::collections::HashMap::new();
+        let mut peer_groups = HashMap::new();
         peer_groups.insert(
             "research-org".to_string(),
             PeerGroupConfig {
@@ -828,6 +857,7 @@ mod tests {
                 external_peers: Vec::new(),
                 ignore: Vec::new(),
                 output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: HashMap::new(),
             },
         );
 
@@ -1049,6 +1079,7 @@ mod tests {
                     external_peers: Vec::new(),
                     ignore: Vec::new(),
                     output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                    a2a_external_peers: std::collections::HashMap::new(),
                 },
             );
             w.a2a.peers.insert(
@@ -1078,6 +1109,90 @@ mod tests {
             }
             o => panic!("expected Authenticated, got {o:?}"),
         }
+    }
+
+    /// External peer added via live config reload without process restart.
+    /// Proves that `a2a_external_peers` entries inside peer groups are read
+    /// fresh from `Arc<RwLock<Config>>` on every verify, mirroring the #7410
+    /// anti-snapshot pattern.
+    #[tokio::test]
+    async fn live_config_resolver_picks_up_new_reloaded_external_peer() {
+        use std::collections::HashMap;
+        use zeroclaw_config::multi_agent::{
+            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
+        };
+
+        let (state, resolver) = {
+            let state = Arc::new(parking_lot::RwLock::new(
+                zeroclaw_config::schema::Config::default(),
+            ));
+            let resolver = LiveConfigA2aResolver::new(Arc::clone(&state));
+            (state, resolver)
+        };
+
+        // Start with a peer group that has no a2a_external_peers.
+        let mut mg = HashMap::new();
+        mg.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("bot")],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: HashMap::new(),
+            },
+        );
+        {
+            let mut w = state.write();
+            w.peer_groups = mg.clone();
+        }
+
+        // 1. Unknown external peer token is rejected before reload.
+        assert!(
+            !resolver
+                .verify(&Credential::Bearer("ext-tok".into()))
+                .await
+                .is_allowed(),
+            "unknown peer must be rejected before reload"
+        );
+
+        // 2. Mutate config: add an a2a_external_peers entry for the peer group.
+        {
+            let mut w = state.write();
+            w.peer_groups
+                .get_mut("ops")
+                .unwrap()
+                .a2a_external_peers
+                .insert("ext-peer".into(), A2aExternalPeerEntry {
+                    credential: "ext-tok".into(),
+                    allowed_aliases_override: None,
+                });
+        }
+
+        // 3. Now the external peer token is accepted — live reload, no restart.
+        match resolver
+            .verify(&Credential::Bearer("ext-tok".into()))
+            .await
+        {
+            AuthOutcome::Authenticated(p) => {
+                assert_eq!(p.id.as_str(), "ext-peer");
+                assert_eq!(p.peer_group.as_deref(), Some("ops"));
+                let aliases: Vec<&str> =
+                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                assert!(aliases.contains(&"bot"));
+            }
+            o => panic!("expected Authenticated after reload, got {o:?}"),
+        }
+
+        // 4. Token for a peer NOT in a2a_external_peers is still denied.
+        assert!(
+            !resolver
+                .verify(&Credential::Bearer("unknown-tok".into()))
+                .await
+                .is_allowed(),
+            "unknown token must remain denied after reload"
+        );
     }
 
     /// Lock discipline: the live-config resolver must NOT hold the
@@ -1125,5 +1240,177 @@ mod tests {
         // And the verify resolves successfully.
         let outcome = verify_task.await;
         assert!(outcome.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_authenticates_external_peer() {
+        use std::collections::HashMap;
+        use zeroclaw_config::multi_agent::{
+            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
+        };
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "ops-team".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![
+                    AgentAlias::new("ops-bot-alpha"),
+                    AgentAlias::new("ops-bot-beta"),
+                ],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: [(
+                    "infra-jenkins".to_string(),
+                    A2aExternalPeerEntry {
+                        credential: "sk-jenkins-secret".into(),
+                        allowed_aliases_override: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
+
+        let outcome = provider
+            .verify(&Credential::Bearer("sk-jenkins-secret".into()))
+            .await;
+        match outcome {
+            AuthOutcome::Authenticated(p) => {
+                assert_eq!(p.peer_group.as_deref(), Some("ops-team"));
+                assert_eq!(p.id.as_str(), "infra-jenkins");
+                let aliases: Vec<&str> =
+                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                assert!(aliases.contains(&"ops-bot-alpha"));
+                assert!(aliases.contains(&"ops-bot-beta"));
+            }
+            o => panic!("expected Authenticated, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_rejects_wrong_external_credential() {
+        use std::collections::HashMap;
+        use zeroclaw_config::multi_agent::{
+            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
+        };
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "ops-team".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("ops-bot-alpha")],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: [(
+                    "infra-jenkins".to_string(),
+                    A2aExternalPeerEntry {
+                        credential: "real-token".into(),
+                        allowed_aliases_override: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
+
+        let outcome = provider
+            .verify(&Credential::Bearer("wrong-token".into()))
+            .await;
+        assert!(!outcome.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_external_peer_respects_alias_override() {
+        use std::collections::HashMap;
+        use zeroclaw_config::multi_agent::{
+            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
+        };
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "ops-team".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![
+                    AgentAlias::new("ops-bot-alpha"),
+                    AgentAlias::new("ops-bot-beta"),
+                ],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: [(
+                    "limited-peer".to_string(),
+                    A2aExternalPeerEntry {
+                        credential: "tok".into(),
+                        allowed_aliases_override: Some(vec![AgentAlias::new(
+                            "ops-bot-alpha",
+                        )]),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
+
+        let outcome = provider
+            .verify(&Credential::Bearer("tok".into()))
+            .await;
+        match outcome {
+            AuthOutcome::Authenticated(p) => {
+                let aliases: Vec<&str> =
+                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                assert_eq!(aliases, vec!["ops-bot-alpha"]);
+            }
+            o => panic!("expected Authenticated, got {o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a2a_peer_provider_external_peer_without_override_inherits_agents() {
+        use std::collections::HashMap;
+        use zeroclaw_config::multi_agent::{
+            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
+        };
+        let mut peer_groups = HashMap::new();
+        peer_groups.insert(
+            "ops-team".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("alpha")],
+                external_peers: Vec::new(),
+                ignore: Vec::new(),
+                output_modality: zeroclaw_config::multi_agent::OutputModality::Mirror,
+                a2a_external_peers: [(
+                    "ext".to_string(),
+                    A2aExternalPeerEntry {
+                        credential: "x".into(),
+                        allowed_aliases_override: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+
+        let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
+
+        let outcome = provider
+            .verify(&Credential::Bearer("x".into()))
+            .await;
+        match outcome {
+            AuthOutcome::Authenticated(p) => {
+                let aliases: Vec<&str> =
+                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                assert_eq!(aliases, vec!["alpha"]);
+            }
+            o => panic!("expected Authenticated, got {o:?}"),
+        }
     }
 }

@@ -143,6 +143,41 @@ pub enum OutputModality {
 }
 
 /// `[peer_groups.<name>]` — mutual-opt-in peer group on a channel type.
+/// An external A2A peer credential, scoped to a peer group.
+///
+/// Defined inline under `[peer_groups.<name>.a2a_external_peers.<peer_id>]`
+/// rather than polluting the top-level `[a2a.peers]` table. Each entry carries
+/// its own bearer credential and an optional `allowed_aliases_override` that
+/// replaces the parent group's `agents` list during authorization.
+///
+/// **This is the source of truth for a peer-group-scoped A2A credential.**
+/// Do not duplicate this shape elsewhere.
+#[derive(Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct A2aExternalPeerEntry {
+    /// Bearer token the external agent presents in the `Authorization` header.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    pub credential: String,
+    /// Optional override for the set of agent aliases this external peer is
+    /// allowed to target. When absent (or empty), inherits the parent peer
+    /// group's `agents` list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_aliases_override: Option<Vec<AgentAlias>>,
+}
+
+impl std::fmt::Debug for A2aExternalPeerEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A2aExternalPeerEntry")
+            .field("credential", &"[REDACTED]")
+            .field(
+                "allowed_aliases_override",
+                &self.allowed_aliases_override,
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "peer_group"]
@@ -163,6 +198,16 @@ pub struct PeerGroupConfig {
     /// agent always reply and deliver proactive messages (cron, announces)
     /// as TTS voice notes on channels that support audio output.
     pub output_modality: OutputModality,
+    /// External A2A peers scoped to this peer group.
+    ///
+    /// Maps peer IDs to bearer credentials and optional alias overrides.
+    /// Unlike `agents` (local aliases) and `external_peers` (channel-native
+    /// usernames), these entries authenticate *inbound A2A requests* from
+    /// agents outside the local deployment. The `A2aPeerProvider::verify()`
+    /// flow merges these entries with the `agents` list when resolving
+    /// `allowed_aliases`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub a2a_external_peers: HashMap<String, A2aExternalPeerEntry>,
 }
 
 /// `[a2a.server]` — inbound A2A discovery server.

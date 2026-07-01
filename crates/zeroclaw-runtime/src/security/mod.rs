@@ -58,8 +58,8 @@ pub use auth_provider::{A2aPeerResolver, LiveConfigA2aResolver};
 // Gateway-facing auth registry — the trait and concrete wrapper that the
 // route-level AuthLayer depends on. Re-exported so zeroclaw-gateway imports
 // via `zeroclaw_runtime::security::AuthRegistry`.
-pub use auth_provider::{AuthRegistry, LiveA2aPeerProvider, LiveAuthRegistry};
 pub use auth_provider::ProviderRegistry;
+pub use auth_provider::{AuthRegistry, LiveA2aPeerProvider, LiveAuthRegistry};
 
 #[allow(unused_imports)]
 pub use audit::{AuditEvent, AuditEventType, AuditLogger};

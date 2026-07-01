@@ -46,6 +46,7 @@ pub mod auth;
 #[cfg(feature = "agent-runtime")]
 pub mod channels;
 pub mod commands;
+pub mod compliance; // PR-F (test surface; executable reaches it via zeroclaw::compliance)
 pub mod config;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod cost;

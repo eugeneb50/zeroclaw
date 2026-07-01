@@ -33,13 +33,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use zeroclaw_api::principal::EntitlementError;
 use zeroclaw_config::schema::Config;
 use zeroclaw_runtime::skills::SkillsService;
-use zeroclaw_api::principal::EntitlementError;
 
 use crate::{
-    AppState, run_gateway_chat_with_tools,
+    AppState,
     auth_middleware::{AuthPrincipal, OptPrincipal},
+    run_gateway_chat_with_tools,
 };
 
 /// A2A protocol version advertised on per-alias interfaces.

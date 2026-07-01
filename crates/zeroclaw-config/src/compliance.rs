@@ -23,7 +23,15 @@ use serde::{Deserialize, Serialize};
 /// `#[non_exhaustive]` so future epics (`PR-F2`+) extend the enum without
 /// breaking external call sites.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
     zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -54,6 +62,7 @@ pub enum ComplianceRegime {
 /// Do not duplicate this shape elsewhere.
 #[derive(Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[natural_key = "signer_id"]
 pub struct KillSwitchSigner {
     /// Opaque operator identifier (e.g. `"ops-primary"`).
     pub signer_id: String,
@@ -99,7 +108,16 @@ pub struct ComplianceConfig {
     /// means the kill-switch can be engaged with the local API but only
     /// the operator on-host shell can resume without an external signer
     /// (intentionally restrictive default).
+    ///
+    /// `#[nested]` is required so the `Configurable` derive's
+    /// `encrypt_secrets` / `decrypt_secrets` recursion reaches each
+    /// `KillSwitchSigner.credential_ref`. Without `#[nested]` the macro
+    /// treats the field as opaque and the plaintext value would survive
+    /// `Config::save()`. The save/readback regression test
+    /// `compliance_kill_switch_signer_round_trips_encrypted` pins this.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[nested]
+    #[natural_key = "signer_id"]
     pub kill_switch_signers: Vec<KillSwitchSigner>,
 
     /// AI-BOM refresh cadence (cron-style 5-field expression). `null` =

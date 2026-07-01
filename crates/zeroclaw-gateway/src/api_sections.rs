@@ -1482,11 +1482,9 @@ mod tests {
             auth_registry: {
                 let mut reg = zeroclaw_runtime::security::ProviderRegistry::new();
                 reg.register(std::sync::Arc::new(
-                    zeroclaw_runtime::security::LiveA2aPeerProvider::new(
-                        std::sync::Arc::new(parking_lot::RwLock::new(
-                            zeroclaw_config::schema::Config::default(),
-                        )),
-                    ),
+                    zeroclaw_runtime::security::LiveA2aPeerProvider::new(std::sync::Arc::new(
+                        parking_lot::RwLock::new(zeroclaw_config::schema::Config::default()),
+                    )),
                 ));
                 std::sync::Arc::new(
                     zeroclaw_runtime::security::auth_provider::LiveAuthRegistry::new(reg),

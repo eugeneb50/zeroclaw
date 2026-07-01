@@ -16,10 +16,10 @@ use std::{
 };
 
 use axum::{
+    Json,
     extract::{FromRequestParts, Request},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
 };
 use tower::Layer;
 use zeroclaw_api::principal::{AuthOutcome, DenyReason, Principal};
@@ -130,8 +130,10 @@ where
 
             match this.policy {
                 AuthPolicy::Optional => {
-                    if matches!(credential, zeroclaw_runtime::security::auth_provider::Credential::None)
-                        || !this.registry.accepts(&credential)
+                    if matches!(
+                        credential,
+                        zeroclaw_runtime::security::auth_provider::Credential::None
+                    ) || !this.registry.accepts(&credential)
                     {
                         let req = Request::from_parts(parts, body);
                         return this.inner.call(req).await;
@@ -149,37 +151,33 @@ where
                         )),
                     }
                 }
-                AuthPolicy::Required => {
-                    match this.registry.verify(&credential).await {
-                        AuthOutcome::Authenticated(p) | AuthOutcome::Trusted(p) => {
-                            parts.extensions.insert(p);
-                            let req = Request::from_parts(parts, body);
-                            this.inner.call(req).await
-                        }
-                        AuthOutcome::Denied { reason } => {
-                            let (status, error, detail) = deny_to_response_parts(reason);
-                            Ok(auth_error_response(status, error, detail))
-                        }
+                AuthPolicy::Required => match this.registry.verify(&credential).await {
+                    AuthOutcome::Authenticated(p) | AuthOutcome::Trusted(p) => {
+                        parts.extensions.insert(p);
+                        let req = Request::from_parts(parts, body);
+                        this.inner.call(req).await
                     }
-                }
-                AuthPolicy::AgentScoped => {
-                    match this.registry.verify(&credential).await {
-                        AuthOutcome::Authenticated(p) => {
-                            parts.extensions.insert(p);
-                            let req = Request::from_parts(parts, body);
-                            this.inner.call(req).await
-                        }
-                        AuthOutcome::Trusted(_) => Ok(auth_error_response(
-                            StatusCode::UNAUTHORIZED,
-                            "unauthorized",
-                            "Agent-scoped routes require peer authentication",
-                        )),
-                        AuthOutcome::Denied { reason } => {
-                            let (status, error, detail) = deny_to_response_parts(reason);
-                            Ok(auth_error_response(status, error, detail))
-                        }
+                    AuthOutcome::Denied { reason } => {
+                        let (status, error, detail) = deny_to_response_parts(reason);
+                        Ok(auth_error_response(status, error, detail))
                     }
-                }
+                },
+                AuthPolicy::AgentScoped => match this.registry.verify(&credential).await {
+                    AuthOutcome::Authenticated(p) => {
+                        parts.extensions.insert(p);
+                        let req = Request::from_parts(parts, body);
+                        this.inner.call(req).await
+                    }
+                    AuthOutcome::Trusted(_) => Ok(auth_error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "unauthorized",
+                        "Agent-scoped routes require peer authentication",
+                    )),
+                    AuthOutcome::Denied { reason } => {
+                        let (status, error, detail) = deny_to_response_parts(reason);
+                        Ok(auth_error_response(status, error, detail))
+                    }
+                },
             }
         })
     }
@@ -266,23 +264,31 @@ fn auth_error_response(status: StatusCode, error: &'static str, detail: &'static
 #[must_use]
 fn deny_to_response_parts(reason: DenyReason) -> (StatusCode, &'static str, &'static str) {
     match reason {
-        DenyReason::NoCredential => {
-            (StatusCode::UNAUTHORIZED, "unauthorized", "Missing authentication")
-        }
-        DenyReason::BadCredential => {
-            (StatusCode::UNAUTHORIZED, "unauthorized", "Invalid authentication credentials")
-        }
-        DenyReason::TokenExpired => {
-            (StatusCode::UNAUTHORIZED, "unauthorized", "Authentication token has expired")
-        }
+        DenyReason::NoCredential => (
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing authentication",
+        ),
+        DenyReason::BadCredential => (
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Invalid authentication credentials",
+        ),
+        DenyReason::TokenExpired => (
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Authentication token has expired",
+        ),
         DenyReason::MfaRequired => (
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "Multi-factor authentication required",
         ),
-        DenyReason::AliasNotEntitled => {
-            (StatusCode::FORBIDDEN, "forbidden", "Not entitled for the requested agent alias")
-        }
+        DenyReason::AliasNotEntitled => (
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Not entitled for the requested agent alias",
+        ),
         DenyReason::Misconfigured => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "misconfigured",
@@ -296,8 +302,29 @@ fn credential_from_headers(
     headers: &HeaderMap,
 ) -> zeroclaw_runtime::security::auth_provider::Credential {
     crate::api::extract_bearer_token(headers)
-        .map(|token| zeroclaw_runtime::security::auth_provider::Credential::Bearer(token.to_owned()))
+        .map(|token| {
+            zeroclaw_runtime::security::auth_provider::Credential::Bearer(token.to_owned())
+        })
         .unwrap_or(zeroclaw_runtime::security::auth_provider::Credential::None)
+}
+
+// ── PR-F: audit-stamp helper ────────────────────────────────────────────
+
+/// Extract the audit-relevant fields from a `Principal` to feed
+/// `AuditEvent::with_principal(&self, …)`. Returns `(principal_id,
+/// auth_method)` already serialized in the form that lands verbatim
+/// in the audit chain's canonical JSON.
+///
+/// `auth_method` is routed through [`AuthMethod::as_wire_name`] — the
+/// single source of truth in `zeroclaw_api::principal` — so the
+/// `serde(rename_all = "snake_case")` renamer and this helper can never
+/// drift apart. Caller threads both fields through into
+/// `AuditEvent::with_principal(...)`; no owned `AuditPrincipalInfo`
+/// struct is materialized, eliminating the intermediate allocation
+/// per request.
+#[must_use]
+pub fn principal_to_audit_actor(principal: &Principal) -> (&str, &'static str) {
+    (principal.id.as_str(), principal.auth_method.as_wire_name())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -305,6 +332,7 @@ fn credential_from_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use axum::{Router, body::Body, http::Request, routing::get};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -313,32 +341,34 @@ mod tests {
         LiveAuthRegistry, ProviderRegistry,
         auth_provider::{AuthProvider, Credential},
     };
-    use async_trait::async_trait;
 
     /// A stub provider that accepts one fixed bearer token.
     struct StubProvider;
 
     #[async_trait]
     impl AuthProvider for StubProvider {
-        fn name(&self) -> &str { "stub" }
-        fn method(&self) -> AuthMethod { AuthMethod::A2aPeer }
+        fn name(&self) -> &str {
+            "stub"
+        }
+        fn method(&self) -> AuthMethod {
+            AuthMethod::A2aPeer
+        }
         fn accepts(&self, credential: &Credential) -> bool {
             matches!(credential, Credential::Bearer(_))
         }
         async fn verify(&self, credential: &Credential) -> AuthOutcome {
             match credential {
-                Credential::Bearer(t) if t == "valid-token" => {
-                    AuthOutcome::Authenticated(
-                        Principal::new("peer-1", "Peer One", AuthMethod::A2aPeer)
-                            .with_allowed_aliases(vec![
-                                zeroclaw_api::principal::AgentAlias::new("agent1"),
-                            ]),
-                    )
-                }
+                Credential::Bearer(t) if t == "valid-token" => AuthOutcome::Authenticated(
+                    Principal::new("peer-1", "Peer One", AuthMethod::A2aPeer).with_allowed_aliases(
+                        vec![zeroclaw_api::principal::AgentAlias::new("agent1")],
+                    ),
+                ),
                 Credential::Bearer(t) if t == "trusted-token" => {
                     AuthOutcome::Trusted(Principal::shared_operator())
                 }
-                _ => AuthOutcome::Denied { reason: DenyReason::BadCredential },
+                _ => AuthOutcome::Denied {
+                    reason: DenyReason::BadCredential,
+                },
             }
         }
     }
@@ -352,10 +382,8 @@ mod tests {
     fn make_request(token: Option<&str>) -> Request<Body> {
         let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         if let Some(t) = token {
-            req.headers_mut().insert(
-                "authorization",
-                format!("Bearer {t}").parse().unwrap(),
-            );
+            req.headers_mut()
+                .insert("authorization", format!("Bearer {t}").parse().unwrap());
         }
         req
     }
@@ -376,7 +404,10 @@ mod tests {
             .route("/test", get(|| async { "ok" }))
             .layer(AuthLayer::required(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("valid-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("valid-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -386,7 +417,10 @@ mod tests {
             .route("/test", get(|| async { "ok" }))
             .layer(AuthLayer::required(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("wrong-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("wrong-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -416,7 +450,10 @@ mod tests {
             .route("/test", get(handler))
             .layer(AuthLayer::optional(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("valid-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("valid-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -426,7 +463,10 @@ mod tests {
             .route("/test", get(|| async { "ok" }))
             .layer(AuthLayer::optional(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("wrong-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("wrong-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -436,7 +476,10 @@ mod tests {
             .route("/test", get(|| async { "ok" }))
             .layer(AuthLayer::agent_scoped(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("valid-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("valid-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -461,13 +504,18 @@ mod tests {
             .route("/test", get(handler))
             .layer(AuthLayer::required(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("valid-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("valid-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn auth_principal_extractor_rejects_no_auth() {
-        async fn handler(_: AuthPrincipal) -> impl IntoResponse { "ok" }
+        async fn handler(_: AuthPrincipal) -> impl IntoResponse {
+            "ok"
+        }
 
         let app = Router::new()
             .route("/test", get(handler))
@@ -503,7 +551,10 @@ mod tests {
             .route("/test", get(handler))
             .layer(AuthLayer::optional(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("valid-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("valid-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -520,7 +571,10 @@ mod tests {
             .route("/test", get(handler))
             .layer(AuthLayer::optional(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("trusted-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("trusted-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -530,12 +584,18 @@ mod tests {
             .route("/test", get(|| async { "ok" }))
             .layer(AuthLayer::required(registry_with_stub()));
 
-        let resp = app.oneshot(make_request(Some("wrong-token"))).await.unwrap();
+        let resp = app
+            .oneshot(make_request(Some("wrong-token")))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body["error"], "unauthorized");
         assert_eq!(body["status"], 401);
     }
@@ -554,9 +614,7 @@ mod tests {
     #[tokio::test]
     async fn auth_layer_accepts_external_peer_via_a2a_external_peers() {
         use std::collections::HashMap;
-        use zeroclaw_config::multi_agent::{
-            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
-        };
+        use zeroclaw_config::multi_agent::{A2aExternalPeerEntry, AgentAlias, PeerGroupConfig};
         use zeroclaw_runtime::security::auth_provider::A2aPeerProvider;
 
         let mut peer_groups = HashMap::new();
@@ -603,5 +661,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── PR-F: principal_to_audit_actor tests ─────────────────────────────
+
+    #[test]
+    fn principal_to_audit_actor_for_oidc() {
+        let p = zeroclaw_api::principal::Principal::new(
+            "alice-7c9",
+            "alice",
+            zeroclaw_api::principal::AuthMethod::Oidc,
+        );
+        let (id, method) = principal_to_audit_actor(&p);
+        assert_eq!(id, "alice-7c9");
+        assert_eq!(method, "oidc");
+    }
+
+    #[test]
+    fn principal_to_audit_actor_for_every_method_via_serde_round_trip() {
+        // Cross-check: every variant of `AuthMethod` must yield the same
+        // string from `AuthMethod::as_wire_name` (the PR-F single source
+        // of truth) as its serde snake_case JSON form. This guards against
+        // future variants drifting the two in lock-step.
+        for (method, expected) in [
+            (zeroclaw_api::principal::AuthMethod::None, "none"),
+            (
+                zeroclaw_api::principal::AuthMethod::SharedOperator,
+                "shared_operator",
+            ),
+            (zeroclaw_api::principal::AuthMethod::Oidc, "oidc"),
+            (zeroclaw_api::principal::AuthMethod::SshKey, "ssh_key"),
+            (zeroclaw_api::principal::AuthMethod::Peercred, "peercred"),
+            (zeroclaw_api::principal::AuthMethod::Native, "native"),
+            (zeroclaw_api::principal::AuthMethod::A2aPeer, "a2a_peer"),
+        ] {
+            let p = zeroclaw_api::principal::Principal::new("id", "user", method);
+            let (id, from_helper) = principal_to_audit_actor(&p);
+            assert_eq!(id, "id");
+            assert_eq!(from_helper, expected, "method {method:?}");
+            // Canonical cross-check: serde round-trip strips two quote
+            // characters only; the body must equal `from_helper`.
+            let from_serde = serde_json::to_string(&method)
+                .expect("serialize")
+                .trim_matches('"')
+                .to_owned();
+            assert_eq!(
+                from_serde, from_helper,
+                "serde-derived string drifted from as_wire_name for {method:?}"
+            );
+        }
     }
 }

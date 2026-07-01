@@ -170,10 +170,7 @@ impl std::fmt::Debug for A2aExternalPeerEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("A2aExternalPeerEntry")
             .field("credential", &"[REDACTED]")
-            .field(
-                "allowed_aliases_override",
-                &self.allowed_aliases_override,
-            )
+            .field("allowed_aliases_override", &self.allowed_aliases_override)
             .finish()
     }
 }

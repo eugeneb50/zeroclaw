@@ -84,6 +84,21 @@ pub struct AuditEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_alias: Option<String>,
 
+    /// PR-F: stable opaque id of the authenticated `Principal` that
+    /// initiated this event (RFC #7141). `None` for events emitted
+    /// before the auth seam landed and for system events unbound to
+    /// any inbound connection. Auditor-eyeball join key for
+    /// "no human request" accountability gaps (SOC 2 Type II CC7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
+    /// PR-F: how the principal authenticated (`AuthMethod` serialized
+    /// in its snake_case form — `oidc`, `ssh_key`, `peercred`,
+    /// `native`, `a2a_peer`, `shared_operator`, or `none`). Drives
+    /// "distinct IdP attestation vs. trusted local" calls in audit
+    /// review. Always present iff `principal_id` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+
     /// Monotonically increasing sequence number.
     #[serde(default)]
     pub sequence: u64,
@@ -115,6 +130,8 @@ impl AuditEvent {
                 sandbox_backend: None,
             },
             agent_alias: None,
+            principal_id: None,
+            auth_method: None,
             sequence: 0,
             prev_hash: String::new(),
             entry_hash: String::new(),
@@ -144,6 +161,28 @@ impl AuditEvent {
     #[must_use]
     pub fn with_agent_alias(mut self, agent_alias: impl Into<String>) -> Self {
         self.agent_alias = Some(agent_alias.into());
+        self
+    }
+
+    /// PR-F: stamp the resolved `Principal` onto this audit entry.
+    /// Both `principal_id` (stable opaque id) and `auth_method`
+    /// (snake-case form) are recorded, so the chain-hash can be
+    /// re-verified later with the same canonical-JSON map. Calling
+    /// this on a system event with no Principal is a no-op.
+    ///
+    /// # Arguments
+    /// - `principal_id` — the `Principal.id.0` (opaque, audit join key)
+    /// - `auth_method`  — the `AuthMethod`'s serde snake_case form
+    ///   (`"none"` / `"shared_operator"` / `"oidc"` / `"ssh_key"` /
+    ///   `"peercred"` / `"native"` / `"a2a_peer"`).
+    #[must_use]
+    pub fn with_principal(
+        mut self,
+        principal_id: impl Into<String>,
+        auth_method: impl Into<String>,
+    ) -> Self {
+        self.principal_id = Some(principal_id.into());
+        self.auth_method = Some(auth_method.into());
         self
     }
 
@@ -192,6 +231,12 @@ impl AuditEvent {
 ///
 /// `content_json` is the canonical JSON of the event *without* the chain fields
 /// (`sequence`, `prev_hash`, `entry_hash`), so the hash covers only the payload.
+///
+/// PR-F: `principal_id` and `auth_method` are included in the canonical map
+/// from day one. Adding fields to `AuditEvent` *without* extending the
+/// canonical-JSON map silently invalidates the hash chain at every
+/// existing log — this is the failure mode the SAV read-write regression
+/// and the audit-trail verify both surface.
 fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
     // Build a canonical representation of the content fields only.
     let content = serde_json::json!({
@@ -202,6 +247,8 @@ fn compute_entry_hash(prev_hash: &str, event: &AuditEvent) -> String {
         "action": event.action,
         "result": event.result,
         "security": event.security,
+        "principal_id": event.principal_id,
+        "auth_method": event.auth_method,
         "sequence": event.sequence,
     });
     let content_json = serde_json::to_string(&content).expect("serialize canonical content");
@@ -612,6 +659,97 @@ mod tests {
         assert!(parsed.actor.is_some());
         assert!(parsed.action.is_some());
         assert!(parsed.result.is_some());
+    }
+
+    // ── PR-F: principal attribution ─────────────────────────────────────
+
+    #[test]
+    fn audit_event_with_principal_records_id_and_method() {
+        let event =
+            AuditEvent::new(AuditEventType::CommandExecution).with_principal("alice-7c9", "oidc");
+        assert_eq!(event.principal_id.as_deref(), Some("alice-7c9"));
+        assert_eq!(event.auth_method.as_deref(), Some("oidc"));
+    }
+
+    #[test]
+    fn audit_event_without_principal_omits_fields() {
+        let event = AuditEvent::new(AuditEventType::PolicyViolation);
+        assert!(event.principal_id.is_none());
+        assert!(event.auth_method.is_none());
+    }
+
+    #[test]
+    fn audit_event_principal_fields_round_trip_through_json() {
+        let event =
+            AuditEvent::new(AuditEventType::AuthSuccess).with_principal("bob-1234", "ssh_key");
+        let json = serde_json::to_string(&event).expect("serialize");
+        // Both fields surface on the wire.
+        assert!(json.contains("\"principal_id\":\"bob-1234\""), "{json}");
+        assert!(json.contains("\"auth_method\":\"ssh_key\""), "{json}");
+        let parsed: AuditEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.principal_id.as_deref(), Some("bob-1234"));
+        assert_eq!(parsed.auth_method.as_deref(), Some("ssh_key"));
+    }
+
+    #[test]
+    fn audit_event_principal_fields_distinct_from_legacy_actor() {
+        // The legacy `actor` field carries channel/user identifiers, while
+        // PR-F's principal fields are the IdP attestation channel. They
+        // coexist — both surface on the same event.
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_actor("telegram".into(), Some("123".into()), None)
+            .with_principal("alice-7c9", "oidc");
+        assert_eq!(event.actor.as_ref().unwrap().channel, "telegram");
+        assert_eq!(event.principal_id.as_deref(), Some("alice-7c9"));
+        assert_eq!(event.auth_method.as_deref(), Some("oidc"));
+    }
+
+    #[test]
+    fn merkle_chain_canonical_json_includes_principal_fields() {
+        // The hash chain must cover principal_id + auth_method, otherwise
+        // an auditor reading the hash-chained JSON cannot bond the
+        // IdP attestation evidence into integrity checks. This test
+        // re-derives the entry hash independently and confirms it covers
+        // every payload field that lands in the canonical-JSON map.
+        let event_id = "b8e1f8b2-0001";
+        let mut event =
+            AuditEvent::new(AuditEventType::CommandExecution).with_principal("alice-7c9", "oidc");
+        event.event_id = event_id.into();
+        event.prev_hash = "0000000000000000000000000000000000000000000000000000000000000000".into();
+        event.sequence = 0;
+        let prev_hash = event.prev_hash.clone();
+        let expected = compute_entry_hash(&prev_hash, &event);
+        event.entry_hash = expected.clone();
+        // Recompute via the public `verify_chain` path is not available
+        // here (= single-file); instead, we re-run the canonical JSON
+        // producer ourselves with the same field order.
+        let content = serde_json::json!({
+            "timestamp": event.timestamp,
+            "event_id": event.event_id,
+            "event_type": event.event_type,
+            "actor": event.actor,
+            "action": event.action,
+            "result": event.result,
+            "security": event.security,
+            "principal_id": event.principal_id,
+            "auth_method": event.auth_method,
+            "sequence": event.sequence,
+        });
+        let content_json = serde_json::to_string(&content).expect("serialize content");
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(prev_hash.as_bytes());
+        hasher.update(content_json.as_bytes());
+        let recomputed = hex::encode(hasher.finalize());
+        assert_eq!(expected, recomputed);
+        // Sanity: any field change invalidates the hash.
+        let mut tampered = event.clone();
+        tampered.principal_id = Some("mallory-0".into());
+        let tampered_hash = compute_entry_hash(&prev_hash, &tampered);
+        assert_ne!(
+            tampered_hash, recomputed,
+            "tampering principal_id must change entry_hash"
+        );
     }
 
     #[test]

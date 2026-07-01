@@ -30527,6 +30527,16 @@ allowed_users = []
             .storage
             .qdrant
             .insert("default".into(), QdrantStorageConfig::default());
+        // PR-F: exercise the kill-switch signer entry so the classification
+        // audit also covers the new compliance surface. Without this entry
+        // the prop_fields() call below would skip the branch.
+        config
+            .compliance
+            .kill_switch_signers
+            .push(crate::compliance::KillSwitchSigner {
+                signer_id: "ops-primary".into(),
+                credential_ref: "hmac-test-key-9f8b3c".into(),
+            });
 
         let fields = config.prop_fields();
         let missing: Vec<_> = fields
@@ -30554,6 +30564,102 @@ allowed_users = []
         assert!(
             unmarked_secrets.is_empty(),
             "EncryptedSecret classifications must route through #[secret]: {unmarked_secrets:?}"
+        );
+
+        // PR-F: explicit assert that the kill-switch signer credential is
+        // marked classified AND flagged as a routing target of `#[secret]`
+        // propagation, so any future regression that strips the annotation
+        // surfaces here with file:line context. The element is addressed
+        // by natural-key `signer_id` (snake_case sub-segment matches the
+        // Rust ident, while the top-level path uses kebab `credential-ref`).
+        let signer_path = "compliance.kill_switch_signers.ops-primary.credential_ref";
+        let signer = fields
+            .iter()
+            .find(|f| f.name == signer_path)
+            .unwrap_or_else(|| {
+                let known: Vec<_> = fields
+                    .iter()
+                    .filter(|f| f.name.contains("kill_switch"))
+                    .map(|f| f.name.clone())
+                    .collect();
+                panic!("missing prop field {signer_path}; known kill_switch paths: {known:?}")
+            });
+        assert_eq!(
+            signer.credential_class,
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret),
+            "kill-switch signer credential must classify as EncryptedSecret"
+        );
+        assert!(
+            Config::prop_is_secret(signer_path),
+            "kill-switch signer credential must route through #[secret] so SecretStore encrypts it on save"
+        );
+    }
+
+    /// PR-F save → reload regression: a kill-switch signer seeded with a
+    /// plaintext credential must not survive `Config::save()` as plaintext.
+    /// Asserts `SecretStore::is_encrypted` reads back `true` after a full
+    /// round trip through the on-disk TOML representation.
+    #[tokio::test]
+    async fn compliance_kill_switch_signer_round_trips_encrypted() {
+        use crate::secrets::SecretStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let plaintext = "hmac-credential-secret-do-not-leak";
+
+        let mut config = Config::default();
+        // Pin both the config path and the data dir at the tempdir root so
+        // `Config::save()` resolves its `.secret_key` next to the file we
+        // control, with encryption forced on.
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config.secrets.encrypt = true;
+        config
+            .compliance
+            .kill_switch_signers
+            .push(crate::compliance::KillSwitchSigner {
+                signer_id: "ops-primary".into(),
+                credential_ref: plaintext.into(),
+            });
+
+        config.save().await.expect("save");
+
+        // Drive the regression test through SecretStore::is_encrypted
+        // works with both ChaCha20-Poly1305 `enc2:` ciphertext and any
+        // future external secret ref (`op://`, `vault://`, etc.).
+        let on_disk =
+            std::fs::read_to_string(&config.config_path).expect("read back written config");
+        assert!(
+            !on_disk.contains(plaintext),
+            "plaintext signer credential leaked into config.toml: {on_disk:?}"
+        );
+        assert!(
+            SecretStore::is_encrypted(&on_disk)
+                || on_disk.contains("enc2:")
+                || on_disk.contains("op://"),
+            "save() did not produce any encrypted/external form for the credential"
+        );
+
+        // Reload via the inner TOML deserializer so we don't fight the
+        // env-based path resolver of `Config::load_or_init()`: the goal of
+        // this test is to exercise save() ↔ deserialize symmetry, not
+        // env path resolution. The reload must yield the encrypted shape
+        // (SecretStore never auto-decrypts; consumers call .decrypt
+        // eagerly at use-time only).
+        let reloaded: Config = toml::from_str(&on_disk).expect("reload via toml");
+        assert_eq!(reloaded.compliance.kill_switch_signers.len(), 1);
+        assert_eq!(
+            reloaded.compliance.kill_switch_signers[0].signer_id,
+            "ops-primary"
+        );
+        let stored = &reloaded.compliance.kill_switch_signers[0].credential_ref;
+        assert!(
+            SecretStore::is_encrypted(stored),
+            "reloaded credential_ref must classify as encrypted/external (got {stored:?})"
+        );
+        assert!(
+            stored != plaintext,
+            "reloaded credential_ref must not equal the plaintext seed (got {stored:?})"
         );
     }
 

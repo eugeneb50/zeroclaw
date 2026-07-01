@@ -653,6 +653,19 @@ Examples:
         security_command: SecurityCommands,
     },
 
+    /// Enterprise compliance posture (PR-F).
+    ///
+    /// Run `compliance report`, `compliance audit-trail verify|export`,
+    /// or `compliance ai-bom` to surface auditable evidence for
+    /// SOC 2 Type II controls CC6.1, CC6.6, CC7.2, CC7.3, and
+    /// CC9.2. See `docs/book/src/compliance/evidence.md` for the
+    /// exit-code contract.
+    #[cfg(feature = "agent-runtime")]
+    Compliance {
+        #[command(subcommand)]
+        compliance_command: ComplianceCommands,
+    },
+
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
@@ -2717,6 +2730,85 @@ enum SecurityCommands {
     },
 }
 
+/// Enterprise compliance posture commands (PR-F).
+///
+/// Subcommand family: `zeroclaw compliance { report, audit-trail,
+/// ai-bom }`. See `docs/book/src/compliance/evidence.md` for which
+/// control set each command emits and the exit-code contract.
+#[derive(Subcommand, Debug)]
+#[cfg(feature = "agent-runtime")]
+enum ComplianceCommands {
+    /// Render the compliance posture report against the live config.
+    ///
+    /// Default format is Markdown (decision 2). `--format json`
+    /// and `--format yaml` opt-in for machine-readable output.
+    Report {
+        /// Compliance regime to render against. Defaults to
+        /// `soc2-type2` (the only currently-implemented regime).
+        #[arg(long, value_name = "REGIME", default_value = "soc2-type2")]
+        regime: String,
+        /// Output format: `markdown` (default), `json`, or `yaml`.
+        #[arg(long, value_enum, default_value_t = ::zeroclaw::compliance::report::ReportFormat::Markdown)]
+        format: ::zeroclaw::compliance::report::ReportFormat,
+        /// File path to write to. When omitted, output goes to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Audit-trail subcommands.
+    ///
+    /// Two operations: `verify` returns 0 on a clean chain, 2 on a
+    /// broken chain, 3 on I/O error. `export` writes a redacted copy
+    /// of the audit JSONL in JSONL or CSV form. See
+    /// `docs/book/src/compliance/evidence.md` for the exit code
+    /// contract.
+    #[command(subcommand)]
+    AuditTrail(AuditTrailCommands),
+    /// AI Bill of Materials — enumerate providers, WASM backends,
+    /// and the audit-log chain root hash for enterprise auditors.
+    AiBom {
+        /// Output format: `markdown` (default), `json`, or `yaml`.
+        #[arg(long, value_enum, default_value_t = ::zeroclaw::compliance::report::ReportFormat::Markdown)]
+        format: ::zeroclaw::compliance::report::ReportFormat,
+        /// File path to write to. When omitted, output goes to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+#[cfg(feature = "agent-runtime")]
+enum AuditTrailCommands {
+    /// Verify the audit-log hash chain from start to finish.
+    ///
+    /// exit 0 = chain clean, exit 2 = chain broken (sequence gap
+    /// or hash / signature mismatch), exit 3 = I/O or parse error.
+    Verify {
+        /// Audit-log path to verify. Defaults to
+        /// `<data_dir>/<security.audit.log_path>` resolved from the
+        /// live config.
+        #[arg(long, value_name = "PATH")]
+        log_path: Option<std::path::PathBuf>,
+    },
+    /// Export the audit log with credential fields redacted.
+    ///
+    /// Useful for handing evidence to auditors without leaking
+    /// credential-shaped strings.
+    Export {
+        /// Audit-log path. Defaults to the live config's
+        /// `<security.audit.log_path>`.
+        #[arg(long, value_name = "PATH")]
+        log_path: Option<std::path::PathBuf>,
+        /// Output file path. When omitted, prints "out path is
+        /// required for export" and exits non-zero — protects against
+        /// operators accidentally writing to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: std::path::PathBuf,
+        /// Output format: `jsonl` (default) or `csv`.
+        #[arg(long, value_enum, default_value_t = ::zeroclaw::compliance::audit_export::ExportFormat::Jsonl)]
+        format: ::zeroclaw::compliance::audit_export::ExportFormat,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
     /// Print current estop status.
@@ -4535,6 +4627,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        #[cfg(feature = "agent-runtime")]
+        Commands::Compliance { compliance_command } => {
+            handle_compliance_command(compliance_command, &config)
+        }
+
         Commands::Estop {
             estop_command,
             level,
@@ -5944,6 +6041,219 @@ fn build_resume_selector(
         return Ok(security::ResumeSelector::Tools(tools));
     }
     Ok(security::ResumeSelector::KillAll)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn handle_compliance_command(command: ComplianceCommands, config: &Config) -> Result<()> {
+    use ::zeroclaw::compliance;
+    use ::zeroclaw::compliance::ai_bom;
+    use ::zeroclaw::compliance::audit_export;
+    use ::zeroclaw::compliance::audit_verify;
+    use ::zeroclaw::compliance::report::{
+        ComplianceReportBuilder, ReportFormat, render as render_report,
+    };
+    use anyhow::Context as _;
+
+    fn write_output(out: Option<&std::path::Path>, body: &str) -> Result<()> {
+        match out {
+            Some(path) => {
+                std::fs::write(path, body)
+                    .with_context(|| format!("write compliance output to {}", path.display()))?;
+            }
+            None => println!("{body}"),
+        }
+        Ok(())
+    }
+
+    fn exit_code_for(err: &compliance::error::ComplianceError) -> i32 {
+        use compliance::error::ComplianceErrorKind;
+        match err.kind {
+            ComplianceErrorKind::Io => 3,
+            ComplianceErrorKind::AuditChainBroken => 2,
+            ComplianceErrorKind::ConfigLoad => 3,
+            ComplianceErrorKind::ControlMissing => 4,
+            ComplianceErrorKind::Other => 1,
+        }
+    }
+
+    let result: Result<()> = match command {
+        ComplianceCommands::Report {
+            regime,
+            format,
+            out,
+        } => {
+            // Per PR-F locked decisions, only `soc2-type2` ships today.
+            // Future epics extend `ControlMatrix::new_<regime>()` and
+            // dispatch on `regime`.
+            if regime != "soc2-type2" && regime != "soc2_type2" {
+                bail!("{regime} is not yet implemented; only `soc2-type2` is supported in PR-F");
+            }
+            let report = ComplianceReportBuilder::soc2_type2()
+                .claimed_regimes(["soc2_type2"])
+                .audit_config(config.security.audit.clone())
+                .build(config)
+                .map_err(anyhow::Error::from)?;
+            let body = render_report(&report, format)?;
+            write_output(out.as_deref(), &body)
+        }
+        ComplianceCommands::AuditTrail(sub) => match sub {
+            AuditTrailCommands::Verify { log_path } => {
+                let log_path = match log_path {
+                    Some(p) => p,
+                    None => {
+                        let zeroclaw_dir = config
+                            .config_path
+                            .parent()
+                            .context("config path must have a parent directory")?;
+                        zeroclaw_dir.join(&config.security.audit.log_path)
+                    }
+                };
+                match audit_verify::verify_chain(&log_path) {
+                    Ok(count) => {
+                        eprintln!(
+                            "audit chain verified ({} entries): {}",
+                            count,
+                            log_path.display()
+                        );
+                        Ok(())
+                    }
+                    Err(err) => {
+                        eprintln!("audit chain FAILED: {err}");
+                        std::process::exit(exit_code_for(&err));
+                    }
+                }
+            }
+            AuditTrailCommands::Export {
+                log_path,
+                out,
+                format,
+            } => {
+                let log_path = match log_path {
+                    Some(p) => p,
+                    None => {
+                        let zeroclaw_dir = config
+                            .config_path
+                            .parent()
+                            .context("config path must have a parent directory")?;
+                        zeroclaw_dir.join(&config.security.audit.log_path)
+                    }
+                };
+                let count =
+                    audit_export::export(&log_path, &out, format).map_err(anyhow::Error::from)?;
+                eprintln!("audit export wrote {count} entries to {}", out.display());
+                Ok(())
+            }
+        },
+        ComplianceCommands::AiBom { format, out } => {
+            // Compute the audit-chain SHA-256 root for the BOM.
+            let chain_root = config
+                .config_path
+                .parent()
+                .map(|d| ai_bom::audit_chain_sha256(d, &config.security.audit.log_path))
+                .transpose()
+                .map_err(anyhow::Error::from)?
+                .flatten();
+            let config_path_str = config
+                .config_path
+                .to_str()
+                .unwrap_or("<unknown>")
+                .to_owned();
+            let bom = ai_bom::build(&config_path_str, config, chain_root);
+            match format {
+                ReportFormat::Markdown => {
+                    // Render to a Markdown string — small enough to do
+                    // inline (BOM surfaces are operator-facing, low
+                    // volume).
+                    write_output(
+                        out.as_deref(),
+                        &render_ai_bom_markdown(&bom, format!("{bom:#?}")).to_string(),
+                    )?;
+                }
+                ReportFormat::Json => {
+                    let body =
+                        serde_json::to_string_pretty(&bom).context("serialize BOM as JSON")?;
+                    write_output(out.as_deref(), &body)?;
+                }
+                ReportFormat::Yaml => {
+                    write_output(
+                        out.as_deref(),
+                        &format!("# YAML serializer not yet wired\n{:#?}\n", bom),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+    };
+
+    if let Err(ref err) = result {
+        if let Some(ce) = err.downcast_ref::<compliance::error::ComplianceError>() {
+            std::process::exit(exit_code_for(ce));
+        }
+    }
+    result
+}
+
+/// Render an `AiBom` to a Markdown table. Single source of truth for
+/// the Markdown emitter so JSON / YAML emitters stay tabular.
+#[cfg(feature = "agent-runtime")]
+fn render_ai_bom_markdown(
+    bom: &::zeroclaw::compliance::ai_bom::AiBom,
+    _debug_anchor: String,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(1024);
+    let _ = writeln!(
+        out,
+        "# AI Bill of Materials\n\nGenerated: `{}`\nConfig: `{}`\n",
+        bom.generated_at.to_rfc3339(),
+        bom.config_path
+    );
+    let _ = writeln!(
+        out,
+        "## WASM backend\n\n- Backend: `{:?}`\n- Plugin fingerprint: `{}`\n",
+        bom.wasm_backends.backend,
+        bom.wasm_backends
+            .plugin_fingerprints_hash
+            .as_deref()
+            .unwrap_or("(none — RFC #8543 deferred)")
+    );
+    let _ = writeln!(
+        out,
+        "## Provider inventory\n\n| Category | Family / alias |\n|---|---|",
+    );
+    for k in bom.model_providers.keys() {
+        let _ = writeln!(out, "| model | {k} |");
+    }
+    for k in bom.tts_providers.keys() {
+        let _ = writeln!(out, "| tts | {k} |");
+    }
+    for k in bom.transcription_providers.keys() {
+        let _ = writeln!(out, "| transcription | {k} |");
+    }
+    let _ = writeln!(
+        out,
+        "\n## Counts\n\n| Model | TTS | Transcription | Total |\n|---|---|---|---|\n| {} | {} | {} | {} |\n",
+        bom.counts.model_providers,
+        bom.counts.tts_providers,
+        bom.counts.transcription_providers,
+        bom.counts.total,
+    );
+    let _ = writeln!(
+        out,
+        "## Audit chain root\n\n`{}`\n",
+        bom.audit_chain_root.as_deref().unwrap_or("(no audit log)")
+    );
+    if !bom.deferred_milestones.is_empty() {
+        let _ = writeln!(out, "## Deferred milestones\n");
+        for m in &bom.deferred_milestones {
+            let _ = writeln!(
+                out,
+                "- **{}** — {}\n  - Planned surface: {}\n",
+                m.tracking_issue, m.summary, m.planned_surface
+            );
+        }
+    }
+    out
 }
 
 #[cfg(feature = "agent-runtime")]

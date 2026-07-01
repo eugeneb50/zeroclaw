@@ -182,6 +182,32 @@ pub enum AuthMethod {
     A2aPeer,
 }
 
+impl AuthMethod {
+    /// The single source of truth for the on-the-wire name of each
+    /// `AuthMethod`. Mirrors `#[serde(rename_all = "snake_case")]` above
+    /// so the audit log, gateway log, and any external consumer read the
+    /// same `None`/`shared_operator`/`oidc`/`ssh_key`/`peercred`/`native`/
+    /// `a2a_peer` strings — no parallel literal list to drift.
+    ///
+    /// PR-F added this so callers (gateway's
+    /// `principal_to_audit_actor`, audit-trail export, etc.) do not need
+    /// to redo the `serde_json::to_value` round-trip just to stringify
+    /// one variant. Add a new variant here *and* in `#[serde(...)]` in
+    /// lock-step.
+    #[must_use]
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SharedOperator => "shared_operator",
+            Self::Oidc => "oidc",
+            Self::SshKey => "ssh_key",
+            Self::Peercred => "peercred",
+            Self::Native => "native",
+            Self::A2aPeer => "a2a_peer",
+        }
+    }
+}
+
 /// The single authenticated subject, produced by an auth provider and consumed by
 /// every dispatch/authz/audit/isolation surface.
 ///
@@ -368,10 +394,7 @@ pub enum EntitlementError {
     /// Principal has no `allowed_aliases` claim at all → fail closed.
     NoAllowedAliases,
     /// `allowed_aliases` non-empty but does not contain the requested alias.
-    AliasNotEntitled {
-        alias: String,
-        allowed: Vec<String>,
-    },
+    AliasNotEntitled { alias: String, allowed: Vec<String> },
 }
 
 impl std::fmt::Display for EntitlementError {
@@ -401,7 +424,11 @@ impl Principal {
         if !self.allowed_aliases.iter().any(|a| a.as_str() == alias) {
             return Err(EntitlementError::AliasNotEntitled {
                 alias: alias.to_owned(),
-                allowed: self.allowed_aliases.iter().map(|a| a.as_str().to_owned()).collect(),
+                allowed: self
+                    .allowed_aliases
+                    .iter()
+                    .map(|a| a.as_str().to_owned())
+                    .collect(),
             });
         }
         Ok(())
@@ -518,6 +545,28 @@ mod tests {
     }
 
     #[test]
+    fn auth_method_as_wire_name_matches_serde_round_trip() {
+        for (method, expected) in [
+            (AuthMethod::None, "none"),
+            (AuthMethod::SharedOperator, "shared_operator"),
+            (AuthMethod::Oidc, "oidc"),
+            (AuthMethod::SshKey, "ssh_key"),
+            (AuthMethod::Peercred, "peercred"),
+            (AuthMethod::Native, "native"),
+            (AuthMethod::A2aPeer, "a2a_peer"),
+        ] {
+            // The serde-Json wire name must equal `as_wire_name()` — locking
+            // the two sources in lock-step prevents drift.
+            let from_serde = serde_json::to_string(&method)
+                .expect("serialize")
+                .trim_matches('"')
+                .to_owned();
+            assert_eq!(from_serde, expected, "serde-derived drift {method:?}");
+            assert_eq!(method.as_wire_name(), expected, "as_wire_name drift");
+        }
+    }
+
+    #[test]
     fn ensure_entitled_to_empty_is_no_allowed_aliases() {
         let p = Principal::shared_operator();
         let err = p.ensure_entitled_to("any-alias").unwrap_err();
@@ -527,10 +576,7 @@ mod tests {
     #[test]
     fn ensure_entitled_to_matching_alias_returns_ok() {
         let p = Principal::new("alice", "alice", AuthMethod::A2aPeer)
-            .with_allowed_aliases(vec![
-                AgentAlias::new("agent1"),
-                AgentAlias::new("agent2"),
-            ]);
+            .with_allowed_aliases(vec![AgentAlias::new("agent1"), AgentAlias::new("agent2")]);
         assert!(p.ensure_entitled_to("agent1").is_ok());
         assert!(p.ensure_entitled_to("agent2").is_ok());
     }

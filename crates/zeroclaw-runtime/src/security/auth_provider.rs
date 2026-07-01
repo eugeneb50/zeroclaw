@@ -236,7 +236,10 @@ impl A2aPeerProvider {
     #[must_use]
     pub fn from_peers(
         peers: std::collections::HashMap<String, zeroclaw_config::multi_agent::A2aPeerConfig>,
-        peer_groups: std::collections::HashMap<String, zeroclaw_config::multi_agent::PeerGroupConfig>,
+        peer_groups: std::collections::HashMap<
+            String,
+            zeroclaw_config::multi_agent::PeerGroupConfig,
+        >,
     ) -> Self {
         Self { peers, peer_groups }
     }
@@ -327,8 +330,7 @@ impl AuthProvider for A2aPeerProvider {
         for (pg_name, group_config) in &self.peer_groups {
             for (peer_id, entry) in &group_config.a2a_external_peers {
                 let presented_hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
-                let expected_hash =
-                    hex::encode(sha2::Sha256::digest(entry.credential.as_bytes()));
+                let expected_hash = hex::encode(sha2::Sha256::digest(entry.credential.as_bytes()));
                 if constant_time_eq(&presented_hash, &expected_hash) {
                     let allowed_aliases = entry
                         .allowed_aliases_override
@@ -396,7 +398,9 @@ impl LiveConfigA2aResolver {
     /// `state.config.clone()` from the gateway boot path, where `state.config`
     /// is itself `Arc<RwLock<Config>>`.
     #[must_use]
-    pub fn new(config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>) -> Self {
+    pub fn new(
+        config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    ) -> Self {
         Self { config }
     }
 }
@@ -538,7 +542,9 @@ impl LiveA2aPeerProvider {
     /// Wrap a live-config handle. Typically constructed with
     /// `state.config.clone()` from the gateway boot path.
     #[must_use]
-    pub fn new(config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>) -> Self {
+    pub fn new(
+        config: std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+    ) -> Self {
         Self { config }
     }
 }
@@ -910,9 +916,7 @@ mod tests {
         let state = Arc::new(parking_lot::RwLock::new(cfg));
         let resolver = LiveConfigA2aResolver::new(Arc::clone(&state));
 
-        let outcome = resolver
-            .verify(&Credential::Bearer("tok-1".into()))
-            .await;
+        let outcome = resolver.verify(&Credential::Bearer("tok-1".into())).await;
         assert!(outcome.is_allowed(), "initial peer must verify");
 
         let outcome = resolver
@@ -975,9 +979,7 @@ mod tests {
         } // write lock released; resolver's next verify() reads fresh.
 
         // CRITICAL: new peer must be honored on next verify, without restart.
-        let outcome = resolver
-            .verify(&Credential::Bearer("tok-2".into()))
-            .await;
+        let outcome = resolver.verify(&Credential::Bearer("tok-2".into())).await;
         assert!(
             outcome.is_allowed(),
             "newly added peer must verify live (regression for #7410 snapshot pattern)"
@@ -1008,14 +1010,20 @@ mod tests {
                 },
             );
         }
-        assert!(!resolver
-            .verify(&Credential::Bearer("tok-1".into()))
-            .await
-            .is_allowed(), "old token must be denied after rotation");
-        assert!(resolver
-            .verify(&Credential::Bearer("tok-1-rotated".into()))
-            .await
-            .is_allowed(), "rotated token must verify");
+        assert!(
+            !resolver
+                .verify(&Credential::Bearer("tok-1".into()))
+                .await
+                .is_allowed(),
+            "old token must be denied after rotation"
+        );
+        assert!(
+            resolver
+                .verify(&Credential::Bearer("tok-1-rotated".into()))
+                .await
+                .is_allowed(),
+            "rotated token must verify"
+        );
     }
 
     /// Resolve across `peer_groups` for a newly-added peer via live reload
@@ -1023,8 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn live_config_resolver_picks_up_peer_groups_change() {
         use zeroclaw_config::multi_agent::{
-            A2aPeerAuth, A2aPeerConfig, AgentAlias, PeerGroupConfig,
-            PeerGroupName,
+            A2aPeerAuth, A2aPeerConfig, AgentAlias, PeerGroupConfig, PeerGroupName,
         };
 
         let (state, resolver) = {
@@ -1102,8 +1109,7 @@ mod tests {
         {
             AuthOutcome::Authenticated(p) => {
                 assert_eq!(p.peer_group.as_deref(), Some("shared"));
-                let aliases: Vec<&str> =
-                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                let aliases: Vec<&str> = p.allowed_aliases.iter().map(|a| a.as_str()).collect();
                 assert!(aliases.contains(&"researcher"));
                 assert!(aliases.contains(&"analyst"));
             }
@@ -1118,9 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn live_config_resolver_picks_up_new_reloaded_external_peer() {
         use std::collections::HashMap;
-        use zeroclaw_config::multi_agent::{
-            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
-        };
+        use zeroclaw_config::multi_agent::{A2aExternalPeerEntry, AgentAlias, PeerGroupConfig};
 
         let (state, resolver) = {
             let state = Arc::new(parking_lot::RwLock::new(
@@ -1164,22 +1168,21 @@ mod tests {
                 .get_mut("ops")
                 .unwrap()
                 .a2a_external_peers
-                .insert("ext-peer".into(), A2aExternalPeerEntry {
-                    credential: "ext-tok".into(),
-                    allowed_aliases_override: None,
-                });
+                .insert(
+                    "ext-peer".into(),
+                    A2aExternalPeerEntry {
+                        credential: "ext-tok".into(),
+                        allowed_aliases_override: None,
+                    },
+                );
         }
 
         // 3. Now the external peer token is accepted — live reload, no restart.
-        match resolver
-            .verify(&Credential::Bearer("ext-tok".into()))
-            .await
-        {
+        match resolver.verify(&Credential::Bearer("ext-tok".into())).await {
             AuthOutcome::Authenticated(p) => {
                 assert_eq!(p.id.as_str(), "ext-peer");
                 assert_eq!(p.peer_group.as_deref(), Some("ops"));
-                let aliases: Vec<&str> =
-                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                let aliases: Vec<&str> = p.allowed_aliases.iter().map(|a| a.as_str()).collect();
                 assert!(aliases.contains(&"bot"));
             }
             o => panic!("expected Authenticated after reload, got {o:?}"),
@@ -1227,14 +1230,11 @@ mod tests {
         // for safety and rely on the rwlock being fair.
         let cred = Credential::Bearer("any-tok".into());
         let verify_task = resolver.verify(&cred);
-        tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            async {
-                // Try to acquire the write lock. If the resolver released its
-                // read lock before .await, this acquires immediately.
-                let _w = state.write();
-            },
-        )
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            // Try to acquire the write lock. If the resolver released its
+            // read lock before .await, this acquires immediately.
+            let _w = state.write();
+        })
         .await
         .expect("write-lock must be acquirable within 250ms — lock discipline broken");
         // And the verify resolves successfully.
@@ -1245,9 +1245,7 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_authenticates_external_peer() {
         use std::collections::HashMap;
-        use zeroclaw_config::multi_agent::{
-            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
-        };
+        use zeroclaw_config::multi_agent::{A2aExternalPeerEntry, AgentAlias, PeerGroupConfig};
         let mut peer_groups = HashMap::new();
         peer_groups.insert(
             "ops-team".to_string(),
@@ -1281,8 +1279,7 @@ mod tests {
             AuthOutcome::Authenticated(p) => {
                 assert_eq!(p.peer_group.as_deref(), Some("ops-team"));
                 assert_eq!(p.id.as_str(), "infra-jenkins");
-                let aliases: Vec<&str> =
-                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                let aliases: Vec<&str> = p.allowed_aliases.iter().map(|a| a.as_str()).collect();
                 assert!(aliases.contains(&"ops-bot-alpha"));
                 assert!(aliases.contains(&"ops-bot-beta"));
             }
@@ -1293,9 +1290,7 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_rejects_wrong_external_credential() {
         use std::collections::HashMap;
-        use zeroclaw_config::multi_agent::{
-            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
-        };
+        use zeroclaw_config::multi_agent::{A2aExternalPeerEntry, AgentAlias, PeerGroupConfig};
         let mut peer_groups = HashMap::new();
         peer_groups.insert(
             "ops-team".to_string(),
@@ -1328,9 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_external_peer_respects_alias_override() {
         use std::collections::HashMap;
-        use zeroclaw_config::multi_agent::{
-            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
-        };
+        use zeroclaw_config::multi_agent::{A2aExternalPeerEntry, AgentAlias, PeerGroupConfig};
         let mut peer_groups = HashMap::new();
         peer_groups.insert(
             "ops-team".to_string(),
@@ -1347,9 +1340,7 @@ mod tests {
                     "limited-peer".to_string(),
                     A2aExternalPeerEntry {
                         credential: "tok".into(),
-                        allowed_aliases_override: Some(vec![AgentAlias::new(
-                            "ops-bot-alpha",
-                        )]),
+                        allowed_aliases_override: Some(vec![AgentAlias::new("ops-bot-alpha")]),
                     },
                 )]
                 .into_iter()
@@ -1359,13 +1350,10 @@ mod tests {
 
         let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
 
-        let outcome = provider
-            .verify(&Credential::Bearer("tok".into()))
-            .await;
+        let outcome = provider.verify(&Credential::Bearer("tok".into())).await;
         match outcome {
             AuthOutcome::Authenticated(p) => {
-                let aliases: Vec<&str> =
-                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                let aliases: Vec<&str> = p.allowed_aliases.iter().map(|a| a.as_str()).collect();
                 assert_eq!(aliases, vec!["ops-bot-alpha"]);
             }
             o => panic!("expected Authenticated, got {o:?}"),
@@ -1375,9 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn a2a_peer_provider_external_peer_without_override_inherits_agents() {
         use std::collections::HashMap;
-        use zeroclaw_config::multi_agent::{
-            A2aExternalPeerEntry, AgentAlias, PeerGroupConfig,
-        };
+        use zeroclaw_config::multi_agent::{A2aExternalPeerEntry, AgentAlias, PeerGroupConfig};
         let mut peer_groups = HashMap::new();
         peer_groups.insert(
             "ops-team".to_string(),
@@ -1401,13 +1387,10 @@ mod tests {
 
         let provider = A2aPeerProvider::from_peers(HashMap::new(), peer_groups);
 
-        let outcome = provider
-            .verify(&Credential::Bearer("x".into()))
-            .await;
+        let outcome = provider.verify(&Credential::Bearer("x".into())).await;
         match outcome {
             AuthOutcome::Authenticated(p) => {
-                let aliases: Vec<&str> =
-                    p.allowed_aliases.iter().map(|a| a.as_str()).collect();
+                let aliases: Vec<&str> = p.allowed_aliases.iter().map(|a| a.as_str()).collect();
                 assert_eq!(aliases, vec!["alpha"]);
             }
             o => panic!("expected Authenticated, got {o:?}"),

@@ -1698,6 +1698,17 @@ pub async fn run(
         let cost_tracking_context =
             crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
+        // Per-turn usage accumulator handle. Lives at outer scope so both the
+        // interactive REPL loop (which repoints this each turn) AND the final
+        // AgentEnd emission (which sits outside the `else {}` interactive
+        // block) can read the last turn's tokens without compile-time scope
+        // errors. Initialised to an empty `TurnUsage` so single-shot runs and
+        // early-quit REPL sessions still produce a readable zero snapshot.
+        let last_turn_usage_handle: Arc<parking_lot::Mutex<crate::agent::cost::TurnUsage>> =
+            Arc::new(parking_lot::Mutex::new(
+                crate::agent::cost::TurnUsage::default(),
+            ));
+
         // ── Execute ──────────────────────────────────────────────────
         let start = Instant::now();
 
@@ -2388,6 +2399,25 @@ pub async fn run(
                     }
                 });
 
+                // Per-turn usage accumulator: clone the steady-state
+                // `cost_tracking_context` (preserving `tracker: Some(...)`,
+                // `model_provider_pricing`, and `agent_alias` so per-turn
+                // cost records still persist and budget enforcement still
+                // fires), then override `turn_usage` with the outer-scope
+                // `last_turn_usage_handle` Arc so this turn's tokens accumulate
+                // into a slot that resets each REPL iteration. The post-turn
+                // context bar AND the final AgentEnd both read this turn's
+                // tokens (not a session-wide accumulation). Falls back to
+                // `usage_only()` only when no global tracker was initialised.
+                let mut turn_cost_ctx = match &cost_tracking_context {
+                    Some(ctx) => ctx.clone(),
+                    None => {
+                        crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+                            .with_agent_alias(agent_alias)
+                    }
+                };
+                turn_cost_ctx.turn_usage = last_turn_usage_handle.clone();
+
                 let response = loop {
                     if let Some(sys_msg) = history.first_mut()
                         && sys_msg.role == "system"
@@ -2418,7 +2448,7 @@ pub async fn run(
                         .scope(
                             thinking_params.native_thinking,
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                                cost_tracking_context.clone(),
+                                Some(turn_cost_ctx.clone()),
                                 run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
@@ -2544,74 +2574,21 @@ pub async fn run(
                             // Context overflow recovery: drop oldest whole
                             // turns and retry. No summarization, no splicing.
                             if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Retry
-                                    )
-                                    .with_category(::zeroclaw_log::EventCategory::Agent),
-                                    "Context overflow in interactive loop, attempting recovery"
-                                );
-                                let taken = std::mem::take(&mut history);
-                                let result = crate::agent::history_trim::trim_to_recent_turns(
-                                    taken,
-                                    eff_model_context_window,
-                                );
-                                if result.trimmed {
-                                    let mut trimmed = result.history;
-                                    let system_count =
-                                        trimmed.iter().take_while(|m| m.role == "system").count();
-                                    trimmed.insert(
-                                        system_count,
-                                        crate::agent::history_trim::breadcrumb(),
-                                    );
-                                    history = trimmed;
-                                    {
-                                        let __zc_trim_span = ::zeroclaw_log::info_span!(
-                                            target: "zeroclaw_log_internal_scope",
-                                            "zeroclaw_scope",
-                                            model = %model_name,
-                                            model_provider = %provider_name,
-                                        );
-                                        let _zc_trim_guard = __zc_trim_span.entered();
-                                        ::zeroclaw_log::record!(
-                                            INFO,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Retry
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                                            .with_attrs(::serde_json::json!({
-                                                "dropped_messages": result.dropped_messages,
-                                                "dropped_turns": result.dropped_turns,
-                                                "kept_turns": result.kept_turns,
-                                            })),
-                                            "Context recovered via whole-turn trim, retrying turn"
-                                        );
-                                    }
+                                let recovered = crate::agent::turn::context_recovery::try_recover_context_overflow(
+                                    &mut history,
+                                    &e,
+                                    None,
+                                    &provider_name,
+                                    &model_name,
+                                    channel_name,
+                                    Some(agent_alias),
+                                    &turn_id,
+                                    None,
+                                    &*observer,
+                                )
+                                .await;
+                                if recovered {
                                     continue;
-                                }
-                                history = result.history;
-                                {
-                                    let __zc_trim_span = ::zeroclaw_log::info_span!(
-                                        target: "zeroclaw_log_internal_scope",
-                                        "zeroclaw_scope",
-                                        model = %model_name,
-                                        model_provider = %provider_name,
-                                    );
-                                    let _zc_trim_guard = __zc_trim_span.entered();
-                                    ::zeroclaw_log::record!(
-                                        WARN,
-                                        ::zeroclaw_log::Event::new(
-                                            module_path!(),
-                                            ::zeroclaw_log::Action::Fail
-                                        )
-                                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                        "Context overflow but only one turn remains; cannot trim further"
-                                    );
                                 }
                             }
 
@@ -2640,44 +2617,57 @@ pub async fn run(
                 observer.record_event(&ObserverEvent::TurnComplete);
 
                 // Display context usage for this turn.
-                if let Some(ref ctx) = cost_tracking_context {
-                    let usage = ctx.snapshot_turn_usage();
-                    if usage.input_tokens > 0 || usage.output_tokens > 0 {
-                        let max_ctx = eff_model_context_window as u64;
-                        let pct = if max_ctx > 0 {
-                            (usage.input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
-                        } else {
-                            0.0
-                        };
-                        let bar_width: usize = 16;
-                        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
-                        let empty = bar_width.saturating_sub(filled);
-                        let bar = format!(
-                            "[{}{}]",
-                            "\u{2588}".repeat(filled),
-                            "\u{2591}".repeat(empty)
-                        );
-                        let msg = if usage.input_tokens > 0 {
-                            crate::i18n::get_required_cli_string_with_args(
-                                "cli-agent-context-bar",
-                                &[
-                                    ("used", format_tokens(usage.input_tokens).as_str()),
-                                    ("max", format_tokens(max_ctx).as_str()),
-                                    ("bar", &bar),
-                                    ("pct", format!("{:.0}", pct).as_str()),
-                                ],
-                            )
-                        } else {
-                            crate::i18n::get_required_cli_string_with_args(
-                                "cli-agent-context-bar-unknown",
-                                &[("max", format_tokens(max_ctx).as_str())],
-                            )
-                        };
-                        eprintln!("\x1b[2m{}\x1b[0m", msg);
-                    }
+                // Reads the same `usage_only()` accumulator the tool loop just
+                // wrote into via the outer-scope `last_turn_usage_handle` Arc,
+                // so the bar reports this turn's tokens (not session-wide).
+                let usage = *last_turn_usage_handle.lock();
+                eprintln!(
+                    "[TRIM-DBG] post-turn bar: provider.input_tokens={} provider.output_tokens={} eff_model_context_window={eff_model_context_window} est_tokens_now={} history_len={}",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    crate::agent::history::estimate_history_tokens(&history),
+                    history.len(),
+                );
+                if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                    let max_ctx = eff_model_context_window as u64;
+                    let pct = if max_ctx > 0 {
+                        (usage.input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                    } else {
+                        0.0
+                    };
+                    let bar_width: usize = 16;
+                    let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                    let empty = bar_width.saturating_sub(filled);
+                    let bar = format!(
+                        "[{}{}]",
+                        "\u{2588}".repeat(filled),
+                        "\u{2591}".repeat(empty)
+                    );
+                    let msg = if usage.input_tokens > 0 {
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-agent-context-bar",
+                            &[
+                                ("used", format_tokens(usage.input_tokens).as_str()),
+                                ("max", format_tokens(max_ctx).as_str()),
+                                ("bar", &bar),
+                                ("pct", format!("{:.0}", pct).as_str()),
+                            ],
+                        )
+                    } else {
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-agent-context-bar-unknown",
+                            &[("max", format_tokens(max_ctx).as_str())],
+                        )
+                    };
+                    eprintln!("\x1b[2m{}\x1b[0m", msg);
                 }
 
                 // Hard cap as a safety net.
+                // [TRIM-DBG] probe #4: count-based post-turn cap
+                eprintln!(
+                    "[TRIM-DBG] post-turn count-cap: history_len={} cap={eff_max_history_messages}",
+                    history.len(),
+                );
                 trim_history(&mut history, eff_max_history_messages);
 
                 // Restore base system prompt after the per-turn tool framing
@@ -2695,22 +2685,20 @@ pub async fn run(
         }
 
         let duration = start.elapsed();
-        // Populate aggregate token usage from the cost-tracking context that
-        // scoped every `run_tool_call_loop` call above — mirroring the streamed
-        // turn path (`Agent::turn_streamed` → `TurnGuard`). The CLI path does
-        // not set the `TOOL_LOOP_TURN_USAGE` task-local, so `snapshot_turn_usage`
-        // reads the context's own accumulator, which holds the session-wide
-        // totals. Without this the CLI `AgentEnd` reported `tokens_used: None`
-        // even though usage was tracked.
-        let tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
-            let usage = ctx.snapshot_turn_usage();
-            (usage.input_tokens > 0 || usage.output_tokens > 0).then_some(
-                zeroclaw_api::observability_traits::TurnTokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                },
-            )
-        });
+        // Populate aggregate token usage from the same per-turn
+        // `usage_only()` accumulator that the post-turn context bar reads.
+        // With the per-turn scope, this Arc holds the last turn's tokens
+        // (not a session-wide accumulation). Mirrors the streamed-turn
+        // path (`Agent::turn_streamed` → `TurnGuard`).
+        let usage = *last_turn_usage_handle.lock();
+        let tokens_used = if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+            })
+        } else {
+            None
+        };
         observer.record_event(&ObserverEvent::AgentEnd {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),

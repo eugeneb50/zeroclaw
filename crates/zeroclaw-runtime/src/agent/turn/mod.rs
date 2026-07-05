@@ -390,10 +390,27 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         preflight_history_maintenance(history);
 
+        // [TRIM-DBG] probe #1+#3: budget/estimate before preemptive trim gate
+        eprintln!(
+            "[TRIM-DBG] preemptive gate: iter={iteration} budget={context_token_budget} est_tokens={} history_len={}",
+            crate::agent::history::estimate_history_tokens(history),
+            history.len(),
+        );
+
         if iteration == 0 && context_token_budget > 0 {
             let taken = std::mem::take(history);
             let result =
                 crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            // [TRIM-DBG] probe #2: trim outcome + which short-circuit branch fired
+            eprintln!(
+                "[TRIM-DBG] trim_to_recent_turns: trimmed={} dropped_msgs={} dropped_turns={} kept_turns={} before={} after={}",
+                result.trimmed,
+                result.dropped_messages,
+                result.dropped_turns,
+                result.kept_turns,
+                result.tokens_before,
+                result.tokens_after,
+            );
             if result.trimmed {
                 let mut trimmed = result.history;
                 let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
@@ -630,7 +647,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let recovered = try_recover_context_overflow(
                     history,
                     &e,
-                    iteration,
+                    Some(iteration),
+                    ctx.provider_name,
+                    ctx.model,
+                    ctx.channel_name,
+                    ctx.agent_alias,
+                    ctx.turn_id,
                     event_tx.as_ref(),
                     observer,
                 )

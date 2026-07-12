@@ -1,5 +1,7 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
+use super::traits::{
+    Memory, MemoryCategory, MemoryEntry, MemoryVisibility, is_recent_recall_query,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -214,7 +216,9 @@ impl QdrantMemory {
                     superseded_by: None,
                     kind: None,
                     pinned: false,
-                    tenant_id: None,
+                    workspace_id: None,
+                    principal_id: None,
+                    visibility: MemoryVisibility::default(),
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -480,7 +484,9 @@ impl QdrantMemory {
                 superseded_by: None,
                 kind: None,
                 pinned: false,
-                tenant_id: None,
+                workspace_id: None,
+                principal_id: None,
+                visibility: MemoryVisibility::default(),
                 agent_alias: payload.agent_id.clone(),
                 agent_id: payload.agent_id,
             })
@@ -693,7 +699,9 @@ impl Memory for QdrantMemory {
                     superseded_by: None,
                     kind: None,
                     pinned: false,
-                    tenant_id: None,
+                    workspace_id: None,
+                    principal_id: None,
+                    visibility: MemoryVisibility::default(),
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -796,7 +804,9 @@ impl Memory for QdrantMemory {
                     superseded_by: None,
                     kind: None,
                     pinned: false,
-                    tenant_id: None,
+                    workspace_id: None,
+                    principal_id: None,
+                    visibility: MemoryVisibility::default(),
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -1122,7 +1132,9 @@ impl Memory for QdrantMemory {
                     superseded_by: None,
                     kind: None,
                     pinned: false,
-                    tenant_id: None,
+                    workspace_id: None,
+                    principal_id: None,
+                    visibility: MemoryVisibility::default(),
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })

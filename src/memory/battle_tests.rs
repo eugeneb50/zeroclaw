@@ -390,7 +390,9 @@ mod tests {
             superseded_by: None,
             kind: None,
             pinned: false,
-            tenant_id: None,
+            workspace_id: None,
+            principal_id: None,
+            visibility: MemoryVisibility::default(),
             agent_alias: None,
             agent_id: None,
         }];
@@ -417,7 +419,9 @@ mod tests {
             superseded_by: Some("newer_id".into()), // already superseded
             kind: None,
             pinned: false,
-            tenant_id: None,
+            workspace_id: None,
+            principal_id: None,
+            visibility: MemoryVisibility::default(),
             agent_alias: None,
             agent_id: None,
         }];
@@ -445,7 +449,9 @@ mod tests {
             superseded_by: None,
             kind: None,
             pinned: false,
-            tenant_id: None,
+            workspace_id: None,
+            principal_id: None,
+            visibility: MemoryVisibility::default(),
             agent_alias: None,
             agent_id: None,
         }];
@@ -1056,7 +1062,9 @@ mod tests {
             superseded_by: Some("newer-id".into()),
             kind: None,
             pinned: false,
-            tenant_id: None,
+            workspace_id: None,
+            principal_id: None,
+            visibility: MemoryVisibility::default(),
             agent_alias: None,
             agent_id: None,
         };

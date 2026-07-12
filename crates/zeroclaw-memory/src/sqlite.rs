@@ -1,6 +1,6 @@
 use super::embeddings::EmbeddingProvider;
 use super::traits::{
-    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, StoreOptions,
+    ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, MemoryVisibility, StoreOptions,
     is_recent_recall_query,
 };
 use super::vector;
@@ -18,6 +18,7 @@ use std::sync::{Mutex as StdMutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use zeroclaw_api::principal::{PrincipalId, WorkspaceId};
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::SearchMode;
 
@@ -367,6 +368,21 @@ impl SqliteMemory {
             "tenant_id",
             "ALTER TABLE memories ADD COLUMN tenant_id TEXT;",
         )?;
+        add_memories_column_if_missing(
+            conn,
+            "workspace_id",
+            "ALTER TABLE memories ADD COLUMN workspace_id TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "principal_id",
+            "ALTER TABLE memories ADD COLUMN principal_id TEXT;",
+        )?;
+        add_memories_column_if_missing(
+            conn,
+            "visibility",
+            "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace';",
+        )?;
         execute_batch_retry(
             conn,
             "CREATE INDEX IF NOT EXISTS idx_memories_namespace_category ON memories(namespace, category);",
@@ -456,7 +472,15 @@ impl SqliteMemory {
             .map(serde_json::to_string)
             .transpose()?;
         let pinned = i64::from(options.pinned);
-        let tenant_id = options.tenant_id;
+        let workspace_id = options
+            .workspace_id
+            .as_ref()
+            .map(|w| w.as_str().to_string());
+        let principal_id = options
+            .principal_id
+            .as_ref()
+            .map(|p| p.as_str().to_string());
+        let visibility = options.visibility.to_string();
         let aid = agent_id.map(String::from);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -468,12 +492,13 @@ impl SqliteMemory {
             conn.execute(
                 "INSERT INTO memories (
                     id, key, content, category, embedding, created_at, updated_at,
-                    session_id, namespace, importance, agent_id, kind, pinned, tenant_id
+                    session_id, namespace, importance, agent_id, kind, pinned,
+                    workspace_id, principal_id, visibility
                  )
                  VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     COALESCE(?11, (SELECT id FROM agents WHERE alias = 'default' LIMIT 1)),
-                    ?12, ?13, ?14
+                    ?12, ?13, ?14, ?15, ?16
                  )
                  ON CONFLICT(agent_id, key) DO UPDATE SET
                     content = excluded.content,
@@ -485,7 +510,9 @@ impl SqliteMemory {
                     importance = excluded.importance,
                     kind = excluded.kind,
                     pinned = excluded.pinned,
-                    tenant_id = excluded.tenant_id",
+                    workspace_id = excluded.workspace_id,
+                    principal_id = excluded.principal_id,
+                    visibility = excluded.visibility",
                 params![
                     id,
                     key,
@@ -500,7 +527,9 @@ impl SqliteMemory {
                     aid,
                     kind,
                     pinned,
-                    tenant_id
+                    workspace_id,
+                    principal_id,
+                    visibility
                 ],
             )?;
             Ok(())
@@ -872,7 +901,7 @@ impl SqliteMemory {
             let until_ref = until_owned.as_deref();
 
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.workspace_id, m.principal_id, m.visibility \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.superseded_by IS NULL AND 1=1"
                     .to_string();
@@ -915,7 +944,9 @@ impl SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: row.get(13)?,
+                    workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1097,7 +1128,7 @@ impl Memory for SqliteMemory {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let sql = format!(
-                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                    "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.workspace_id, m.principal_id, m.visibility \
                      FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                      WHERE m.superseded_by IS NULL AND m.id IN ({placeholders})"
                 );
@@ -1124,6 +1155,8 @@ impl Memory for SqliteMemory {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
                     ))
                 })?;
 
@@ -1143,13 +1176,15 @@ impl Memory for SqliteMemory {
                         pinned,
                         alias,
                         aid,
-                        tenant,
+                        workspace_id_str,
+                        principal_id_str,
+                        visibility_str,
                     ) = row?;
                     entry_map.insert(
                         id,
                         (
                             key, content, cat, ts, sid, ns, imp, sup, kind, pinned, alias, aid,
-                            tenant,
+                            workspace_id_str, principal_id_str, visibility_str,
                         ),
                     );
                 }
@@ -1168,7 +1203,9 @@ impl Memory for SqliteMemory {
                         pinned,
                         alias,
                         aid,
-                        tenant,
+                        workspace_id_str,
+                        principal_id_str,
+                        visibility_str,
                     )) = entry_map.remove(&scored.id)
                     {
                         if let Some(s) = since_ref
@@ -1192,7 +1229,14 @@ impl Memory for SqliteMemory {
                             superseded_by: sup,
                             kind: Self::decode_kind(kind),
                             pinned,
-                            tenant_id: tenant,
+                            workspace_id: workspace_id_str.map(WorkspaceId),
+                            principal_id: principal_id_str.map(PrincipalId),
+                            visibility: visibility_str.map(|s| match s.as_str() {
+                                "principal" => MemoryVisibility::Principal,
+                                "workspace" => MemoryVisibility::Workspace,
+                                "shared" => MemoryVisibility::Shared,
+                                _ => MemoryVisibility::Workspace,
+                            }).unwrap_or(MemoryVisibility::Workspace),
                             agent_alias: alias,
                             agent_id: aid,
                         };
@@ -1285,7 +1329,9 @@ impl Memory for SqliteMemory {
                             superseded_by: row.get(8)?,
                             kind: Self::decode_kind(row.get(9)?),
                             pinned: row.get::<_, i64>(10)? != 0,
-                            tenant_id: row.get(13)?,
+                            workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                             agent_alias: row.get(11)?,
                             agent_id: row.get(12)?,
                         })
@@ -1325,7 +1371,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.workspace_id, m.principal_id, m.visibility \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1",
             )?;
@@ -1344,7 +1390,9 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: row.get(13)?,
+                    workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1370,7 +1418,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.workspace_id, m.principal_id, m.visibility \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.key = ?1 AND m.agent_id = ?2",
             )?;
@@ -1389,7 +1437,9 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: row.get(13)?,
+                    workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1433,7 +1483,9 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: row.get(13)?,
+                    workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1732,7 +1784,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut sql =
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.workspace_id, m.principal_id, m.visibility \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE 1=1"
                     .to_string();
@@ -1783,7 +1835,9 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: row.get(13)?,
+                    workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })
@@ -1805,7 +1859,7 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let mut stmt = conn.prepare(
-                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id \
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.workspace_id, m.principal_id, m.visibility \
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
                  ORDER BY m.created_at ASC",
@@ -1824,7 +1878,9 @@ impl Memory for SqliteMemory {
                     superseded_by: row.get(8)?,
                     kind: Self::decode_kind(row.get(9)?),
                     pinned: row.get::<_, i64>(10)? != 0,
-                    tenant_id: row.get(13)?,
+                    workspace_id: row.get::<_, Option<String>>(13)?.map(WorkspaceId),
+                    principal_id: row.get::<_, Option<String>>(14)?.map(PrincipalId),
+                    visibility: row.get::<_, Option<String>>(15)?.map(|s| match s.as_str() { "principal" => MemoryVisibility::Principal, "workspace" => MemoryVisibility::Workspace, "shared" => MemoryVisibility::Shared, _ => MemoryVisibility::Workspace }).unwrap_or(MemoryVisibility::Workspace),
                     agent_alias: row.get(11)?,
                     agent_id: row.get(12)?,
                 })

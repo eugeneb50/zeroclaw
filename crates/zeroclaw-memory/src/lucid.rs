@@ -1,5 +1,7 @@
 use super::sqlite::SqliteMemory;
-use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
+use super::traits::{
+    MemoryVisibility, {Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query},
+};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -190,7 +192,9 @@ impl LucidMemory {
                 superseded_by: None,
                 kind: None,
                 pinned: false,
-                tenant_id: None,
+                workspace_id: None,
+                principal_id: None,
+                visibility: MemoryVisibility::default(),
                 agent_alias: None,
                 agent_id: None,
             });

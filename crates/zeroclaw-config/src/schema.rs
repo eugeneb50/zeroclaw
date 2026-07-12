@@ -10479,6 +10479,10 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub policy: MemoryPolicyConfig,
+    /// Memory scoping/isolation configuration.
+    #[serde(default)]
+    #[nested]
+    pub scoping: MemoryScopingConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -10502,6 +10506,53 @@ pub struct MemoryPolicyConfig {
     /// Namespaces that are read-only (writes are rejected).
     #[serde(default)]
     pub read_only_namespaces: Vec<String>,
+}
+
+/// Memory scoping configuration (`[memory.scoping]` section).
+///
+/// Controls how memory entries are isolated between principals and workspaces.
+/// Three-tier visibility model (mirrors `MemoryVisibility` in `zeroclaw-api`):
+/// - `Principal`: only the writing principal sees the entry
+/// - `Workspace`: all principals sharing the same workspace_id see the entry
+/// - `Shared`: daemon-wide (no workspace filter)
+///
+/// When `workspace_isolation = "per_workspace"`, Core and Daily categories
+/// default to `Workspace` visibility and Conversation defaults to `Principal`.
+/// With `workspace_isolation = "shared"` (default, backward-compat), all
+/// categories default to `Shared`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.scoping"]
+pub struct MemoryScopingConfig {
+    /// Isolation mode: "per_workspace" (principals in same workspace share Core/Daily)
+    /// or "shared" (backward-compat single workspace).
+    #[serde(default = "default_workspace_isolation")]
+    pub workspace_isolation: String,
+    /// Default visibility for Core/Daily categories.
+    #[serde(default = "default_memory_visibility")]
+    pub default_visibility: String,
+    /// Default visibility for Conversation category.
+    #[serde(default = "default_conversation_visibility")]
+    pub conversation_visibility: String,
+    /// Categories that may be shared at workspace level when isolation is per_workspace.
+    #[serde(default = "default_shared_categories")]
+    pub allow_workspace_shared_categories: Vec<String>,
+}
+
+fn default_workspace_isolation() -> String {
+    "shared".to_string()
+}
+
+fn default_memory_visibility() -> String {
+    "workspace".to_string()
+}
+
+fn default_conversation_visibility() -> String {
+    "principal".to_string()
+}
+
+fn default_shared_categories() -> Vec<String> {
+    vec!["core".into(), "daily".into()]
 }
 
 fn default_retrieval_stages() -> Vec<String> {
@@ -10666,6 +10717,7 @@ impl Default for MemoryConfig {
             audit_enabled: false,
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
+            scoping: MemoryScopingConfig::default(),
         }
     }
 }

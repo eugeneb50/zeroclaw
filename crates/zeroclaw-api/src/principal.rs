@@ -39,6 +39,45 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrincipalId(pub String);
 
+/// Organizational boundary — the workspace or tenant a principal belongs to.
+///
+/// Resolved at auth time from SCIM group membership or static TOML mapping
+/// (`[scim].workspace_mapping` or `[oidc.<alias>].workspace_mapping`). For the
+/// shared-operator / single-workspace backward-compat path, the sentinel
+/// [`WorkspaceId::DEFAULT`] is used.
+///
+/// This is NOT a duplicate of `PrincipalId`: a principal is a person/identity,
+/// a workspace is an organizational boundary. Multiple principals can share a
+/// workspace. SCIM groups are the canonical source of truth; static TOML is the
+/// fallback for installs without SCIM.
+///
+/// Lives alongside [`PrincipalId`] in `zeroclaw-api` so memory, gateway, RPC,
+/// and audit surfaces all import the same contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkspaceId(pub String);
+
+impl WorkspaceId {
+    /// Sentinel workspace id for single-operator / backward-compat path.
+    pub const DEFAULT: &'static str = "default";
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for WorkspaceId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for WorkspaceId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
 impl PrincipalId {
     /// Sentinel id for the single-operator / trusted-local path (no distinct IdP
     /// principal). Lets callers treat "trusted, but anonymous operator" as a real
@@ -178,6 +217,16 @@ pub struct Principal {
     /// with no config alias; audit falls back to [`AuthMethod::as_str`].
     #[serde(default)]
     pub auth_provider: Option<String>,
+    /// Workspace / organizational boundary this principal belongs to. Resolved
+    /// from SCIM group membership or static TOML at auth time. Drives memory
+    /// isolation: entries at [`MemoryVisibility::Workspace`] are visible to all
+    /// principals sharing this workspace_id.
+    #[serde(default = "default_workspace_id")]
+    pub workspace_id: WorkspaceId,
+}
+
+fn default_workspace_id() -> WorkspaceId {
+    WorkspaceId(WorkspaceId::DEFAULT.to_owned())
 }
 
 impl Principal {
@@ -199,6 +248,7 @@ impl Principal {
             allowed_aliases: Vec::new(),
             grants: crate::grants::ResolvedGrants::all(),
             auth_provider: None,
+            workspace_id: default_workspace_id(),
         }
     }
 
@@ -223,7 +273,15 @@ impl Principal {
             allowed_aliases: Vec::new(),
             grants: crate::grants::ResolvedGrants::none(),
             auth_provider: None,
+            workspace_id: default_workspace_id(),
         }
+    }
+
+    /// Attach the workspace / organizational boundary this principal belongs to.
+    #[must_use]
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<WorkspaceId>) -> Self {
+        self.workspace_id = workspace_id.into();
+        self
     }
 
     /// Attach the role claims the identity source asserted.
@@ -370,6 +428,7 @@ mod tests {
             allowed_aliases: vec![AgentAlias("main".to_owned())],
             grants: crate::grants::ResolvedGrants::none(),
             auth_provider: None,
+            workspace_id: WorkspaceId::from("acme-eng"),
         };
         assert!(p.is_authenticated());
     }

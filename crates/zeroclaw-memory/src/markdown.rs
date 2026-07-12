@@ -1,4 +1,6 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
+use super::traits::{
+    MemoryVisibility, {Memory, MemoryCategory, MemoryEntry, is_recent_recall_query},
+};
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, Local, NaiveDate};
 use std::path::{Path, PathBuf};
@@ -139,7 +141,9 @@ impl MarkdownMemory {
                     superseded_by: None,
                     kind: None,
                     pinned: false,
-                    tenant_id: None,
+                    workspace_id: None,
+                    principal_id: None,
+                    visibility: MemoryVisibility::default(),
                     agent_alias: None,
                     agent_id: None,
                 }

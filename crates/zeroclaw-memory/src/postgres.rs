@@ -9,7 +9,9 @@
 //! a single durable memory store with concurrent writes — the SQLite backend
 //! cannot serve that use case.
 
-use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
+use super::traits::{
+    MemoryVisibility, {Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query},
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -325,7 +327,9 @@ impl PostgresMemory {
             superseded_by: None,
             kind: None,
             pinned: false,
-            tenant_id: None,
+            workspace_id: None,
+            principal_id: None,
+            visibility: MemoryVisibility::default(),
             agent_alias: row.try_get("agent_alias").ok(),
             agent_id: row.try_get("agent_id").ok(),
         })

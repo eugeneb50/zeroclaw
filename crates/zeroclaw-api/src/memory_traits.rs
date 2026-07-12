@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::principal::{PrincipalId, WorkspaceId};
+
 /// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportFilter {
@@ -38,9 +40,21 @@ pub struct MemoryEntry {
     /// Whether this entry is protected from budget eviction.
     #[serde(default)]
     pub pinned: bool,
-    /// Tenant or end-user scope for multi-user memory isolation.
+    /// Workspace this memory entry belongs to. Drives workspace-scoped visibility:
+    /// entries at [`MemoryVisibility::Workspace`] are visible to all principals
+    /// sharing this `workspace_id`. The sentinel [`WorkspaceId::DEFAULT`] is used
+    /// for single-workspace backward compat.
     #[serde(default)]
-    pub tenant_id: Option<String>,
+    pub workspace_id: Option<WorkspaceId>,
+    /// Principal that authored this entry. Drives principal-private visibility:
+    /// entries at [`MemoryVisibility::Principal`] are visible only to the
+    /// principal whose [`PrincipalId`] matches this field.
+    #[serde(default)]
+    pub principal_id: Option<PrincipalId>,
+    /// Visibility scope — who may see this entry. Defaults to
+    /// [`MemoryVisibility::Workspace`] for backward compat.
+    #[serde(default)]
+    pub visibility: MemoryVisibility,
     /// Resolved, human-readable agent alias for this row (the HashMap key
     /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
     /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
@@ -78,7 +92,9 @@ impl std::fmt::Debug for MemoryEntry {
             .field("importance", &self.importance)
             .field("kind", &self.kind)
             .field("pinned", &self.pinned)
-            .field("tenant_id", &self.tenant_id)
+            .field("workspace_id", &self.workspace_id)
+            .field("principal_id", &self.principal_id)
+            .field("visibility", &self.visibility)
             .field("agent_alias", &self.agent_alias)
             .finish_non_exhaustive()
     }
@@ -120,6 +136,42 @@ pub enum MemoryCategory {
     Conversation,
     /// User-defined custom category
     Custom(String),
+}
+
+/// Visibility scope controlling which principals may see a memory entry.
+///
+/// Three-tier scoping model (inspired by Caura-MemClaw's
+/// `scope_agent`/`scope_team`/`scope_org`):
+///
+/// - **`Principal`**: only the writing principal sees this entry. Conversation
+///   memory defaults to this so two authenticated users on one daemon cannot
+///   read each other's conversations.
+/// - **`Workspace`**: all principals sharing the same `workspace_id` see this
+///   entry. Core and Daily memories default to this so team knowledge is shared
+///   within an organizational boundary.
+/// - **`Shared`**: daemon-wide visibility (no workspace filter). Backward-compat
+///   for single-workspace installs where all memories were previously visible to
+///   all agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryVisibility {
+    /// Only the writing principal sees this entry.
+    Principal,
+    /// All principals sharing the same `workspace_id` see this entry.
+    #[default]
+    Workspace,
+    /// Daemon-wide visibility (no workspace or principal filter).
+    Shared,
+}
+
+impl std::fmt::Display for MemoryVisibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Principal => write!(f, "principal"),
+            Self::Workspace => write!(f, "workspace"),
+            Self::Shared => write!(f, "shared"),
+        }
+    }
 }
 
 impl serde::Serialize for MemoryCategory {
@@ -188,7 +240,9 @@ pub struct StoreOptions {
     pub importance: Option<f64>,
     pub kind: Option<MemoryKind>,
     pub pinned: bool,
-    pub tenant_id: Option<String>,
+    pub workspace_id: Option<WorkspaceId>,
+    pub principal_id: Option<PrincipalId>,
+    pub visibility: MemoryVisibility,
 }
 
 impl StoreOptions {
@@ -212,8 +266,18 @@ impl StoreOptions {
         self
     }
 
-    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
-        self.tenant_id = Some(tenant_id.into());
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<WorkspaceId>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+
+    pub fn with_principal_id(mut self, principal_id: impl Into<PrincipalId>) -> Self {
+        self.principal_id = Some(principal_id.into());
+        self
+    }
+
+    pub fn with_visibility(mut self, visibility: MemoryVisibility) -> Self {
+        self.visibility = visibility;
         self
     }
 }
@@ -694,7 +758,9 @@ mod tests {
             superseded_by: None,
             kind: None,
             pinned: false,
-            tenant_id: None,
+            workspace_id: None,
+            principal_id: None,
+            visibility: MemoryVisibility::default(),
             agent_alias: None,
             agent_id: None,
         };
@@ -713,7 +779,9 @@ mod tests {
         assert!(parsed.superseded_by.is_none());
         assert!(parsed.kind.is_none());
         assert!(!parsed.pinned);
-        assert!(parsed.tenant_id.is_none());
+        assert!(parsed.workspace_id.is_none());
+        assert!(parsed.principal_id.is_none());
+        assert_eq!(parsed.visibility, MemoryVisibility::Workspace);
     }
 
     #[test]
@@ -732,7 +800,9 @@ mod tests {
 
         assert!(parsed.kind.is_none());
         assert!(!parsed.pinned);
-        assert!(parsed.tenant_id.is_none());
+        assert!(parsed.workspace_id.is_none());
+        assert!(parsed.principal_id.is_none());
+        assert_eq!(parsed.visibility, MemoryVisibility::Workspace);
     }
 
     #[test]
@@ -750,7 +820,9 @@ mod tests {
             superseded_by: None,
             kind: Some(MemoryKind::Semantic(SemanticSubtype::Decision)),
             pinned: true,
-            tenant_id: Some("tenant-1".into()),
+            workspace_id: Some(WorkspaceId::from("acme-eng")),
+            principal_id: Some(PrincipalId::from("alice")),
+            visibility: MemoryVisibility::Workspace,
             agent_alias: Some("agent-a".into()),
             agent_id: Some("agent-uuid".into()),
         };
@@ -763,6 +835,14 @@ mod tests {
             Some(MemoryKind::Semantic(SemanticSubtype::Decision))
         );
         assert!(parsed.pinned);
-        assert_eq!(parsed.tenant_id.as_deref(), Some("tenant-1"));
+        assert_eq!(
+            parsed.workspace_id.as_ref().map(|w| w.as_str()),
+            Some("acme-eng")
+        );
+        assert_eq!(
+            parsed.principal_id.as_ref().map(|p| p.as_str()),
+            Some("alice")
+        );
+        assert_eq!(parsed.visibility, MemoryVisibility::Workspace);
     }
 }

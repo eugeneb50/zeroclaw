@@ -1,0 +1,40 @@
+[package]
+name = "zeroclaw-provisioning"
+version = "0.1.0"
+edition = "2021"
+description = "SCIM provisioning, workspace resolution, and multi-tenant identity management for ZeroClaw"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zeroclaw/zeroclaw"
+publish = false
+
+[dependencies]
+zeroclaw-api = { path = "../zeroclaw-api" }
+zeroclaw-config = { path = "../zeroclaw-config" }
+zeroclaw-log = { path = "../zeroclaw-log" }
+zeroclaw-macros = { path = "../zeroclaw-macros" }
+
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1.38", features = ["full", "rt-multi-thread"] }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+parking_lot = "0.12"
+chrono = { version = "0.4", features = ["serde"] }
+url = "2.5"
+rusqlite = { version = "0.37", features = ["bundled"] }
+uuid = { version = "1.7", features = ["serde", "v4"] }
+strum = { version = "0.26", features = ["derive"] }
+dashmap = "5.5"
+anyhow = "1.0"
+actix-web = { version = "4.7", features = ["ws", "openssl"] }
+actix-http = "3.7"
+futures-util = "0.3"
+
+# Conflict resolution (optional WASM)
+wasmtime = { version = "24.0", optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3.8"

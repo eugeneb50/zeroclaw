@@ -300,7 +300,7 @@ pub struct Config {
     #[nested]
     pub tunnel: TunnelConfig,
 
-    /// Gateway server configuration: host, port, pairing, rate limits (`[gateway]`).
+/// Gateway server configuration: host, port, pairing, rate limits (`[gateway]`).
     #[serde(default)]
     #[nested]
     #[group = "Network"]

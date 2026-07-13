@@ -48,6 +48,7 @@ pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
 pub mod static_files;
+pub mod scim_endpoints;
 pub mod tls;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
@@ -1988,6 +1989,8 @@ pub async fn run_gateway(
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
+        // ── SCIM 2.0 Provisioning ──
+        .nest("/scim/v2", crate::scim_endpoints::scim_routes())
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))

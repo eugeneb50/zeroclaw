@@ -192,6 +192,7 @@ impl LucidMemory {
                 superseded_by: None,
                 kind: None,
                 pinned: false,
+                tenant_id: None,
                 workspace_id: None,
                 principal_id: None,
                 visibility: MemoryVisibility::default(),

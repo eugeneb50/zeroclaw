@@ -40,6 +40,11 @@ pub struct MemoryEntry {
     /// Whether this entry is protected from budget eviction.
     #[serde(default)]
     pub pinned: bool,
+    /// Tenant or end-user scope for multi-user memory isolation.
+    /// Preserved for backward compatibility and external system correlation
+    /// (e.g. M365/WATI tenant IDs). New code should use workspace_id/principal_id/visibility.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     /// Workspace this memory entry belongs to. Drives workspace-scoped visibility:
     /// entries at [`MemoryVisibility::Workspace`] are visible to all principals
     /// sharing this `workspace_id`. The sentinel [`WorkspaceId::DEFAULT`] is used
@@ -92,6 +97,7 @@ impl std::fmt::Debug for MemoryEntry {
             .field("importance", &self.importance)
             .field("kind", &self.kind)
             .field("pinned", &self.pinned)
+            .field("tenant_id", &self.tenant_id)
             .field("workspace_id", &self.workspace_id)
             .field("principal_id", &self.principal_id)
             .field("visibility", &self.visibility)
@@ -240,6 +246,7 @@ pub struct StoreOptions {
     pub importance: Option<f64>,
     pub kind: Option<MemoryKind>,
     pub pinned: bool,
+    pub tenant_id: Option<String>,
     pub workspace_id: Option<WorkspaceId>,
     pub principal_id: Option<PrincipalId>,
     pub visibility: MemoryVisibility,
@@ -263,6 +270,11 @@ impl StoreOptions {
 
     pub fn pinned(mut self, pinned: bool) -> Self {
         self.pinned = pinned;
+        self
+    }
+
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
         self
     }
 
@@ -758,6 +770,7 @@ mod tests {
             superseded_by: None,
             kind: None,
             pinned: false,
+            tenant_id: None,
             workspace_id: None,
             principal_id: None,
             visibility: MemoryVisibility::default(),
@@ -800,6 +813,7 @@ mod tests {
 
         assert!(parsed.kind.is_none());
         assert!(!parsed.pinned);
+        assert!(parsed.tenant_id.is_none());
         assert!(parsed.workspace_id.is_none());
         assert!(parsed.principal_id.is_none());
         assert_eq!(parsed.visibility, MemoryVisibility::Workspace);
@@ -820,6 +834,7 @@ mod tests {
             superseded_by: None,
             kind: Some(MemoryKind::Semantic(SemanticSubtype::Decision)),
             pinned: true,
+            tenant_id: Some("acme".into()),
             workspace_id: Some(WorkspaceId::from("acme-eng")),
             principal_id: Some(PrincipalId::from("alice")),
             visibility: MemoryVisibility::Workspace,
@@ -843,6 +858,7 @@ mod tests {
             parsed.principal_id.as_ref().map(|p| p.as_str()),
             Some("alice")
         );
+        assert!(parsed.tenant_id.is_none());
         assert_eq!(parsed.visibility, MemoryVisibility::Workspace);
     }
 }

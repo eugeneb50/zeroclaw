@@ -6671,6 +6671,15 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Max `/scim/v2` requests per minute per client key.
+    #[serde(default = "default_scim_rate_limit")]
+    pub scim_rate_limit_per_minute: u32,
+
+    /// Provisioning tokens with scopes for SCIM provisioning access.
+    /// Each token is stored as a SHA-256 hash; the plaintext is shown only once at creation.
+    #[serde(default)]
+    pub provisioning_tokens: Vec<ProvisioningToken>,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -6731,6 +6740,33 @@ pub struct GatewayConfig {
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
+}
+
+fn default_scim_rate_limit() -> u32 {
+    30
+}
+
+/// A provisioning token with associated scopes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct ProvisioningToken {
+    /// Hashed token value (SHA-256 hex). Never stored in plaintext.
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
+    pub token_hash: String,
+    /// Human-readable name/description.
+    pub name: String,
+    /// Scopes this token is allowed for this token.
+    #[cfg_attr(feature = "schema-export", schemars(with = "Vec<String>"))]
+    pub scopes: Vec<String>,
+    /// Optional TOTP requirement for mutation operations.
+    #[serde(default)]
+    pub require_totp: bool,
+    /// Token creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Optional expiration timestamp (RFC 3339).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -6796,6 +6832,7 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            scim_rate_limit_per_minute: default_scim_rate_limit(),
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -6808,6 +6845,7 @@ impl Default for GatewayConfig {
             tls: None,
             request_timeout_secs: default_gateway_request_timeout_secs(),
             long_running_request_timeout_secs: default_gateway_long_running_request_timeout_secs(),
+            provisioning_tokens: Vec::new(),
         }
     }
 }
@@ -26285,6 +26323,8 @@ allowed_numbers = ["+1", "+2"]
             tls: None,
             request_timeout_secs: 30,
             long_running_request_timeout_secs: 600,
+            scim_rate_limit_per_minute: 30,
+            provisioning_tokens: Vec::new(),
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

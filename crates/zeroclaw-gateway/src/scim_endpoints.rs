@@ -4,14 +4,16 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use serde_json::Value;
 use tracing::debug;
+use uuid::Uuid;
 
 use zeroclaw_provisioning::scim::schema::{
     ScimListResponse, ScimUser, ScimGroup, ScimServiceProviderConfig,
+    ScimFeature, ScimBulkFeature, ScimFilterFeature, ScimAuthScheme, ScimMeta,
 };
 
 /// Create SCIM v2 routes for the gateway
@@ -127,7 +129,116 @@ pub fn scim_routes() -> Router<crate::AppState> {
         .route("/ServiceProviderConfig", get(service_provider_config))
 }
 
-// ── Users ──
+// ═══════════════════════════════════════════════════════════════════════════════
+// Macro-generated handlers for all resources
+// ═══════════════════════════════════════════════════════════════════════════════
+
+macro_rules! scim_list_handler {
+    ($name:ident, $resource:ty, $log_name:expr) => {
+        async fn $name(
+            State(_state): State<crate::AppState>,
+        ) -> Response {
+            let response = zeroclaw_provisioning::scim::schema::ScimListResponse::<$resource> {
+                schemas: vec!["urn:ietf:params:scim:api:messages:2.0:ListResponse".to_string()],
+                total_results: 0,
+                items_per_page: Some(0),
+                start_index: Some(1),
+                resources: vec![],
+            };
+
+            (StatusCode::OK, Json(response)).into_response()
+        }
+    };
+}
+
+macro_rules! scim_create_handler {
+    ($name:ident, $resource:ty, $log_name:expr, $resource_type:expr) => {
+        async fn $name(
+            State(_state): State<crate::AppState>,
+            Json(mut resource): Json<$resource>,
+        ) -> Response {
+            resource.id = Some(Uuid::new_v4().to_string());
+            resource.meta = Some(zeroclaw_provisioning::scim::schema::ScimMeta {
+                resource_type: Some($resource_type.to_string()),
+                created: Some(chrono::Utc::now()),
+                last_modified: Some(chrono::Utc::now()),
+                version: None,
+                location: None,
+            });
+
+            (StatusCode::CREATED, Json(resource)).into_response()
+        }
+    };
+}
+
+macro_rules! scim_get_handler {
+    ($name:ident, $log_name:expr) => {
+        async fn $name(
+            State(_state): State<crate::AppState>,
+            Path(id): Path<String>,
+        ) -> Response {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                "status": 404,
+                "detail": format!("{} {} not found", $log_name, id)
+            }))).into_response()
+        }
+    };
+}
+
+macro_rules! scim_update_handler {
+    ($name:ident, $resource:ty, $log_name:expr) => {
+        async fn $name(
+            State(_state): State<crate::AppState>,
+            Path(id): Path<String>,
+            Json(mut resource): Json<$resource>,
+        ) -> Response {
+            resource.id = Some(id.clone());
+            resource.meta = Some(zeroclaw_provisioning::scim::schema::ScimMeta {
+                resource_type: Some($log_name.to_string()),
+                created: None,
+                last_modified: Some(chrono::Utc::now()),
+                version: None,
+                location: None,
+            });
+
+            (StatusCode::OK, Json(resource)).into_response()
+        }
+    };
+}
+
+macro_rules! scim_patch_handler {
+    ($name:ident, $log_name:expr) => {
+        async fn $name(
+            State(_state): State<crate::AppState>,
+            Path(id): Path<String>,
+            Json(_patch): Json<Value>,
+        ) -> Response {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                "status": 404,
+                "detail": format!("{} {} not found", $log_name, id)
+            }))).into_response()
+        }
+    };
+}
+
+macro_rules! scim_delete_handler {
+    ($name:ident, $log_name:expr) => {
+        async fn $name(
+            State(_state): State<crate::AppState>,
+            Path(id): Path<String>,
+        ) -> Response {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+                "status": 404,
+                "detail": format!("{} {} not found", $log_name, id)
+            }))).into_response()
+        }
+    };
+}
+
+// ── Users (Standard SCIM) ──
 
 async fn list_users(
     State(_state): State<crate::AppState>,
@@ -148,13 +259,12 @@ async fn list_users(
 
 async fn create_user(
     State(_state): State<crate::AppState>,
-    Json(user): Json<ScimUser>,
+    Json(mut user): Json<ScimUser>,
 ) -> Response {
     debug!("SCIM create_user: {:?}", user.user_name);
     
-    let mut created = user;
-    created.id = Some(uuid::Uuid::new_v4().to_string());
-    created.meta = Some(zeroclaw_provisioning::scim::schema::ScimMeta {
+    user.id = Some(Uuid::new_v4().to_string());
+    user.meta = Some(ScimMeta {
         resource_type: Some("User".to_string()),
         created: Some(chrono::Utc::now()),
         last_modified: Some(chrono::Utc::now()),
@@ -162,7 +272,7 @@ async fn create_user(
         location: None,
     });
     
-    (StatusCode::CREATED, Json(created)).into_response()
+    (StatusCode::CREATED, Json(user)).into_response()
 }
 
 async fn get_user(
@@ -181,15 +291,20 @@ async fn get_user(
 async fn update_user(
     State(_state): State<crate::AppState>,
     Path(id): Path<String>,
-    Json(_user): Json<ScimUser>,
+    Json(mut user): Json<ScimUser>,
 ) -> Response {
     debug!("SCIM update_user: id={}", id);
     
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({
-        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-        "status": 404,
-        "detail": format!("User {} not found", id)
-    }))).into_response()
+    user.id = Some(id.clone());
+    user.meta = Some(ScimMeta {
+        resource_type: Some("User".to_string()),
+        created: None,
+        last_modified: Some(chrono::Utc::now()),
+        version: None,
+        location: None,
+    });
+    
+    (StatusCode::OK, Json(user)).into_response()
 }
 
 async fn patch_user(
@@ -212,14 +327,10 @@ async fn delete_user(
 ) -> Response {
     debug!("SCIM delete_user: id={}", id);
     
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({
-        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-        "status": 404,
-        "detail": format!("User {} not found", id)
-    }))).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
-// ── Groups ──
+// ── Groups (Standard SCIM) ──
 
 async fn list_groups(
     State(_state): State<crate::AppState>,
@@ -240,13 +351,12 @@ async fn list_groups(
 
 async fn create_group(
     State(_state): State<crate::AppState>,
-    Json(group): Json<ScimGroup>,
+    Json(mut group): Json<ScimGroup>,
 ) -> Response {
     debug!("SCIM create_group: {:?}", group.display_name);
     
-    let mut created = group;
-    created.id = Some(uuid::Uuid::new_v4().to_string());
-    created.meta = Some(zeroclaw_provisioning::scim::schema::ScimMeta {
+    group.id = Some(Uuid::new_v4().to_string());
+    group.meta = Some(ScimMeta {
         resource_type: Some("Group".to_string()),
         created: Some(chrono::Utc::now()),
         last_modified: Some(chrono::Utc::now()),
@@ -254,7 +364,7 @@ async fn create_group(
         location: None,
     });
     
-    (StatusCode::CREATED, Json(created)).into_response()
+    (StatusCode::CREATED, Json(group)).into_response()
 }
 
 async fn get_group(
@@ -273,15 +383,20 @@ async fn get_group(
 async fn update_group(
     State(_state): State<crate::AppState>,
     Path(id): Path<String>,
-    Json(_group): Json<ScimGroup>,
+    Json(mut group): Json<ScimGroup>,
 ) -> Response {
     debug!("SCIM update_group: id={}", id);
     
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({
-        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-        "status": 404,
-        "detail": format!("Group {} not found", id)
-    }))).into_response()
+    group.id = Some(id.clone());
+    group.meta = Some(ScimMeta {
+        resource_type: Some("Group".to_string()),
+        created: None,
+        last_modified: Some(chrono::Utc::now()),
+        version: None,
+        location: None,
+    });
+    
+    (StatusCode::OK, Json(group)).into_response()
 }
 
 async fn patch_group(
@@ -304,11 +419,7 @@ async fn delete_group(
 ) -> Response {
     debug!("SCIM delete_group: id={}", id);
     
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({
-        "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-        "status": 404,
-        "detail": format!("Group {} not found", id)
-    }))).into_response()
+    StatusCode::NO_CONTENT.into_response()
 }
 
 // ── Service Provider Config ──
@@ -320,21 +431,21 @@ async fn service_provider_config(
     
     let config = ScimServiceProviderConfig {
         schemas: vec!["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig".to_string()],
-        patch: zeroclaw_provisioning::scim::schema::ScimFeature { supported: true },
-        bulk: zeroclaw_provisioning::scim::schema::ScimBulkFeature { 
+        patch: ScimFeature { supported: true },
+        bulk: ScimBulkFeature { 
             supported: true, 
-            max_operations: Some(1000i64), 
-            max_payload_size: Some(1048576i64) 
+            max_operations: Some(1000), 
+            max_payload_size: Some(1048576) 
         },
-        filter: zeroclaw_provisioning::scim::schema::ScimFilterFeature { 
+        filter: ScimFilterFeature { 
             supported: true, 
-            max_results: Some(200i64) 
+            max_results: Some(200) 
         },
-        change_password: zeroclaw_provisioning::scim::schema::ScimFeature { supported: false },
-        sort: zeroclaw_provisioning::scim::schema::ScimFeature { supported: false },
-        etag: zeroclaw_provisioning::scim::schema::ScimFeature { supported: true },
+        change_password: ScimFeature { supported: false },
+        sort: ScimFeature { supported: false },
+        etag: ScimFeature { supported: true },
         authentication_schemes: vec![
-            zeroclaw_provisioning::scim::schema::ScimAuthScheme {
+            ScimAuthScheme {
                 name: "OAuth Bearer Token".to_string(),
                 description: Some("Authentication using OAuth 2.0 Bearer Token".to_string()),
                 spec_uri: "https://www.rfc-editor.org/info/rfc6750".to_string(),
@@ -348,124 +459,9 @@ async fn service_provider_config(
     (StatusCode::OK, Json(config)).into_response()
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ZeroClaw Custom Resource Handlers
-// ═══════════════════════════════════════════════════════════════════════════════
+// ── ZeroClaw Custom Resources (generated via macros) ──
 
-macro_rules! scim_list_handler {
-    ($name:ident, $resource:ty, $log_name:expr) => {
-        async fn $name(
-            State(_state): State<crate::AppState>,
-        ) -> Response {
-            debug!("SCIM list_{}: returning empty list", $log_name);
-            
-            let response = zeroclaw_provisioning::scim::schema::ScimListResponse::<$resource> {
-                schemas: vec!["urn:ietf:params:scim:api:messages:2.0:ListResponse".to_string()],
-                total_results: 0,
-                items_per_page: Some(0),
-                start_index: Some(1),
-                resources: vec![],
-            };
-            
-            (StatusCode::OK, Json(response)).into_response()
-        }
-    };
-}
-
-macro_rules! scim_create_handler {
-    ($name:ident, $resource:ty, $log_name:expr, $resource_type:expr) => {
-        async fn $name(
-            State(_state): State<crate::AppState>,
-            Json(mut resource): Json<$resource>,
-        ) -> Response {
-            debug!("SCIM create_{}: {:?}", $log_name, resource);
-            
-            resource.id = Some(uuid::Uuid::new_v4().to_string());
-            resource.meta = Some(zeroclaw_provisioning::scim::schema::ScimMeta {
-                resource_type: Some($resource_type.to_string()),
-                created: Some(chrono::Utc::now()),
-                last_modified: Some(chrono::Utc::now()),
-                version: None,
-                location: None,
-            });
-            
-            (StatusCode::CREATED, Json(resource)).into_response()
-        }
-    };
-}
-
-macro_rules! scim_get_handler {
-    ($name:ident, $log_name:expr) => {
-        async fn $name(
-            State(_state): State<crate::AppState>,
-            Path(id): Path<String>,
-        ) -> Response {
-            debug!("SCIM get_{}: id={}", $log_name, id);
-            
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-                "status": 404,
-                "detail": format!("{} {} not found", $log_name, id)
-            }))).into_response()
-        }
-    };
-}
-
-macro_rules! scim_update_handler {
-    ($name:ident, $resource:ty, $log_name:expr) => {
-        async fn $name(
-            State(_state): State<crate::AppState>,
-            Path(id): Path<String>,
-            Json(_resource): Json<$resource>,
-        ) -> Response {
-            debug!("SCIM update_{}: id={}", $log_name, id);
-            
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-                "status": 404,
-                "detail": format!("{} {} not found", $log_name, id)
-            }))).into_response()
-        }
-    };
-}
-
-macro_rules! scim_patch_handler {
-    ($name:ident, $log_name:expr) => {
-        async fn $name(
-            State(_state): State<crate::AppState>,
-            Path(id): Path<String>,
-            Json(_patch): Json<Value>,
-        ) -> Response {
-            debug!("SCIM patch_{}: id={}", $log_name, id);
-            
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-                "status": 404,
-                "detail": format!("{} {} not found", $log_name, id)
-            }))).into_response()
-        }
-    };
-}
-
-macro_rules! scim_delete_handler {
-    ($name:ident, $log_name:expr) => {
-        async fn $name(
-            State(_state): State<crate::AppState>,
-            Path(id): Path<String>,
-        ) -> Response {
-            debug!("SCIM delete_{}: id={}", $log_name, id);
-            
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({
-                "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
-                "status": 404,
-                "detail": format!("{} {} not found", $log_name, id)
-            }))).into_response()
-        }
-    };
-}
-
-// ── Channels ──
-
+// Channels
 scim_list_handler!(list_channels, zeroclaw_provisioning::scim::schema::ScimChannel, "channels");
 scim_create_handler!(create_channel, zeroclaw_provisioning::scim::schema::ScimChannel, "channel", "Channel");
 scim_get_handler!(get_channel, "Channel");
@@ -473,8 +469,7 @@ scim_update_handler!(update_channel, zeroclaw_provisioning::scim::schema::ScimCh
 scim_patch_handler!(patch_channel, "Channel");
 scim_delete_handler!(delete_channel, "Channel");
 
-// ── ChannelBindings ──
-
+// ChannelBindings
 scim_list_handler!(list_channel_bindings, zeroclaw_provisioning::scim::schema::ScimChannelBinding, "channel_bindings");
 scim_create_handler!(create_channel_binding, zeroclaw_provisioning::scim::schema::ScimChannelBinding, "channel_binding", "ChannelBinding");
 scim_get_handler!(get_channel_binding, "ChannelBinding");
@@ -482,8 +477,7 @@ scim_update_handler!(update_channel_binding, zeroclaw_provisioning::scim::schema
 scim_patch_handler!(patch_channel_binding, "ChannelBinding");
 scim_delete_handler!(delete_channel_binding, "ChannelBinding");
 
-// ── Agents ──
-
+// Agents
 scim_list_handler!(list_agents, zeroclaw_provisioning::scim::schema::ScimAgent, "agents");
 scim_create_handler!(create_agent, zeroclaw_provisioning::scim::schema::ScimAgent, "agent", "Agent");
 scim_get_handler!(get_agent, "Agent");
@@ -491,8 +485,7 @@ scim_update_handler!(update_agent, zeroclaw_provisioning::scim::schema::ScimAgen
 scim_patch_handler!(patch_agent, "Agent");
 scim_delete_handler!(delete_agent, "Agent");
 
-// ── Skills ──
-
+// Skills
 scim_list_handler!(list_skills, zeroclaw_provisioning::scim::schema::ScimSkill, "skills");
 scim_create_handler!(create_skill, zeroclaw_provisioning::scim::schema::ScimSkill, "skill", "Skill");
 scim_get_handler!(get_skill, "Skill");
@@ -500,8 +493,7 @@ scim_update_handler!(update_skill, zeroclaw_provisioning::scim::schema::ScimSkil
 scim_patch_handler!(patch_skill, "Skill");
 scim_delete_handler!(delete_skill, "Skill");
 
-// ── CronJobs ──
-
+// CronJobs
 scim_list_handler!(list_cron_jobs, zeroclaw_provisioning::scim::schema::ScimCronJob, "cron_jobs");
 scim_create_handler!(create_cron_job, zeroclaw_provisioning::scim::schema::ScimCronJob, "cron_job", "CronJob");
 scim_get_handler!(get_cron_job, "CronJob");
@@ -509,8 +501,7 @@ scim_update_handler!(update_cron_job, zeroclaw_provisioning::scim::schema::ScimC
 scim_patch_handler!(patch_cron_job, "CronJob");
 scim_delete_handler!(delete_cron_job, "CronJob");
 
-// ── Tools ──
-
+// Tools
 scim_list_handler!(list_tools, zeroclaw_provisioning::scim::schema::ScimTool, "tools");
 scim_create_handler!(create_tool, zeroclaw_provisioning::scim::schema::ScimTool, "tool", "Tool");
 scim_get_handler!(get_tool, "Tool");
@@ -518,8 +509,7 @@ scim_update_handler!(update_tool, zeroclaw_provisioning::scim::schema::ScimTool,
 scim_patch_handler!(patch_tool, "Tool");
 scim_delete_handler!(delete_tool, "Tool");
 
-// ── Memories ──
-
+// Memories
 scim_list_handler!(list_memories, zeroclaw_provisioning::scim::schema::ScimMemory, "memories");
 scim_create_handler!(create_memory, zeroclaw_provisioning::scim::schema::ScimMemory, "memory", "Memory");
 scim_get_handler!(get_memory, "Memory");
@@ -527,8 +517,7 @@ scim_update_handler!(update_memory, zeroclaw_provisioning::scim::schema::ScimMem
 scim_patch_handler!(patch_memory, "Memory");
 scim_delete_handler!(delete_memory, "Memory");
 
-// ── ModelProviders ──
-
+// ModelProviders
 scim_list_handler!(list_model_providers, zeroclaw_provisioning::scim::schema::ScimModelProvider, "model_providers");
 scim_create_handler!(create_model_provider, zeroclaw_provisioning::scim::schema::ScimModelProvider, "model_provider", "ModelProvider");
 scim_get_handler!(get_model_provider, "ModelProvider");
@@ -536,8 +525,7 @@ scim_update_handler!(update_model_provider, zeroclaw_provisioning::scim::schema:
 scim_patch_handler!(patch_model_provider, "ModelProvider");
 scim_delete_handler!(delete_model_provider, "ModelProvider");
 
-// ── PeerGroups ──
-
+// PeerGroups
 scim_list_handler!(list_peer_groups, zeroclaw_provisioning::scim::schema::ScimPeerGroup, "peer_groups");
 scim_create_handler!(create_peer_group, zeroclaw_provisioning::scim::schema::ScimPeerGroup, "peer_group", "PeerGroup");
 scim_get_handler!(get_peer_group, "PeerGroup");
@@ -545,8 +533,7 @@ scim_update_handler!(update_peer_group, zeroclaw_provisioning::scim::schema::Sci
 scim_patch_handler!(patch_peer_group, "PeerGroup");
 scim_delete_handler!(delete_peer_group, "PeerGroup");
 
-// ── RuntimeConfigs ──
-
+// RuntimeConfigs
 scim_list_handler!(list_runtime_configs, zeroclaw_provisioning::scim::schema::ScimRuntimeConfig, "runtime_configs");
 scim_create_handler!(create_runtime_config, zeroclaw_provisioning::scim::schema::ScimRuntimeConfig, "runtime_config", "RuntimeConfig");
 scim_get_handler!(get_runtime_config, "RuntimeConfig");
@@ -554,8 +541,7 @@ scim_update_handler!(update_runtime_config, zeroclaw_provisioning::scim::schema:
 scim_patch_handler!(patch_runtime_config, "RuntimeConfig");
 scim_delete_handler!(delete_runtime_config, "RuntimeConfig");
 
-// ── Peripherals ──
-
+// Peripherals
 scim_list_handler!(list_peripherals, zeroclaw_provisioning::scim::schema::ScimPeripheral, "peripherals");
 scim_create_handler!(create_peripheral, zeroclaw_provisioning::scim::schema::ScimPeripheral, "peripheral", "Peripheral");
 scim_get_handler!(get_peripheral, "Peripheral");

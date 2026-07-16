@@ -11354,6 +11354,19 @@ pub struct OidcConfig {
     /// `otp`, or `hwk`) before authentication succeeds.
     #[serde(default)]
     pub require_mfa: bool,
+    /// Skip strict issuer validation on tokens. When true, the token's `iss`
+    /// claim is NOT compared against `issuer` — only signature and audience
+    /// are verified. Required for Azure AD (Microsoft Entra ID) where the
+    /// token `iss` value may differ from the issuer URL used to fetch the
+    /// JWKS/discovery document (e.g., v1.0 vs v2.0 endpoints, B2C tenants,
+    /// national clouds).
+    ///
+    /// **Security note:** Disabling issuer checking means any token signed by
+    /// a key from the fetched JWKS that carries the correct audience will be
+    /// accepted. Only enable this for issuers you fully trust and where the
+    /// issuer mismatch is a known platform quirk.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_issuer_check: bool,
 }
 
 impl std::fmt::Debug for OidcConfig {
@@ -11370,6 +11383,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("claim_path", &self.claim_path)
             .field("role_map", &self.role_map)
             .field("require_mfa", &self.require_mfa)
+            .field("skip_issuer_check", &self.skip_issuer_check)
             .finish()
     }
 }

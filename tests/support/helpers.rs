@@ -8,6 +8,7 @@ use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
 use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::Memory;
+use zeroclaw_api::memory_traits::MemoryVisibility;
 use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::{ChatResponse, ModelProvider, ToolCall};
 use zeroclaw::tools::Tool;
@@ -151,7 +152,7 @@ impl zeroclaw::memory::Memory for StaticRecallMemory {
         _since: Option<&str>,
         _until: Option<&str>,
     ) -> anyhow::Result<Vec<zeroclaw::memory::MemoryEntry>> {
-        Ok(self
+Ok(self
             .entries
             .iter()
             .map(|(k, v)| zeroclaw::memory::MemoryEntry {
@@ -168,6 +169,9 @@ impl zeroclaw::memory::Memory for StaticRecallMemory {
                 kind: None,
                 pinned: false,
                 tenant_id: None,
+                workspace_id: None,
+                principal_id: None,
+                visibility: MemoryVisibility::Workspace,
                 agent_alias: None,
                 agent_id: None,
             })

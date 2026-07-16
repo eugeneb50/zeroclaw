@@ -243,7 +243,9 @@ fn now_unix() -> u64 {
 
 impl OidcAuthProvider {
     fn claims_to_outcome(&self, claims: &Claims) -> AuthOutcome {
-        if claims.iss.as_deref() != Some(self.config.issuer.as_str()) {
+        if !self.config.skip_issuer_check
+            && claims.iss.as_deref() != Some(self.config.issuer.as_str())
+        {
             return AuthOutcome::Denied {
                 reason: DenyReason::BadCredential,
             };
@@ -444,6 +446,9 @@ impl AuthProvider for OidcAuthProvider {
         let Credential::Bearer(token) = credential else {
             return false;
         };
+        if self.config.skip_issuer_check {
+            return true;
+        }
         match Self::unverified_issuer(token) {
             Some(iss) => iss == self.config.issuer,
             None => self.config.validation == OidcValidation::Introspection,
@@ -541,6 +546,7 @@ mod tests {
                 claim_path: "realm_access.roles".into(),
                 role_map,
                 require_mfa: false,
+                skip_issuer_check: false,
             };
             let mut grants = ResolvedGrants::none();
             grants.resources.insert(

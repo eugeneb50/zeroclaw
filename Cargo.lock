@@ -15020,6 +15020,7 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-provisioning",
  "zeroclaw-runtime",
  "zeroclaw-spawn",
  "zeroclaw-tool-call-parser",

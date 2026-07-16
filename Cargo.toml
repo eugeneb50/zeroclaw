@@ -29,7 +29,7 @@ zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.2" }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.2" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.2" }
 zerocode = { path = "apps/zerocode", version = "0.8.2" }
-zeroclaw-provisioning = { path = "crates/zeroclaw-provisioning", version = "0.8.2" }
+zeroclaw-provisioning = { path = "crates/zeroclaw-provisioning", version = "0.1.0" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
 sys-locale = "0.3"
@@ -85,6 +85,7 @@ zeroclaw-config = { workspace = true, features = ["clap"] }
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
+zeroclaw-provisioning.workspace = true
 zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }

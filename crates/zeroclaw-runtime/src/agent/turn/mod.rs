@@ -217,14 +217,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         hooks,
         excluded_tools,
         dedup_exempt_tools,
-        activated_tools,
+activated_tools,
         model_switch_callback,
         pacing,
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
         context_token_budget,
-        model_context_window,
         receipt_generator,
         knobs,
     } = exec;
@@ -1105,7 +1104,6 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 parallel_tools,
                 max_tool_result_chars,
                 context_token_budget,
-                model_context_window,
                 receipt_generator,
                 knobs,
                 channel_name,
@@ -1545,7 +1543,6 @@ async fn drive_live_sop_actions(
     parallel_tools: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
-    model_context_window: usize,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     knobs: &LoopKnobs,
     channel_name: &str,
@@ -1708,7 +1705,6 @@ async fn drive_live_sop_actions(
                             eff_context_token_budget,
                             eff_dedup_exempt_tools,
                             eff_pacing,
-                            eff_model_context_window,
                         ) = match owned {
                             Some(o) => (
                                 o.temperature,
@@ -1722,7 +1718,6 @@ async fn drive_live_sop_actions(
                                     .expect("owned implies a reassembly handle")
                                     .config
                                     .pacing,
-                                o.agent.resolved.model_context_window,
                             ),
                             None => (
                                 temperature,
@@ -1733,7 +1728,6 @@ async fn drive_live_sop_actions(
                                 context_token_budget,
                                 dedup_exempt_tools,
                                 pacing,
-                                model_context_window,
                             ),
                         };
 
@@ -1836,7 +1830,6 @@ async fn drive_live_sop_actions(
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
                                             context_token_budget: eff_context_token_budget,
-                                            model_context_window: eff_model_context_window,
                                             knobs,
                                         },
                                     ),
@@ -2855,7 +2848,6 @@ mod sop_step_reassembly_tests {
             false,
             false,
             30_000,
-            100_000,
             100_000,
             None,
             &LoopKnobs::default(),

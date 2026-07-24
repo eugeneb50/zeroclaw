@@ -2353,7 +2353,6 @@ impl Agent {
                                     .config
                                     .resolved
                                     .effective_context_budget(),
-                                model_context_window: self.config.resolved.model_context_window,
                                 knobs: &knobs,
                             },
                         ),
@@ -2728,7 +2727,6 @@ impl Agent {
                                     .config
                                     .resolved
                                     .effective_context_budget(),
-                                model_context_window: self.config.resolved.model_context_window,
                                 knobs: &knobs,
                             },
                         ),

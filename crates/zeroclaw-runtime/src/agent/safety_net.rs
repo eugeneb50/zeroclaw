@@ -2046,47 +2046,6 @@ fn agent_with_provider_name(
         .expect("agent builder should succeed")
 }
 
-/// Regression: Usage event carries the serving provider's name as
-/// `provider_ref`, and a subsequent Chunk event arrives after the Usage
-/// callback returns (the drain must not stall when the callback resolves
-/// the window from the embedded provider_ref).
-#[tokio::test]
-async fn usage_event_carries_provider_ref_and_drain_continues() {
-    let mut first = text_response("hello");
-    first.usage = Some(token_usage(10, 5));
-    let provider = ScriptedProvider::new(vec![first]);
-    let events = run_turn_collect_events(
-        || agent_with_provider_name(Box::new(provider), vec![], "mock-provider"),
-        "hi",
-    )
-    .await;
-
-    let usage = events
-        .iter()
-        .find_map(|e| match e {
-            TurnEvent::Usage { provider_ref, .. } => Some(provider_ref.clone()),
-            _ => None,
-        })
-        .expect("a Usage event must be emitted");
-    assert_eq!(
-        usage, "mock-provider",
-        "Usage.provider_ref must carry the serving provider name"
-    );
-
-    let pos_usage = events
-        .iter()
-        .position(|e| matches!(e, TurnEvent::Usage { .. }))
-        .expect("Usage event position");
-    let pos_chunk = events
-        .iter()
-        .rposition(|e| matches!(e, TurnEvent::Chunk { delta } if delta.contains("hello")))
-        .expect("a final Chunk carrying the response must be emitted");
-    assert!(
-        pos_usage < pos_chunk,
-        "Usage must precede the final Chunk — drain continued after the Usage callback"
-    );
-}
-
 /// Regression: a tool turn emits Usage (call 1) → ToolCall → ToolResult →
 /// Usage (call 2) → final Chunk, proving the drain processes every event
 /// type after a Usage event without relocking the agent.

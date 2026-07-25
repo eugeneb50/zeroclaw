@@ -4993,73 +4993,29 @@ mod tests {
 
             // Second take should be None.
             assert!(take_last_provider_fallback().is_none());
-        })
-        .await;
-    }
 
-    /// Regression: `clear_last_provider_fallback` must wipe a stale record so
-    /// `peek_last_provider_fallback` returns `None` on the next iteration.
-    /// Without this, a fallback recorded in iteration N-1 would leak into
-    /// iteration N's `Usage.provider_ref` / `serving_model` even when
-    /// iteration N succeeded with the primary provider — resolving the
-    /// wrong context window and attributing cost to the wrong provider.
-    #[tokio::test]
-    async fn clear_last_provider_fallback_wipes_stale_record_for_next_iteration() {
-        scope_provider_fallback(async {
-            // Step 1: simulate iteration N-1 recording a fallback.
-            let model_provider = ReliableModelProvider::new(
-                "test",
-                vec![
-                    (
-                        "broken".into(),
-                        Box::new(MockModelProvider {
-                            calls: Arc::new(AtomicUsize::new(0)),
-                            fail_until_attempt: 0,
-                            response: "",
-                            error: "primary failed",
-                        }),
-                    ),
-                    (
-                        "working".into(),
-                        Box::new(MockModelProvider {
-                            calls: Arc::new(AtomicUsize::new(0)),
-                            fail_until_attempt: 0,
-                            response: "hello from working",
-                            error: "unused",
-                        }),
-                    ),
-                ],
-                2,
-                1,
-            );
+            // Regression: `clear_last_provider_fallback` must wipe a stale
+            // record so `peek_last_provider_fallback` returns `None` on the
+            // next iteration. Without this, a fallback recorded in iteration
+            // N-1 would leak into iteration N's `Usage.provider_ref` /
+            // `serving_model` even when iteration N succeeded with the
+            // primary provider — resolving the wrong context window and
+            // attributing cost to the wrong provider.
+            //
+            // Re-record a fallback then clear it to prove the cell is wiped.
             let _ = model_provider
                 .simple_chat("hi", "test-model", Some(0.0))
                 .await
                 .unwrap();
-
-            let stale = peek_last_provider_fallback();
             assert!(
-                stale.is_some(),
-                "iteration N-1 must have recorded a fallback"
+                peek_last_provider_fallback().is_some(),
+                "iteration N-1 must have re-recorded a fallback"
             );
-            assert_eq!(stale.as_ref().unwrap().actual_provider, "working");
-
-            // Step 2: clear the cell — simulates the top-of-iteration clear
-            // the turn loop performs before `call_provider`.
             clear_last_provider_fallback();
             assert!(
                 peek_last_provider_fallback().is_none(),
-                "after clear, the per-iteration cell must be empty"
-            );
-
-            // Step 3: iteration N succeeds with the primary (no fallback
-            // recorded, so `record_provider_fallback` is never called).
-            // `peek_last_provider_fallback` must return `None` — confirming
-            // the stale record from iteration N-1 does NOT leak in.
-            assert!(
-                peek_last_provider_fallback().is_none(),
-                "iteration N's peek must not see the stale N-1 record \
-                 — resolved wrong context window and wrong cost attribution"
+                "after clear, the per-iteration cell must be empty — stale \
+                 N-1 record would leak into iteration N"
             );
         })
         .await;

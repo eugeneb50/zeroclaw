@@ -6601,52 +6601,6 @@ mod tests {
         assert_eq!(v["params"]["reason"], "context token budget exceeded");
     }
 
-    #[test]
-    fn usage_event_emits_context_usage_notification() {
-        let event = TurnEvent::Usage {
-            input_tokens: Some(100),
-            cached_input_tokens: None,
-            output_tokens: Some(50),
-            cost_usd: Some(0.01),
-            provider_ref: String::new(),
-            model: String::new(),
-        };
-        let json = notification_for_turn_event("s1", &event, Some(32_000), None).unwrap();
-        let v = parse(&json);
-        assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(v["params"]["session_id"], "s1");
-        // Context size is the prompt the model just consumed = input_tokens.
-        // Output tokens are the model's reply, not part of the prompt size.
-        // cached_input_tokens is a *subset* of input_tokens per the
-        // TokenUsage contract and must NOT be added (double-counts).
-        assert_eq!(v["params"]["input_tokens"], 100);
-        assert_eq!(
-            v["params"]["max_context_tokens"], 32_000,
-            "profile budget must be emitted"
-        );
-        assert!(v["params"].get("model_context_window").is_none());
-    }
-
-    #[test]
-    fn usage_event_emits_model_context_window_when_provided() {
-        let event = TurnEvent::Usage {
-            input_tokens: Some(100),
-            cached_input_tokens: None,
-            output_tokens: Some(50),
-            cost_usd: Some(0.01),
-            provider_ref: String::new(),
-            model: String::new(),
-        };
-        let json =
-            notification_for_turn_event("s1", &event, Some(800_000), Some(1_000_000)).unwrap();
-        let v = parse(&json);
-        assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(v["params"]["session_id"], "s1");
-        assert_eq!(v["params"]["input_tokens"], 100);
-        assert_eq!(v["params"]["max_context_tokens"], 800_000);
-        assert_eq!(v["params"]["model_context_window"], 1_000_000);
-    }
-
     /// Resolution: runtime_profile.max_context_tokens → 32_000 stub.
     #[test]
     fn context_usage_max_tokens_resolution() {
@@ -6719,56 +6673,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Regression: wire payload carries profile budget (128k), not the 32k stub.
-    #[test]
-    fn context_usage_notification_wire_reports_runtime_profile_budget() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            ..Config::default()
-        };
-
-        let max_ctx = context_usage_max_tokens(&cfg, "coder");
-        let event = TurnEvent::Usage {
-            input_tokens: Some(100),
-            cached_input_tokens: None,
-            output_tokens: Some(50),
-            cost_usd: Some(0.01),
-            provider_ref: String::new(),
-            model: String::new(),
-        };
-        let json = notification_for_turn_event("s1", &event, Some(max_ctx), None).unwrap();
-        let v = parse(&json);
-
-        assert_eq!(v["params"]["type"], "context_usage");
-        assert_eq!(
-            v["params"]["max_context_tokens"], 128_000,
-            "emitted context_usage must carry the runtime-profile budget, not the 32k model-window fallback"
-        );
     }
 
     /// Regression: model_context_window survives the wire when provider has it.

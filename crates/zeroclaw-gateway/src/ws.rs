@@ -2180,308 +2180,193 @@ mod tests {
         );
     }
 
-    /// Regression: done-frame omits `model_context_window` when provider
-    /// has no explicit `context_window`.
+    /// done-frame model_context_window: present when the provider has an
+    /// explicit `context_window`, absent when it does not.
+    /// Covers both halves of #8872: absence must be preserved at the producer
+    /// boundary and a set window must survive the wire.
     #[test]
-    fn done_frame_omits_model_context_window_when_provider_unset() {
+    fn done_frame_model_context_window_presence_tracks_provider_config() {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(128_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
+        // (provider_alias, context_window, expected_model_window,
+        //  expected_max_context_tokens)
+        let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
+            // Provider has no context_window — field must be absent.
+            ("openrouter.default", None, None, 128_000),
+            // Provider sets context_window — field must appear on the wire.
+            (
+                "openrouter.glm-5.2",
+                Some(1_000_000),
+                Some(1_000_000),
+                800_000,
+            ),
+        ];
 
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openrouter.default".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
+        for &(provider_alias, context_window, expected_window, expected_max_ctx) in cases {
+            let mut runtime_profiles = HashMap::new();
+            runtime_profiles.insert(
+                "coding".to_string(),
+                RuntimeProfileConfig {
+                    max_context_tokens: Some(expected_max_ctx as usize),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
 
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        providers
-            .models
-            .ensure("openrouter", "default")
-            .expect("ensure creates entry");
+            let (vendor, model_alias) = provider_alias.split_once('.').unwrap();
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: "coding".into(),
+                    model_provider: provider_alias.into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
 
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
+            let mut providers = zeroclaw_config::providers::Providers::default();
+            let entry = providers
+                .models
+                .ensure(vendor, model_alias)
+                .expect("ensure creates entry");
+            if let Some(w) = context_window {
+                entry.context_window = Some(w);
+            }
 
-        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-        let model_ctx_window =
-            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, "openrouter.default");
-        assert!(
-            model_ctx_window.is_none(),
-            "resolve_live_model_context_window must return None when no \
-             provider context_window is set, preserving absence at the \
-             producer boundary"
-        );
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
 
-        let done = build_done_frame_json(
-            "ok",
-            Some(100),
-            Some(50),
-            Some(150),
-            Some(0.001),
-            "glm-5.2",
-            "openrouter",
-            max_ctx,
-            model_ctx_window,
-            Some(100),
-        );
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+            let model_ctx_window =
+                zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_alias);
+            assert_eq!(
+                model_ctx_window, expected_window,
+                "resolve_live_model_context_window({provider_alias}) must return {expected_window:?}"
+            );
 
-        assert_eq!(v["type"], "done");
-        assert_eq!(
-            v["max_context_tokens"], 128_000,
-            "profile budget must be emitted"
-        );
-        assert!(
-            v.get("model_context_window").is_none(),
-            "model_context_window must be absent when provider has no context_window \
-             (#8872)"
-        );
+            let done = build_done_frame_json(
+                "ok",
+                Some(100),
+                Some(50),
+                Some(150),
+                Some(0.001),
+                "glm-5.2",
+                vendor,
+                max_ctx,
+                model_ctx_window,
+                Some(100),
+            );
+            let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+            assert_eq!(v["type"], "done");
+            assert_eq!(
+                v["max_context_tokens"], expected_max_ctx,
+                "profile budget must be emitted"
+            );
+            if let Some(window) = expected_window {
+                assert_eq!(
+                    v["model_context_window"], window,
+                    "done-frame must carry the provider's explicit context_window"
+                );
+            } else {
+                assert!(
+                    v.get("model_context_window").is_none(),
+                    "model_context_window must be absent when provider has no context_window \
+                     (#8872)"
+                );
+            }
+        }
     }
 
-    /// Positive case: provider sets `context_window`, done-frame includes it.
+    /// Regression: done-frame model_context_window follows the live provider
+    /// after either a session/configure A→B switch or an in-turn model switch,
+    /// not the static agent alias. Both paths use the same shared resolver.
     #[test]
-    fn done_frame_includes_model_context_window_when_provider_set() {
+    fn done_frame_model_window_follows_live_provider_switch() {
         use std::collections::HashMap;
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
+        // (switched_provider_alias, scenario_label)
+        let cases: &[(&str, &str)] = &[
+            ("ollama.provider-b", "session/configure switch"),
+            ("ollama.llama3", "in-turn model_switch"),
+        ];
 
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openrouter.glm-5.2".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
+        for &(live_provider_ref, label) in cases {
+            let mut runtime_profiles = HashMap::new();
+            runtime_profiles.insert(
+                "coding".to_string(),
+                RuntimeProfileConfig {
+                    max_context_tokens: Some(800_000),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
 
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        providers
-            .models
-            .ensure("openrouter", "glm-5.2")
-            .expect("ensure creates entry")
-            .context_window = Some(1_000_000);
+            let mut agents = HashMap::new();
+            agents.insert(
+                "coder".to_string(),
+                AliasedAgentConfig {
+                    enabled: true,
+                    runtime_profile: "coding".into(),
+                    model_provider: "openrouter.glm-5.2".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
 
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
+            let mut providers = zeroclaw_config::providers::Providers::default();
+            // Provider A (static binding) — no context_window.
+            providers
+                .models
+                .ensure("openrouter", "glm-5.2")
+                .expect("ensure A");
+            // Provider B (switched-to) — has context_window.
+            let (b_vendor, b_alias) = live_provider_ref.split_once('.').unwrap();
+            providers
+                .models
+                .ensure(b_vendor, b_alias)
+                .expect("ensure B")
+                .context_window = Some(1_000_000);
 
-        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-        let model_ctx_window =
-            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, "openrouter.glm-5.2");
-        assert_eq!(
-            model_ctx_window,
-            Some(1_000_000),
-            "resolve_live_model_context_window must return the provider's \
-             explicit context_window when set"
-        );
+            let cfg = Config {
+                agents,
+                runtime_profiles,
+                providers,
+                ..Config::default()
+            };
 
-        let done = build_done_frame_json(
-            "ok",
-            Some(100),
-            Some(50),
-            Some(150),
-            Some(0.001),
-            "glm-5.2",
-            "openrouter",
-            max_ctx,
-            model_ctx_window,
-            Some(100),
-        );
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+            let model_ctx_window =
+                zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, live_provider_ref);
+            assert_eq!(
+                model_ctx_window,
+                Some(1_000_000),
+                "resolver must return B's window for {label}, not A's"
+            );
 
-        assert_eq!(v["type"], "done");
-        assert_eq!(v["max_context_tokens"], 800_000);
-        assert_eq!(
-            v["model_context_window"], 1_000_000,
-            "done-frame must carry the provider's explicit context_window"
-        );
-    }
+            let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
+            let done = build_done_frame_json(
+                "ok",
+                Some(100),
+                Some(50),
+                Some(150),
+                Some(0.001),
+                "glm-5.2",
+                "openrouter",
+                max_ctx,
+                model_ctx_window,
+                Some(100),
+            );
+            let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
 
-    /// Regression: done-frame model_context_window follows the live
-    /// provider after a session/configure A→B switch, not the static
-    /// agent alias.
-    #[test]
-    fn done_frame_model_window_follows_live_session_provider_switch() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openrouter.glm-5.2".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        providers
-            .models
-            .ensure("openrouter", "glm-5.2")
-            .expect("ensure A");
-        providers
-            .models
-            .ensure("ollama", "provider-b")
-            .expect("ensure B")
-            .context_window = Some(1_000_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
-
-        let live_provider_ref = "ollama.provider-b";
-        let model_ctx_window =
-            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, live_provider_ref);
-        assert_eq!(
-            model_ctx_window,
-            Some(1_000_000),
-            "shared resolver must return B's window, not A's"
-        );
-
-        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-        let done = build_done_frame_json(
-            "ok",
-            Some(100),
-            Some(50),
-            Some(150),
-            Some(0.001),
-            "glm-5.2",
-            "openrouter",
-            max_ctx,
-            model_ctx_window,
-            Some(100),
-        );
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
-
-        assert_eq!(v["type"], "done");
-        assert_eq!(
-            v["model_context_window"], 1_000_000,
-            "done-frame must carry B's live window, not A's static alias window"
-        );
-    }
-
-    /// Regression: done-frame model_context_window reflects the live provider
-    /// after an in-turn model_switch (not the static agent alias).
-    ///
-    /// Exercises the same shared resolver path that `process_chat_message`
-    /// uses at turn-end (ws.rs end-of-turn block) after
-    /// `try_apply_pending_model_switch` mutates `agent.model_provider_name`.
-    #[test]
-    fn done_frame_model_window_follows_in_turn_provider_switch() {
-        use std::collections::HashMap;
-        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
-
-        let mut runtime_profiles = HashMap::new();
-        runtime_profiles.insert(
-            "coding".to_string(),
-            RuntimeProfileConfig {
-                max_context_tokens: Some(800_000),
-                ..RuntimeProfileConfig::default()
-            },
-        );
-
-        let mut agents = HashMap::new();
-        agents.insert(
-            "coder".to_string(),
-            AliasedAgentConfig {
-                enabled: true,
-                runtime_profile: "coding".into(),
-                model_provider: "openrouter.glm-5.2".into(),
-                ..AliasedAgentConfig::default()
-            },
-        );
-
-        let mut providers = zeroclaw_config::providers::Providers::default();
-        providers
-            .models
-            .ensure("openrouter", "glm-5.2")
-            .expect("ensure A");
-        providers
-            .models
-            .ensure("ollama", "llama3")
-            .expect("ensure B")
-            .context_window = Some(1_000_000);
-
-        let cfg = Config {
-            agents,
-            runtime_profiles,
-            providers,
-            ..Config::default()
-        };
-
-        let live_provider_ref = "ollama.llama3";
-        let model_ctx_window =
-            zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, live_provider_ref);
-        assert_eq!(
-            model_ctx_window,
-            Some(1_000_000),
-            "post-switch resolver must return B's window, not A's"
-        );
-
-        let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-        let done = build_done_frame_json(
-            "ok",
-            Some(100),
-            Some(50),
-            Some(150),
-            Some(0.001),
-            "glm-5.2",
-            "openrouter",
-            max_ctx,
-            model_ctx_window,
-            Some(100),
-        );
-        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
-
-        assert_eq!(v["type"], "done");
-        assert_eq!(
-            v["model_context_window"], 1_000_000,
-            "done-frame must carry B's post-switch window, not A's static alias window"
-        );
+            assert_eq!(v["type"], "done");
+            assert_eq!(
+                v["model_context_window"], 1_000_000,
+                "done-frame must carry B's live window after {label}, not A's static alias window"
+            );
+        }
     }
 }

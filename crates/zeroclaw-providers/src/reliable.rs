@@ -50,6 +50,25 @@ pub fn peek_last_provider_fallback() -> Option<ProviderFallbackInfo> {
         .flatten()
 }
 
+/// Clear the provider-fallback cell so the next iteration starts fresh.
+/// Called at the top of each tool-loop iteration (before `call_provider`)
+/// to prevent a stale record from iteration N-1 leaking into the
+/// `peek_last_provider_fallback` + `serving_provider_name` update for
+/// iteration N. After the clear, only a fallback recorded *during* this
+/// iteration affects the per-call `Usage` event's `provider_ref`/`model`.
+///
+/// This means the round-level `take_last_provider_fallback` at agent
+/// turn-end reads the LAST iteration's recorded fallback — matching the
+/// model-fallback-notice semantics ("the final response was served by a
+/// different provider than requested"), since the user-facing response
+/// always comes from the last iteration's LLM call.
+/// Must be called within a `scope_provider_fallback` scope.
+pub fn clear_last_provider_fallback() {
+    let _ = PROVIDER_FALLBACK.try_with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
 /// Run the given future within a provider-fallback scope.
 /// Both `record_provider_fallback` (inside ReliableModelProvider) and
 /// `take_last_provider_fallback` (post-loop channel code) must execute
@@ -4974,6 +4993,74 @@ mod tests {
 
             // Second take should be None.
             assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    /// Regression: `clear_last_provider_fallback` must wipe a stale record so
+    /// `peek_last_provider_fallback` returns `None` on the next iteration.
+    /// Without this, a fallback recorded in iteration N-1 would leak into
+    /// iteration N's `Usage.provider_ref` / `serving_model` even when
+    /// iteration N succeeded with the primary provider — resolving the
+    /// wrong context window and attributing cost to the wrong provider.
+    #[tokio::test]
+    async fn clear_last_provider_fallback_wipes_stale_record_for_next_iteration() {
+        scope_provider_fallback(async {
+            // Step 1: simulate iteration N-1 recording a fallback.
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "broken".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "",
+                            error: "primary failed",
+                        }),
+                    ),
+                    (
+                        "working".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "hello from working",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                2,
+                1,
+            );
+            let _ = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .unwrap();
+
+            let stale = peek_last_provider_fallback();
+            assert!(
+                stale.is_some(),
+                "iteration N-1 must have recorded a fallback"
+            );
+            assert_eq!(stale.as_ref().unwrap().actual_provider, "working");
+
+            // Step 2: clear the cell — simulates the top-of-iteration clear
+            // the turn loop performs before `call_provider`.
+            clear_last_provider_fallback();
+            assert!(
+                peek_last_provider_fallback().is_none(),
+                "after clear, the per-iteration cell must be empty"
+            );
+
+            // Step 3: iteration N succeeds with the primary (no fallback
+            // recorded, so `record_provider_fallback` is never called).
+            // `peek_last_provider_fallback` must return `None` — confirming
+            // the stale record from iteration N-1 does NOT leak in.
+            assert!(
+                peek_last_provider_fallback().is_none(),
+                "iteration N's peek must not see the stale N-1 record \
+                 — resolved wrong context window and wrong cost attribution"
+            );
         })
         .await;
     }

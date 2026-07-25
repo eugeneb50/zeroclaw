@@ -635,16 +635,25 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            active_model,
-            &prepared_messages.messages,
-            request_tools,
-            should_consume_provider_stream,
-            iteration,
-        )
-        .await?;
+        } = {
+            // Clear the per-iteration fallback record so this iteration's
+            // peek below only reports a fallback recorded *during* this
+            // call_provider. Without this, a stale record from iteration
+            // N-1 (which succeeded without fallback) would leak into
+            // iteration N's Usage.provider_ref/model, resolving the wrong
+            // context window and attributing cost to the wrong provider.
+            zeroclaw_providers::reliable::clear_last_provider_fallback();
+            call_provider(
+                &ctx,
+                active_model_provider,
+                active_model,
+                &prepared_messages.messages,
+                request_tools,
+                should_consume_provider_stream,
+                iteration,
+            )
+            .await?
+        };
 
         // If the reliable provider wrapper fell back to a different entry
         // (e.g., pinned model), update the serving identity so the Usage

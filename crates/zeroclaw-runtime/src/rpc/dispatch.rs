@@ -6540,6 +6540,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: Some(0.01),
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(32_000), None).unwrap();
         let v = parse(&json);
@@ -6565,6 +6566,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: Some(0.01),
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json =
             notification_for_turn_event("s1", &event, Some(800_000), Some(1_000_000)).unwrap();
@@ -6688,6 +6690,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: Some(0.01),
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(max_ctx), None).unwrap();
         let v = parse(&json);
@@ -6749,6 +6752,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: Some(0.01),
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json =
             notification_for_turn_event("s1", &event, Some(max_ctx), Some(model_ctx)).unwrap();
@@ -6821,6 +6825,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: None,
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, max_ctx, model_ctx_window).unwrap();
         let v = parse(&json);
@@ -6964,6 +6969,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: None,
             provider_ref: String::new(),
+            model: String::new(),
         };
         let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
         let json =
@@ -6985,6 +6991,7 @@ mod tests {
             output_tokens: Some(50),
             cost_usd: None,
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
@@ -7004,6 +7011,7 @@ mod tests {
             output_tokens: Some(200),
             cost_usd: None,
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(200_000), None).unwrap();
         let v = parse(&json);
@@ -7024,6 +7032,7 @@ mod tests {
             output_tokens: Some(100),
             cost_usd: None,
             provider_ref: String::new(),
+            model: String::new(),
         };
         let json = notification_for_turn_event("s1", &event, Some(100_000), None).unwrap();
         let v = parse(&json);

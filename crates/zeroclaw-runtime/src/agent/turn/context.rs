@@ -1,6 +1,6 @@
 //! Shared context for the per-iteration turn step functions. Most fields are
-//! immutable for the turn; `serving_provider_name` is mutated per iteration
-//! when vision routing selects a different provider.
+//! immutable for the turn; `serving_provider_name` and `serving_model` are
+//! mutated per iteration when vision routing selects a different provider.
 
 use super::events::DraftEvent;
 use crate::approval::ApprovalManager;
@@ -41,6 +41,10 @@ pub(crate) struct TurnCtx<'a> {
     /// because the vision-resolved name's lifetime is the iteration scope,
     /// not the `'a` of the struct.
     pub(crate) serving_provider_name: Option<String>,
+    /// Per-iteration override for the model that actually served the
+    /// current LLM call. Mirrors `serving_provider_name`: set when vision
+    /// routing or reliable fallback selects a different model.
+    pub(crate) serving_model: Option<String>,
 }
 
 /// Lightweight metadata for turn-level event emission.

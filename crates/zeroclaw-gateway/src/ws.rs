@@ -1055,6 +1055,9 @@ async fn process_chat_message(
     // Track the most recent provider that served usage events (for done-frame
     // context_window resolution and provider label).
     let mut last_provider_ref: Option<String> = None;
+    // Track the most recent model that served usage events so the terminal
+    // metadata stays a coherent tuple with the provider.
+    let mut last_model: Option<String> = None;
 
     // Track the most recent absolute provider-reported prompt size
     // (replaces on each TurnEvent::Usage; not accumulated).
@@ -1187,8 +1190,10 @@ async fn process_chat_message(
                             output_tokens,
                             cost_usd: _,
                             provider_ref,
+                            model: served_model,
                         } => {
                             last_provider_ref = Some(provider_ref.clone());
+                            last_model = Some(served_model.clone());
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
@@ -1317,10 +1322,15 @@ async fn process_chat_message(
         }
 
         // Broadcast agent_end event
+        let cancel_model = last_model.as_deref().unwrap_or(&turn_model);
+        let cancel_provider = last_provider_ref
+            .as_deref()
+            .map(|r| r.split('.').next_back().unwrap_or(r))
+            .unwrap_or(&provider_label);
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
-            "model_provider": provider_label,
-            "model": turn_model,
+            "model_provider": cancel_provider,
+            "model": cancel_model,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1330,8 +1340,8 @@ async fn process_chat_message(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model_provider": provider_label,
-                    "model": turn_model,
+                    "model_provider": cancel_provider,
+                    "model": cancel_model,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1433,13 +1443,16 @@ async fn process_chat_message(
                     (window, label.to_string())
                 }
             };
+            // Use the last served model from usage events when available so
+            // the terminal metadata is one coherent tuple with the provider.
+            let effective_model = last_model.as_deref().unwrap_or(&turn_model);
             let done = build_done_frame_json(
                 &outcome.response,
                 total_input_tokens,
                 total_output_tokens,
                 total_tokens,
                 cost_usd,
-                &turn_model,
+                effective_model,
                 &provider_ref_label,
                 max_context_tokens,
                 model_context_window,
@@ -1456,7 +1469,7 @@ async fn process_chat_message(
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "model_provider": provider_ref_label,
-                "model": turn_model,
+                "model": effective_model,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1468,7 +1481,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_ref_label,
-                        "model": turn_model,
+                        "model": effective_model,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,

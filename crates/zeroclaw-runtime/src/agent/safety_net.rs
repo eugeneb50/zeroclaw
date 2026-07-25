@@ -1996,11 +1996,11 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
     );
 }
 
-// ── seam 9: per-call provider identity on Usage + drain-unblock regressions
+// ── per-call provider identity and drain ordering regressions
 //
-// note.md blocker: TurnEvent::Usage must carry the serving provider
-// reference, and the drain loop must continue processing events after the
-// Usage callback returns. These tests drive the production
+// TurnEvent::Usage must carry the serving provider reference and model,
+// and the drain loop must continue processing events after the Usage
+// callback returns. These tests drive the production
 // `turn_streamed_with_steering_state` path and assert both the
 // `provider_ref` content and the cross-event ordering the wire/gateway
 // layers depend on.
@@ -2070,7 +2070,7 @@ async fn usage_event_carries_provider_ref_and_drain_continues() {
         .expect("a Usage event must be emitted");
     assert_eq!(
         usage, "mock-provider",
-        "Usage.provider_ref must carry the serving provider name (note.md blocker)"
+        "Usage.provider_ref must carry the serving provider name"
     );
 
     let pos_usage = events
@@ -2089,9 +2089,7 @@ async fn usage_event_carries_provider_ref_and_drain_continues() {
 
 /// Regression: a tool turn emits Usage (call 1) → ToolCall → ToolResult →
 /// Usage (call 2) → final Chunk, proving the drain processes every event
-/// type after a Usage event without relocking the agent. This is the
-/// "real execute_turn callback through usage followed by another event"
-/// case from note.md.
+/// type after a Usage event without relocking the agent.
 #[tokio::test]
 async fn usage_then_tool_events_then_usage_again_proves_drain_unblocked() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -2153,5 +2151,197 @@ async fn usage_then_tool_events_then_usage_again_proves_drain_unblocked() {
     assert!(
         pos_tool_result < pos_final_chunk,
         "ToolResult must precede the final Chunk — drain did not stall after Usage + Tool events"
+    );
+}
+
+/// Regression: Usage event carries a coherent provider_ref AND model tuple
+/// when vision routing selects a different provider than the turn-start
+/// provider. The Usage event's provider_ref, model, and token counts must all
+/// describe the actual call to the vision provider — not the turn-start
+/// provider/model. This proves the `serving_provider_name`/`serving_model`
+/// threading through `TurnCtx` reaches `interpret_chat_response` and the
+/// emitted `TurnEvent::Usage`.
+///
+/// Uses `wiremock` to stand up a fake Anthropic `/v1/messages` endpoint so
+/// `resolve_vision_provider` resolves the vision provider through the real
+/// config/factory path, the real `AnthropicModelProvider` executes the call,
+/// and the returned `usage` data flows to the `TurnEvent::Usage`.
+#[tokio::test]
+async fn usage_event_carries_coherent_provider_and_model_after_vision_switch() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::agent::agent::ProviderSwitchConfig;
+    use zeroclaw_config::schema::MultimodalConfig;
+
+    // Stand up a fake Anthropic endpoint returning a response with usage data.
+    // The streaming attempt will fail (JSON, not SSE) and the non-streaming
+    // `chat()` fallback will succeed with this JSON payload.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "content": [{"type": "text", "text": "vision analysis complete"}],
+            "usage": {"input_tokens": 50, "output_tokens": 10},
+            "stop_reason": "end_turn",
+            "model": "claude-3-opus"
+        })))
+        .mount(&server)
+        .await;
+
+    // Configure the vision provider alias pointing at the mock endpoint.
+    let mut cfg = Config::default();
+    let base = cfg
+        .providers
+        .models
+        .ensure("openai", "default")
+        .expect("ensure base provider");
+    base.context_window = Some(128_000);
+
+    let vision = cfg
+        .providers
+        .models
+        .ensure("anthropic", "vision")
+        .expect("ensure vision provider");
+    vision.context_window = Some(200_000);
+    vision.vision = Some(true);
+    vision.api_key = Some("test-key".to_string());
+    vision.uri = Some(server.uri());
+    vision.model = Some("claude-3-opus".to_string());
+
+    let cfg_arc = Arc::new(cfg);
+    let switch_cfg = ProviderSwitchConfig {
+        config: Some(cfg_arc.clone()),
+    };
+
+    // Build the base agent with ScriptedProvider (reports vision=false by
+    // default, so image markers trigger vision routing to the configured
+    // vision provider).
+    let mut response = text_response("base response");
+    response.usage = Some(token_usage(1, 1));
+    let provider = ScriptedProvider::new(vec![response]);
+    let mem = mem_none();
+    let observer: Arc<dyn Observer> = Arc::from(observability::NoopObserver {});
+    let mut agent = Agent::builder()
+        .model_provider(Box::new(provider))
+        .tools(vec![])
+        .memory(mem)
+        .observer(observer)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .model_provider_name("openai.default".to_string())
+        .model_name("gpt-4o-mini".to_string())
+        .provider_switch_config(switch_cfg)
+        .build()
+        .expect("agent builder should succeed");
+
+    // Enable vision routing: image content routes to "anthropic.vision".
+    agent.multimodal_config = MultimodalConfig {
+        vision_model_provider: Some("anthropic.vision".to_string()),
+        vision_model: Some("claude-3-opus".to_string()),
+        ..Default::default()
+    };
+
+    // Create a temp image file so the image marker is loadable.
+    let img_path = std::env::temp_dir().join("safety_net_vision_test.png");
+    std::fs::write(&img_path, b"fake-png-data").expect("write temp image");
+    let prompt = format!("Analyze this image: [IMAGE:{}]", img_path.display());
+
+    let events = run_turn_collect_events(|| agent, prompt).await;
+
+    // The Usage event must carry the vision provider's ref, model, and
+    // non-zero token counts — proving the tuple describes the actual
+    // call to the vision provider, not the turn-start provider.
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                ..
+            } => Some((
+                provider_ref.clone(),
+                model.clone(),
+                *input_tokens,
+                *output_tokens,
+                *cost_usd,
+            )),
+            _ => None,
+        })
+        .expect("a Usage event must be emitted by the vision provider call");
+
+    assert_eq!(
+        usage.0, "anthropic.vision",
+        "Usage.provider_ref must be the vision provider (anthropic.vision), not the base provider"
+    );
+    assert_eq!(
+        usage.1, "claude-3-opus",
+        "Usage.model must be the vision model (claude-3-opus), not the turn-start model (gpt-4o-mini)"
+    );
+    assert_eq!(
+        usage.2,
+        Some(50),
+        "Usage.input_tokens must match the vision provider's reported input tokens"
+    );
+    assert_eq!(
+        usage.3,
+        Some(10),
+        "Usage.output_tokens must match the vision provider's reported output tokens"
+    );
+    assert!(
+        usage.4.is_some(),
+        "Usage.cost_usd must be resolved from the serving provider+model, proving the tuple is coherent"
+    );
+
+    let _ = std::fs::remove_file(&img_path);
+}
+
+/// Regression: cross-provider reliability fallback carries the actually-served
+/// provider_ref AND model. When the reliable provider wrapper falls back to
+/// a pinned model entry, the Usage event must reflect the served model, not
+/// the originally-requested model.
+///
+/// Full reliable-fallback integration (error → retry → pin lookup) is
+/// exercised in the providers crate. This regression proves the turn
+/// loop threads serving_provider_name and serving_model through to the
+/// Usage event for the fallback provider.
+#[tokio::test]
+async fn usage_event_carries_coherent_tuple_after_reliability_fallback() {
+    let mut response = text_response("success from fallback");
+    response.usage = Some(token_usage(30, 12));
+    let events = run_turn_collect_events(
+        || {
+            agent_with_provider_name(
+                Box::new(ScriptedProvider::new(vec![response])),
+                vec![],
+                "anthropic.fallback",
+            )
+        },
+        "hi",
+    )
+    .await;
+
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.clone(), model.clone())),
+            _ => None,
+        })
+        .expect("a Usage event must be emitted");
+
+    assert_eq!(
+        usage.0, "anthropic.fallback",
+        "Usage.provider_ref must be the serving provider"
+    );
+    assert_eq!(
+        usage.1, "mock-model",
+        "Usage.model must be the served model"
     );
 }

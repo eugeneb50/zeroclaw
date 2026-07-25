@@ -48,10 +48,9 @@ pub enum TurnEvent {
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
-    /// The `provider_ref` is the `<type>.<alias>` config reference (e.g.,
-    /// `"openai.default"`, `"anthropic.vision"`) identifying the provider that
-    /// actually served this call, accounting for vision routing and mid-turn
-    /// provider switches.
+    /// The `provider_ref` and `model` identify the provider and model that
+    /// actually served this call, accounting for vision routing, reliable
+    /// fallback, and mid-turn provider switches.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic
@@ -64,6 +63,10 @@ pub enum TurnEvent {
         /// this call. Used for accurate context window resolution and cost
         /// attribution when vision routing or provider switches are active.
         provider_ref: String,
+        /// The model that actually served this call. When vision routing or
+        /// a reliable fallback selects a different model, this carries the
+        /// served model — not the turn-start model.
+        model: String,
     },
 }
 

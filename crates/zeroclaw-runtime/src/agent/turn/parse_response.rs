@@ -141,9 +141,13 @@ pub(crate) async fn interpret_chat_response(
         .as_deref()
         .unwrap_or(ctx.provider_name);
 
+    // Per-iteration served model: vision routing or reliable fallback
+    // may have changed which model served this call.
+    let effective_model = ctx.serving_model.as_deref().unwrap_or(ctx.model);
+
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: effective_provider_name.to_string(),
-        model: ctx.model.to_string(),
+        model: effective_model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -161,7 +165,9 @@ pub(crate) async fn interpret_chat_response(
     let call_cost_usd = resp
         .usage
         .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(effective_provider_name, ctx.model, usage))
+        .and_then(|usage| {
+            record_tool_loop_cost_usage(effective_provider_name, effective_model, usage)
+        })
         .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
@@ -176,6 +182,7 @@ pub(crate) async fn interpret_chat_response(
                 output_tokens: usage.output_tokens,
                 cost_usd: call_cost_usd,
                 provider_ref: effective_provider_name.to_string(),
+                model: effective_model.to_string(),
             })
             .await;
     }
@@ -485,6 +492,7 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             turn_id: "turn-cost-regression",
             serving_provider_name: None,
+            serving_model: None,
         };
 
         let specs = IterationToolSpecs {

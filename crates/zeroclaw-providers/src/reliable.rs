@@ -38,6 +38,18 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
         .flatten()
 }
 
+/// Peek (non-consuming read) the last model_provider fallback info, if any.
+/// Used by the turn loop to update `serving_provider_name` / `serving_model`
+/// before the `Usage` event is emitted, without consuming the record that
+/// `take_last_provider_fallback` will read after the round completes.
+/// Must be called within a `scope_provider_fallback` scope.
+pub fn peek_last_provider_fallback() -> Option<ProviderFallbackInfo> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow().clone())
+        .ok()
+        .flatten()
+}
+
 /// Run the given future within a provider-fallback scope.
 /// Both `record_provider_fallback` (inside ReliableModelProvider) and
 /// `take_last_provider_fallback` (post-loop channel code) must execute

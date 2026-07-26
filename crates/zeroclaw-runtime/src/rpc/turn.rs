@@ -1039,8 +1039,8 @@ mod tests {
 
             // Two Usage events (one per LLM call) drained through the callback.
             // This proves the drain continued past the first Usage AND through
-            // the interleaved tool events to the second Usage — the exact
-            // blocker-2 regression: no relock stall after a Usage event.
+            // the interleaved tool events to the second Usage — a relock stall
+            // after the first Usage would prevent the second from arriving.
             assert_eq!(
                 *usage_count.lock().unwrap(),
                 2,

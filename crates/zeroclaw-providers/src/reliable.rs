@@ -743,14 +743,14 @@ impl ReliableModelProviderEntryProvider {
     }
 }
 
-pub(crate) struct ReliableModelProviderEntry {
+pub struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
 }
 
 impl ReliableModelProviderEntry {
-    pub(crate) fn new(
+    pub fn new(
         display_name: impl Into<String>,
         cooldown_key: impl Into<String>,
         provider: Box<dyn ModelProvider>,
@@ -766,7 +766,7 @@ impl ReliableModelProviderEntry {
     /// model. The [`crate::model_pin::ModelPinnedProvider`] wrapper is the
     /// source of truth for the pinned model; this entry reads it from the
     /// wrapper at use-time.
-    pub(crate) fn new_pinned(
+    pub fn new_pinned(
         display_name: impl Into<String>,
         cooldown_key: impl Into<String>,
         alias: &str,
@@ -834,7 +834,7 @@ impl ReliableModelProvider {
         Self::new_with_entries(alias, model_providers, max_retries, base_backoff_ms)
     }
 
-    pub(crate) fn new_with_entries(
+    pub fn new_with_entries(
         alias: &str,
         model_providers: Vec<ReliableModelProviderEntry>,
         max_retries: u32,

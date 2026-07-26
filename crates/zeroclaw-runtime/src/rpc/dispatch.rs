@@ -1804,7 +1804,8 @@ impl RpcDispatcher {
                             None
                         } else {
                             let cfg = config.read();
-                            crate::agent::resolve_live_model_context_window(&cfg, provider_ref)
+                            cfg.model_provider_context_window_opt(provider_ref)
+                                .map(|v| v as u64)
                         }
                     } else {
                         None
@@ -6784,11 +6785,12 @@ mod tests {
         };
 
         let max_ctx = Some(context_usage_max_tokens(&cfg, "coder"));
-        let model_ctx_window =
-            crate::agent::resolve_live_model_context_window(&cfg, "openrouter.default");
+        let model_ctx_window = cfg
+            .model_provider_context_window_opt("openrouter.default")
+            .map(|v| v as u64);
         assert!(
             model_ctx_window.is_none(),
-            "resolve_live_model_context_window must return None when no \
+            "model_provider_context_window_opt must return None when no \
              provider context_window is set"
         );
 
@@ -6931,8 +6933,9 @@ mod tests {
 
         // Resolve model_context_window from the live provider
         let cfg = dispatcher.ctx.config.read();
-        let model_ctx_window =
-            crate::agent::resolve_live_model_context_window(&cfg, &live_provider);
+        let model_ctx_window = cfg
+            .model_provider_context_window_opt(&live_provider)
+            .map(|v| v as u64);
         assert_eq!(model_ctx_window, Some(1_000_000));
 
         // Now simulate the notification emission

@@ -1417,32 +1417,31 @@ async fn process_chat_message(
             // for accurate context_window resolution (accounts for vision routing
             // and mid-turn provider switches). Fall back to re-reading attribution
             // fields when no usage events were emitted.
-            let (model_context_window, provider_ref_label) = if let Some(ref provider_ref) =
-                last_provider_ref
-            {
-                let cfg = state.config.read();
-                let window =
-                    zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_ref);
-                // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
-                let label = provider_ref.split('.').next_back().unwrap_or(provider_ref);
-                (window, label.to_string())
-            } else {
-                let (_, live_provider, _) = agent.attribution_fields();
-                if live_provider.is_empty() {
-                    (None, provider_label.clone())
-                } else {
+            let (model_context_window, provider_ref_label) =
+                if let Some(ref provider_ref) = last_provider_ref {
                     let cfg = state.config.read();
-                    let window = zeroclaw_runtime::agent::resolve_live_model_context_window(
-                        &cfg,
-                        &live_provider,
-                    );
-                    let label = live_provider
-                        .split('.')
-                        .next_back()
-                        .unwrap_or(&live_provider);
+                    let window = cfg
+                        .model_provider_context_window_opt(provider_ref)
+                        .map(|v| v as u64);
+                    // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
+                    let label = provider_ref.split('.').next_back().unwrap_or(provider_ref);
                     (window, label.to_string())
-                }
-            };
+                } else {
+                    let (_, live_provider, _) = agent.attribution_fields();
+                    if live_provider.is_empty() {
+                        (None, provider_label.clone())
+                    } else {
+                        let cfg = state.config.read();
+                        let window = cfg
+                            .model_provider_context_window_opt(&live_provider)
+                            .map(|v| v as u64);
+                        let label = live_provider
+                            .split('.')
+                            .next_back()
+                            .unwrap_or(&live_provider);
+                        (window, label.to_string())
+                    }
+                };
             // Use the last served model from usage events when available so
             // the terminal metadata is one coherent tuple with the provider.
             let effective_model = last_model.as_deref().unwrap_or(&turn_model);
@@ -2242,11 +2241,12 @@ mod tests {
             };
 
             let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-            let model_ctx_window =
-                zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, provider_alias);
+            let model_ctx_window = cfg
+                .model_provider_context_window_opt(provider_alias)
+                .map(|v| v as u64);
             assert_eq!(
                 model_ctx_window, expected_window,
-                "resolve_live_model_context_window({provider_alias}) must return {expected_window:?}"
+                "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
             );
 
             let done = build_done_frame_json(
@@ -2339,8 +2339,9 @@ mod tests {
                 ..Config::default()
             };
 
-            let model_ctx_window =
-                zeroclaw_runtime::agent::resolve_live_model_context_window(&cfg, live_provider_ref);
+            let model_ctx_window = cfg
+                .model_provider_context_window_opt(live_provider_ref)
+                .map(|v| v as u64);
             assert_eq!(
                 model_ctx_window,
                 Some(1_000_000),

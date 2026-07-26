@@ -2258,17 +2258,13 @@ async fn usage_event_carries_coherent_provider_and_model_after_vision_switch() {
     let _ = std::fs::remove_file(&img_path);
 }
 
-/// Regression: cross-provider reliability fallback carries the actually-served
-/// provider_ref AND model. When the reliable provider wrapper falls back to
-/// a pinned model entry, the Usage event must reflect the served model, not
-/// the originally-requested model.
-///
-/// Full reliable-fallback integration (error → retry → pin lookup) is
-/// exercised in the providers crate. This regression proves the turn
-/// loop threads serving_provider_name and serving_model through to the
-/// Usage event for the fallback provider.
+/// Regression: Usage event carries the agent-configured provider_ref
+/// and model through to the consumer in a minimal single-call turn.
+/// The reliable-fallback integration (error → retry → pin lookup) is
+/// exercised in the providers crate; this test proves the turn loop
+/// threads the provider identity to TurnEvent::Usage.
 #[tokio::test]
-async fn usage_event_carries_coherent_tuple_after_reliability_fallback() {
+async fn usage_event_carries_agent_provider_ref_through_single_call_turn() {
     let mut response = text_response("success from fallback");
     response.usage = Some(token_usage(30, 12));
     let events = run_turn_collect_events(

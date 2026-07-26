@@ -9153,7 +9153,7 @@ mod tests {
         );
     }
 
-    /// Regression: resolve_live_model_context_window follows the in-turn
+    /// Regression: model_provider_context_window_opt follows the in-turn
     /// provider switch, not the static agent alias.
     #[test]
     fn model_context_window_follows_in_turn_model_switch() {
@@ -9191,8 +9191,9 @@ mod tests {
         // Before switch: resolve with provider A's ref
         let (_, live_provider_before, _) = agent.attribution_fields();
         assert_eq!(live_provider_before, "openai.provider-a");
-        let window_before =
-            crate::agent::resolve_live_model_context_window(&cfg_arc, &live_provider_before);
+        let window_before = cfg_arc
+            .model_provider_context_window_opt(&live_provider_before)
+            .map(|v| v as u64);
         assert_eq!(window_before, Some(128_000));
 
         // Apply in-turn switch
@@ -9206,8 +9207,9 @@ mod tests {
         // After switch: B's ref and window
         let (_, live_provider_after, _) = agent.attribution_fields();
         assert_eq!(live_provider_after, "ollama.provider-b");
-        let window_after =
-            crate::agent::resolve_live_model_context_window(&cfg_arc, &live_provider_after);
+        let window_after = cfg_arc
+            .model_provider_context_window_opt(&live_provider_after)
+            .map(|v| v as u64);
         assert_eq!(window_after, Some(1_000_000));
     }
 

@@ -637,8 +637,9 @@ mod tests {
                             // provider_ref via config.read() — NOT via the
                             // agent mutex. This is the drain fix path.
                             let cfg = cfg.read();
-                            let window =
-                                crate::agent::resolve_live_model_context_window(&cfg, provider_ref);
+                            let window = cfg
+                                .model_provider_context_window_opt(provider_ref)
+                                .map(|v| v as u64);
                             *rw.lock().unwrap() = window;
                         }
                         TurnEvent::Chunk { .. } => {
@@ -674,7 +675,7 @@ mod tests {
         );
     }
 
-    /// Regression (note3.md blocker 2): drive the **real `execute_turn` RPC
+    /// Regression: drive the **real `execute_turn` RPC
     /// boundary** with an interleaved Usage → ToolCall → ToolResult → Usage
     /// → final Chunk sequence — the exact flow production dispatch sees — and
     /// assert the drain completes every notification while `execute_turn` owns
@@ -684,7 +685,7 @@ mod tests {
     ///
     /// The matrix is a negative control on the trim-budget axis: the drain
     /// callback resolves `model_context_window` from the embedded
-    /// `provider_ref` via config (`resolve_live_model_context_window`), which
+    /// `provider_ref` via config (`model_provider_context_window_opt`), which
     /// returns the provider's `context_window` and ONLY that. It must never
     /// substitute the runtime profile's `max_context_tokens` budget — neither
     /// when the provider has no `context_window` (the legacy 32k stub leak) nor
@@ -716,6 +717,7 @@ mod tests {
             first: ChatResponse,
             second: ChatResponse,
             done: std::sync::atomic::AtomicBool,
+            alias: &'static str,
         }
 
         #[async_trait]
@@ -748,10 +750,8 @@ mod tests {
             fn role(&self) -> Role {
                 Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
             }
-            // Overridden per case to carry the serving provider ref the
-            // agent's attribution_fields().1 will report on the wire.
             fn alias(&self) -> &str {
-                "openai.default"
+                self.alias
             }
         }
 
@@ -909,55 +909,12 @@ mod tests {
                 first,
                 second,
                 done: std::sync::atomic::AtomicBool::new(false),
+                alias: cell.provider_ref,
             };
-
-            // Provider alias must report the cell's provider_ref so the
-            // agent's attribution_fields().1 (and thus the Usage event's
-            // provider_ref field) carries the live serving provider.
-            // TwoCallToolProvider::alias() hard-codes "openai.default", so we
-            // override by wrapping in a per-cell provider that returns the
-            // cell's ref from alias() — same chat() behavior, different ref.
-            struct CellProvider {
-                inner: TwoCallToolProvider,
-                ref_str: &'static str,
-            }
-
-            #[async_trait]
-            impl ModelProvider for CellProvider {
-                async fn chat_with_system(
-                    &self,
-                    s: Option<&str>,
-                    m: &str,
-                    md: &str,
-                    t: Option<f64>,
-                ) -> anyhow::Result<String> {
-                    self.inner.chat_with_system(s, m, md, t).await
-                }
-                async fn chat(
-                    &self,
-                    r: ChatRequest<'_>,
-                    md: &str,
-                    t: Option<f64>,
-                ) -> anyhow::Result<ChatResponse> {
-                    self.inner.chat(r, md, t).await
-                }
-            }
-
-            impl Attributable for CellProvider {
-                fn role(&self) -> Role {
-                    self.inner.role()
-                }
-                fn alias(&self) -> &str {
-                    self.ref_str
-                }
-            }
 
             let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let agent = Agent::builder()
-                .model_provider(Box::new(CellProvider {
-                    inner: provider,
-                    ref_str: cell.provider_ref,
-                }))
+                .model_provider(Box::new(provider))
                 .tools(vec![Box::new(CountingTool {
                     name: "echo",
                     calls: Arc::clone(&tool_calls),
@@ -973,7 +930,7 @@ mod tests {
                 .expect("agent builder should succeed");
 
             // Per-cell counters collected by the drain callback. The callback
-            // invokes resolve_live_model_context_window(&cfg.read(), provider_ref)
+            // invokes model_provider_context_window_opt(&cfg.read(), provider_ref)
             // — the same config-read path production uses — proving it does not
             // reacquire the agent mutex. Each of the two Usage events records
             // its resolved window; we assert both match the cell expectation
@@ -1031,10 +988,9 @@ mod tests {
                                 // fix path; if it locked the agent again the
                                 // drain would stall after the first Usage.
                                 let cfg = cfg.read();
-                                let window = crate::agent::resolve_live_model_context_window(
-                                    &cfg,
-                                    provider_ref,
-                                );
+                                let window = cfg
+                                    .model_provider_context_window_opt(provider_ref)
+                                    .map(|v| v as u64);
                                 rw.lock().unwrap().push(window);
                                 // A Chunk arriving AFTER the first Usage but
                                 // before the second is the normal call-1 path;
@@ -1094,7 +1050,7 @@ mod tests {
             );
 
             // Both Usage events carry the cell's serving provider_ref — the
-            // coherent-tuple invariant (note3.md blocker 1) exercised at the
+            // coherent-tuple invariant exercised at the
             // RPC boundary, not just the agent-internal steering-state path.
             let refs: Vec<String> = provider_refs_seen.lock().unwrap().clone();
             assert_eq!(
@@ -1142,7 +1098,7 @@ mod tests {
                 cell.label,
             );
 
-            // The matrix core: in every cell, resolve_live_model_context_window
+            // The matrix core: in every cell, model_provider_context_window_opt
             // returns the PROVIDER's context_window and ONLY that — never the
             // profile's max_context_tokens. Both Usage events in the cell
             // resolve identically (the resolution is deterministic per

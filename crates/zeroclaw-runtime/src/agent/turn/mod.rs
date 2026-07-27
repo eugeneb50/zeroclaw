@@ -556,11 +556,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        // When vision routing selects a provider different from the
-        // turn-start provider_name, carry the serving identity through
-        // to interpret_chat_response so the Usage event's provider_ref
-        // and the LlmResponse observer event reflect the actual call
-        // target.
+        // Vision routing override: set the per-iteration serving identity.
         ctx.serving_provider_name = if vision_model_provider_box.is_some() {
             Some(active_model_provider_name.to_string())
         } else {

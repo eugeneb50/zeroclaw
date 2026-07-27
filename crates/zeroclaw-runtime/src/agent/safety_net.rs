@@ -2250,7 +2250,6 @@ async fn run_turn_and_assert_usage(
 async fn usage_event_coherent_tuple_reliable_fallback() {
     use reliable_mocks::*;
     use zeroclaw_api::model_provider::ModelProvider;
-    use zeroclaw_providers::reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 
     // Two cells: one with the fallback provider exposing a context_window
     // (the resolved window must equal it), one without (resolved must be None,
@@ -2287,28 +2286,22 @@ async fn usage_event_coherent_tuple_reliable_fallback() {
 
         let mut success = text_response("fallback served");
         success.usage = Some(token_usage(input_tokens, output_tokens));
-        let reliable = ReliableModelProvider::new_with_entries(
+        let reliable = zeroclaw_providers::reliable::for_test_reliable_with_pinned_fallback(
             "openai.primary",
-            vec![
-                ReliableModelProviderEntry::new(
-                    "openai.primary",
-                    "openai.primary.key",
-                    Box::new(FailingProvider) as Box<dyn ModelProvider>,
-                ),
-                ReliableModelProviderEntry::new_pinned(
-                    "openai.fallback",
-                    "openai.fallback.key",
-                    "openai.fallback",
-                    "fallback-model",
-                    Box::new(SucceedingProvider { resp: success }) as Box<dyn ModelProvider>,
-                ),
-            ],
+            "openai.primary",
+            "openai.primary.key",
+            Box::new(FailingProvider),
+            "openai.fallback",
+            "openai.fallback.key",
+            "openai.fallback",
+            "fallback-model",
+            Box::new(SucceedingProvider { resp: success }),
             0,
             0,
         );
 
         let agent = Agent::builder()
-            .model_provider(Box::new(reliable))
+            .model_provider(reliable)
             .tools(vec![])
             .memory(mem_none())
             .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
@@ -2747,7 +2740,6 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 async fn usage_event_coherent_tuple_vision_route_with_reliable_fallback() {
     use reliable_mocks::*;
     use zeroclaw_api::model_provider::ModelProvider;
-    use zeroclaw_providers::reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 
     // Two cells: fallback vision provider with and without an explicit
     // context_window. The vision primary fails; the reliable wrapper falls
@@ -2784,28 +2776,22 @@ async fn usage_event_coherent_tuple_vision_route_with_reliable_fallback() {
 
         let mut success = text_response("vision fallback served");
         success.usage = Some(token_usage(input_tokens, output_tokens));
-        let reliable = ReliableModelProvider::new_with_entries(
+        let reliable = zeroclaw_providers::reliable::for_test_reliable_with_pinned_fallback(
             "anthropic.vision-1",
-            vec![
-                ReliableModelProviderEntry::new(
-                    "anthropic.vision-1",
-                    "anthropic.vision-1.key",
-                    Box::new(FailingProvider) as Box<dyn ModelProvider>,
-                ),
-                ReliableModelProviderEntry::new_pinned(
-                    "anthropic.vision-2",
-                    "anthropic.vision-2.key",
-                    "anthropic.vision-2",
-                    "vision-model-2",
-                    Box::new(SucceedingProvider { resp: success }) as Box<dyn ModelProvider>,
-                ),
-            ],
+            "anthropic.vision-1",
+            "anthropic.vision-1.key",
+            Box::new(FailingProvider),
+            "anthropic.vision-2",
+            "anthropic.vision-2.key",
+            "anthropic.vision-2",
+            "vision-model-2",
+            Box::new(SucceedingProvider { resp: success }),
             0,
             0,
         );
 
         let agent = Agent::builder()
-            .model_provider(Box::new(reliable))
+            .model_provider(reliable)
             .tools(vec![])
             .memory(mem_none())
             .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)

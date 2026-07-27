@@ -1052,11 +1052,8 @@ async fn process_chat_message(
     let mut total_input_tokens: Option<u64> = None;
     let mut total_output_tokens: Option<u64> = None;
 
-    // Track the most recent provider that served usage events (for done-frame
-    // context_window resolution and provider label).
+    // Most recent serving provider/model from usage events (for done-frame metadata).
     let mut last_provider_ref: Option<String> = None;
-    // Track the most recent model that served usage events so the terminal
-    // metadata stays a coherent tuple with the provider.
     let mut last_model: Option<String> = None;
 
     // Track the most recent absolute provider-reported prompt size
@@ -1413,10 +1410,7 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
-            // Build the done-frame JSON. Use the last provider_ref from usage events
-            // for accurate context_window resolution (accounts for vision routing
-            // and mid-turn provider switches). Fall back to re-reading attribution
-            // fields when no usage events were emitted.
+            // Resolve context_window from the last-served provider's config.
             let (model_context_window, provider_ref_label) =
                 if let Some(ref provider_ref) = last_provider_ref {
                     let cfg = state.config.read();

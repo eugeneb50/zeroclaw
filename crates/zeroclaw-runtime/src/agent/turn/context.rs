@@ -35,15 +35,12 @@ pub(crate) struct TurnCtx<'a> {
     /// the EFFECTIVE agent whose policy/tools execute; this keeps the parent
     /// correlation on every emitted record. `None` for ordinary turns.
     pub(crate) parent_agent_alias: Option<&'a str>,
-    /// Per-iteration override for the provider that actually served the
-    /// current LLM call. Set after vision routing resolves the active
-    /// provider; `None` means "use `provider_name`". Owned `String`
-    /// because the vision-resolved name's lifetime is the iteration scope,
-    /// not the `'a` of the struct.
+    /// Per-iteration override for the provider that served the current LLM
+    /// call when vision routing resolved a different provider. Owned `String`
+    /// because the vision-resolved name's lifetime is the iteration scope.
     pub(crate) serving_provider_name: Option<String>,
-    /// Per-iteration override for the model that actually served the
-    /// current LLM call. Mirrors `serving_provider_name`: set when vision
-    /// routing or reliable fallback selects a different model.
+    /// Per-iteration override for the model that served the current LLM call
+    /// when vision routing or reliable fallback selected a different model.
     pub(crate) serving_model: Option<String>,
 }
 

@@ -52,19 +52,8 @@ pub fn peek_last_provider_fallback() -> Option<ProviderFallbackInfo> {
         .flatten()
 }
 
-/// Clear the provider-fallback cell so the next iteration starts fresh.
-/// Called at the top of each tool-loop iteration (before `call_provider`)
-/// to prevent a stale record from iteration N-1 leaking into the
-/// `peek_last_provider_fallback` + `serving_provider_name` update for
-/// iteration N. After the clear, only a fallback recorded *during* this
-/// iteration affects the per-call `Usage` event's `provider_ref`/`model`.
-///
-/// This means the round-level `take_last_provider_fallback` at agent
-/// turn-end reads the LAST iteration's recorded fallback — matching the
-/// model-fallback-notice semantics ("the final response was served by a
-/// different provider than requested"), since the user-facing response
-/// always comes from the last iteration's LLM call.
-/// No-ops when called outside a `scope_provider_fallback` scope.
+/// Clear the per-iteration fallback cell so the next `call_provider` starts
+/// fresh. No-ops outside a `scope_provider_fallback` scope.
 pub fn clear_last_provider_fallback() {
     let _ = PROVIDER_FALLBACK.try_with(|cell| {
         *cell.borrow_mut() = None;
@@ -746,14 +735,14 @@ impl ReliableModelProviderEntryProvider {
     }
 }
 
-pub struct ReliableModelProviderEntry {
+pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
 }
 
 impl ReliableModelProviderEntry {
-    pub fn new(
+    pub(crate) fn new(
         display_name: impl Into<String>,
         cooldown_key: impl Into<String>,
         provider: Box<dyn ModelProvider>,
@@ -763,19 +752,19 @@ impl ReliableModelProviderEntry {
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
-    }
+}
 
-    /// Build an entry that serves `pinned_model` regardless of the requested
-    /// model. The [`crate::model_pin::ModelPinnedProvider`] wrapper is the
-    /// source of truth for the pinned model; this entry reads it from the
-    /// wrapper at use-time.
-    pub fn new_pinned(
-        display_name: impl Into<String>,
-        cooldown_key: impl Into<String>,
-        alias: &str,
-        pinned_model: &str,
-        inner: Box<dyn ModelProvider>,
-    ) -> Self {
+/// Build an entry that serves `pinned_model` regardless of the requested
+/// model. The [`crate::model_pin::ModelPinnedProvider`] wrapper is the
+/// source of truth for the pinned model; this entry reads it from the
+/// wrapper at use-time.
+pub(crate) fn new_pinned(
+    display_name: impl Into<String>,
+    cooldown_key: impl Into<String>,
+    alias: &str,
+    pinned_model: &str,
+    inner: Box<dyn ModelProvider>,
+) -> Self {
         Self {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
@@ -837,7 +826,7 @@ impl ReliableModelProvider {
         Self::new_with_entries(alias, model_providers, max_retries, base_backoff_ms)
     }
 
-    pub fn new_with_entries(
+    pub(crate) fn new_with_entries(
         alias: &str,
         model_providers: Vec<ReliableModelProviderEntry>,
         max_retries: u32,
@@ -2174,6 +2163,45 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
             None => &self.alias,
         }
     }
+}
+
+/// Build a [`ReliableModelProvider`] with a direct primary and a pinned
+/// fallback, without requiring the caller to depend on internal entry
+/// types. Only compiled when the `test-helpers` feature is active.
+#[cfg(feature = "test-helpers")]
+#[allow(dead_code)]
+pub fn for_test_reliable_with_pinned_fallback(
+    alias: &str,
+    primary_name: &str,
+    primary_cooldown_key: &str,
+    primary_provider: Box<dyn ModelProvider>,
+    fallback_name: &str,
+    fallback_cooldown_key: &str,
+    fallback_alias: &str,
+    fallback_model: &str,
+    fallback_provider: Box<dyn ModelProvider>,
+    max_retries: u32,
+    base_backoff_ms: u64,
+) -> Box<dyn ModelProvider> {
+    Box::new(ReliableModelProvider::new_with_entries(
+        alias,
+        vec![
+            ReliableModelProviderEntry::new(
+                primary_name,
+                primary_cooldown_key,
+                primary_provider,
+            ),
+            ReliableModelProviderEntry::new_pinned(
+                fallback_name,
+                fallback_cooldown_key,
+                fallback_alias,
+                fallback_model,
+                fallback_provider,
+            ),
+        ],
+        max_retries,
+        base_backoff_ms,
+    ))
 }
 
 #[cfg(test)]

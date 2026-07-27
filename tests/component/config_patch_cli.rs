@@ -93,6 +93,7 @@ fn test_state(config: Config) -> AppState {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         reload_tx: None,
         node_registry: Arc::new(gateway::nodes::NodeRegistry::new(16)),
+        mdns_peer_registry: gateway::nodes::mdns::MdnsPeerRegistry::default(),
         path_prefix: String::new(),
         web_dist_dir: None,
         session_backend: None,
@@ -281,14 +282,6 @@ fn config_patch_json_post_apply_validation_emits_structured_error_envelope() {
 // `ensure_map_key_for_path` guard in `handle_patch`, api_config.rs:2040-2051)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `add` on a leaf under a not-yet-existing map-keyed alias (a brand-new
-/// `channels.telegram.<alias>`) now materializes the alias first instead of
-/// failing `Unknown property`, and the materialized alias is actually
-/// persisted to disk. A second op sets `bot_token` too — `TelegramConfig`'s
-/// `bot_token` field has no `#[serde(default)]`, so a section missing it
-/// fails to deserialize on the next load and gets salvaged back to defaults
-/// by the migration layer, which would make the round-trip assertion below
-/// meaningless.
 #[test]
 fn config_patch_add_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -322,9 +315,6 @@ fn config_patch_add_materializes_new_map_alias_and_persists() {
     );
 }
 
-/// HTTP's guard covers both `add` and `replace` identically (same
-/// `matches!(op.op.as_str(), "add" | "replace")` in `handle_patch`) — prove
-/// the CLI's does too.
 #[test]
 fn config_patch_replace_materializes_new_map_alias_and_persists() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -354,10 +344,6 @@ fn config_patch_replace_materializes_new_map_alias_and_persists() {
     assert!(bot.enabled);
 }
 
-/// `replace` on an EXISTING alias's leaf must still succeed, and must not
-/// re-touch the map-keyed section's alias set — guards against the new
-/// materialization guard accidentally re-creating (or disturbing) an alias
-/// that already exists.
 #[test]
 fn config_patch_replace_on_existing_alias_does_not_recreate_it() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -399,10 +385,6 @@ fn config_patch_replace_on_existing_alias_does_not_recreate_it() {
     assert!(!after.channels.telegram["existingbot"].enabled);
 }
 
-/// `remove`/`test` intentionally do NOT materialize (the new guard is
-/// `matches!(op_name, "add" | "replace")` only) — a nonexistent alias path
-/// via either op must still fail with the same `path_not_found` error as
-/// before this change, and must not create the alias as a side effect.
 #[test]
 fn config_patch_remove_and_test_do_not_materialize_unknown_alias() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -438,10 +420,6 @@ fn config_patch_remove_and_test_do_not_materialize_unknown_alias() {
     );
 }
 
-/// `add` on `/agents/default/<field>` is refused with `ValidationFailed` and
-/// a message naming the reserved alias, mirroring the schema-level
-/// `ensure_map_key_for_path_refuses_reserved_default_agent`
-/// (`crates/zeroclaw-config/src/alias_refs.rs`) and HTTP's identical guard.
 #[test]
 fn config_patch_add_on_reserved_default_agent_is_refused() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -476,11 +454,6 @@ fn config_patch_add_on_reserved_default_agent_is_refused() {
     );
 }
 
-/// The genuinely new risk: a patch document where `add` targets a brand-new
-/// alias's leaf, the alias gets materialized in-memory, but the op itself
-/// (or a later op in the same document) then fails post-apply
-/// `Config::validate()`. `config.save_dirty()` only runs after the whole op
-/// loop succeeds, so the phantom alias must never reach disk.
 #[test]
 fn config_patch_add_failure_after_materialization_does_not_persist_phantom_alias() {
     let config_dir = tempfile::tempdir().expect("temp config dir");
@@ -501,5 +474,157 @@ fn config_patch_add_failure_after_materialization_does_not_persist_phantom_alias
     assert!(
         !cfg.channels.telegram.contains_key("phantombot"),
         "a failed op must not leave a phantom alias on disk: {saved}"
+    );
+}
+
+#[test]
+fn config_patch_add_does_not_materialize_resource_keyed_rate_alias() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // Establish a config.toml on disk first via a benign, unrelated op.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.6"}]"#,
+    );
+
+    let envelope = run_cli_patch(
+        config_dir.path(),
+        br#"[{"op":"add","path":"/cost/rates/providers/models/openai/gpt-5/input_per_mtok","value":1.5}]"#,
+    );
+    assert_eq!(envelope["code"], "path_not_found");
+    assert_eq!(
+        envelope["path"],
+        "cost.rates.providers.models.openai.gpt-5.input_per_mtok"
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        cfg.cost.rates.providers.models.openai.is_empty(),
+        "a leaf write must not auto-create a resource-keyed rate row: {saved}"
+    );
+}
+
+/// Guard against future divergence, not regression coverage: this passes
+/// identically before the `resource_key` exclusion, because `apply_dirty_path`
+/// splits the dirty path on every dot and so a phantom `gpt-4` never reaches
+/// disk. The dot-free `gpt-5` case above is the CLI's real signal.
+#[test]
+fn config_patch_replace_on_dotted_resource_id_does_not_plant_phantom_sibling() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let version = zeroclaw_config::migration::CURRENT_SCHEMA_VERSION;
+    std::fs::write(
+        config_dir.path().join("config.toml"),
+        format!(
+            "schema_version = {version}\n\n\
+             [cost.rates.providers.models.openai.\"gpt-4.1\"]\n\
+             input_per_mtok = 1.0\n"
+        ),
+    )
+    .expect("seed config.toml");
+
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/cost/rates/providers/models/openai/gpt-4.1/input_per_mtok","value":2.5}]"#,
+    );
+    assert_eq!(envelope["saved"], true);
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    let keys: Vec<&String> = cfg.cost.rates.providers.models.openai.keys().collect();
+    assert_eq!(
+        keys,
+        vec!["gpt-4.1"],
+        "no phantom `gpt-4` sibling may appear: {saved}"
+    );
+}
+
+fn run_cli_init(config_dir: &std::path::Path, section: &str) -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "init", section, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config init");
+    assert!(
+        output.status.success(),
+        "config init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
+}
+
+fn run_cli_get(config_dir: &std::path::Path, path: &str) -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_zeroclaw");
+    let output = Command::new(bin)
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "get", path, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config get");
+    assert!(
+        output.status.success(),
+        "config get should succeed after reloading the saved file: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    serde_json::from_str(&stdout).expect("stdout should be JSON envelope")
+}
+
+#[test]
+fn config_init_materializes_new_map_alias_and_persists() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    // Seed a config.toml first: `save_dirty()` short-circuits to a full `save()`
+    // when the file is missing, which would exercise the fallback instead of the
+    // incremental dirty-path write this test exists to prove.
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+
+    let envelope = run_cli_init(config_dir.path(), "risk_profiles.strict");
+    assert_eq!(
+        envelope["initialized"],
+        serde_json::json!(["risk_profiles.strict"])
+    );
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let cfg: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert!(
+        cfg.risk_profiles.contains_key("strict"),
+        "the new alias must survive save_dirty + reload: {saved}"
+    );
+}
+
+#[test]
+fn config_init_channel_alias_survives_config_reload() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.7"}]"#,
+    );
+
+    let envelope = run_cli_init(config_dir.path(), "channels.telegram.main");
+    assert_eq!(
+        envelope["initialized"],
+        serde_json::json!(["channels.telegram.main"])
+    );
+
+    let reloaded = run_cli_get(config_dir.path(), "channels.telegram.main.enabled");
+    assert_eq!(
+        reloaded,
+        serde_json::json!({
+            "path": "channels.telegram.main.enabled",
+            "value": "false",
+        }),
+        "the initialized channel alias must remain addressable after Config reload",
     );
 }

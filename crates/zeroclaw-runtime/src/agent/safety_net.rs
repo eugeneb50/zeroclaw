@@ -58,6 +58,43 @@ fn token_usage(input: u64, output: u64) -> TokenUsage {
     }
 }
 
+/// Build a cost-tracking context keyed on the serving provider's pricing.
+/// Mirrors ws.rs::process_chat_message — the pricing map keys ONLY the
+/// serving provider so a coherent Usage tuple yields the correct cost,
+/// while a misattributed tuple resolves empty pricing → cost 0.
+pub(super) fn build_cost_context(
+    serving_provider: &str,
+    serving_model: &str,
+    input_rate: f64,
+    output_rate: f64,
+) -> (
+    Arc<crate::cost::CostTracker>,
+    crate::agent::cost::ToolLoopCostTrackingContext,
+) {
+    use crate::agent::cost::ToolLoopCostTrackingContext;
+    use crate::cost::CostTracker;
+    use std::collections::HashMap;
+
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let tracker = Arc::new(
+        CostTracker::new(
+            zeroclaw_config::schema::CostConfig::default(),
+            tmpdir.path(),
+        )
+        .expect("CostTracker::new"),
+    );
+    let pricing_map = HashMap::from([(
+        serving_provider.to_string(),
+        HashMap::from([
+            (format!("{serving_model}.input"), input_rate),
+            (format!("{serving_model}.output"), output_rate),
+            (format!("{serving_model}.cached_input"), 0.0_f64),
+        ]),
+    )]);
+    let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+    (tracker, cost_ctx)
+}
+
 /// Returns scripted responses in order; "done" once the script is exhausted.
 pub(super) struct ScriptedProvider {
     responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
@@ -2140,26 +2177,38 @@ async fn assert_usage_coherent_after_turn(
     input_rate: f64,
     output_rate: f64,
 ) {
-    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
-    use crate::cost::CostTracker;
+    let (_tracker, cost_ctx) =
+        build_cost_context(serving_provider, serving_model, input_rate, output_rate);
+    run_turn_and_assert_usage(
+        agent,
+        cfg,
+        serving_provider,
+        serving_model,
+        expected_window,
+        input_tokens,
+        output_tokens,
+        input_rate,
+        output_rate,
+        cost_ctx,
+    )
+    .await;
+}
 
-    let tmpdir = tempfile::TempDir::new().unwrap();
-    let tracker = Arc::new(
-        CostTracker::new(
-            zeroclaw_config::schema::CostConfig::default(),
-            tmpdir.path(),
-        )
-        .expect("CostTracker::new"),
-    );
-    let pricing_map = std::collections::HashMap::from([(
-        serving_provider.to_string(),
-        std::collections::HashMap::from([
-            (format!("{serving_model}.input"), input_rate),
-            (format!("{serving_model}.output"), output_rate),
-            (format!("{serving_model}.cached_input"), 0.0_f64),
-        ]),
-    )]);
-    let cost_ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+/// Run a turn loop with cost tracking, collect events, and assert the Usage
+/// event matches the expected coherent tuple.
+async fn run_turn_and_assert_usage(
+    agent: Agent,
+    cfg: &zeroclaw_config::schema::Config,
+    serving_provider: &str,
+    serving_model: &str,
+    expected_window: Option<u64>,
+    input_tokens: u64,
+    output_tokens: u64,
+    input_rate: f64,
+    output_rate: f64,
+    cost_ctx: crate::agent::cost::ToolLoopCostTrackingContext,
+) {
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
 
     let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
     let prompt = "complete the task".to_string();
@@ -2336,8 +2385,7 @@ async fn usage_event_coherent_tuple_reliable_fallback() {
 #[tokio::test]
 async fn usage_event_coherent_tuple_vision_route() {
     use crate::agent::agent::ProviderSwitchConfig;
-    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
-    use crate::cost::CostTracker;
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_config::schema::MultimodalConfig;
@@ -2422,24 +2470,8 @@ async fn usage_event_coherent_tuple_vision_route() {
         // is computed (mirrors ws.rs::process_chat_message). The pricing map
         // keys the SERVING provider (anthropic.vision) only, so a coherent
         // tuple yields Some(expected_cost) and a misattributed tuple yields 0.
-        let tmpdir = tempfile::TempDir::new().unwrap();
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig::default(),
-                tmpdir.path(),
-            )
-            .expect("CostTracker::new"),
-        );
-        let pricing_map = std::collections::HashMap::from([(
-            "anthropic.vision".to_string(),
-            std::collections::HashMap::from([
-                (format!("claude-3-opus.input"), input_rate),
-                (format!("claude-3-opus.output"), output_rate),
-                (format!("claude-3-opus.cached_input"), 0.0_f64),
-            ]),
-        )]);
-        let cost_ctx =
-            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
+        let (_tracker, cost_ctx) =
+            build_cost_context("anthropic.vision", "claude-3-opus", input_rate, output_rate);
 
         // Vision routing triggers on an image marker in the prompt. Write a
         // temp image and rewrite the prompt; clean up after the turn so the
@@ -2543,8 +2575,7 @@ async fn usage_event_coherent_tuple_vision_route() {
 #[tokio::test]
 async fn usage_event_coherent_tuple_in_turn_model_switch() {
     use crate::agent::agent::ProviderSwitchConfig;
-    use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
-    use crate::cost::CostTracker;
+    use crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2645,24 +2676,12 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         // keys the SERVING provider only, so a coherent tuple yields
         // Some(expected_cost) and a misattributed tuple with no pricing
         // entries yields Some(0.0) — the assertion catches both.
-        let tmpdir = tempfile::TempDir::new().unwrap();
-        let tracker = Arc::new(
-            CostTracker::new(
-                zeroclaw_config::schema::CostConfig::default(),
-                tmpdir.path(),
-            )
-            .expect("CostTracker::new"),
+        let (_tracker, cost_ctx) = build_cost_context(
+            "anthropic.provider-b",
+            "claude-3-opus",
+            input_rate,
+            output_rate,
         );
-        let pricing_map = std::collections::HashMap::from([(
-            "anthropic.provider-b".to_string(),
-            std::collections::HashMap::from([
-                (format!("claude-3-opus.input"), input_rate),
-                (format!("claude-3-opus.output"), output_rate),
-                (format!("claude-3-opus.cached_input"), 0.0_f64),
-            ]),
-        )]);
-        let cost_ctx =
-            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing_map));
 
         // Run the turn loop INLINE (no spawn) so there is no async yield
         // between setting the switch state and the turn applying it.
@@ -2683,7 +2702,11 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
             },
         );
         let _ = turn_result.expect("turn should succeed");
-        // Find the (single) Usage event the serving call emitted.
+        // Find the post-switch Usage event the serving call emitted. The
+        // pre-switch call (token_usage(1,1) on the primary) also emits a
+        // Usage event when the model_switch check fires after iteration N=0,
+        // so we filter on the serving-call token counts (10, 5) to pin the
+        // assertions to the coherent tuple from anthropic.provider-b.
         let usage = events
             .iter()
             .find_map(|e| match e {
@@ -2694,7 +2717,9 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
                     output_tokens: ot,
                     cost_usd,
                     ..
-                } => Some((provider_ref.clone(), model.clone(), *it, *ot, cost_usd)),
+                } if *it == Some(input_tokens) && *ot == Some(output_tokens) => {
+                    Some((provider_ref.clone(), model.clone(), *it, *ot, cost_usd))
+                }
                 _ => None,
             })
             .expect("a Usage event must be emitted by the serving call");
@@ -2748,6 +2773,7 @@ async fn usage_event_coherent_tuple_vision_route_with_reliable_fallback() {
     use zeroclaw_api::model_provider::ModelProvider;
     use zeroclaw_providers::reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 
+    let _guard = crate::agent::loop_::MODEL_SWITCH_TEST_LOCK.lock().unwrap();
     crate::agent::loop_::clear_model_switch_request();
 
     // Two cells: fallback vision provider with and without an explicit

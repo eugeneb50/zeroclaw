@@ -213,6 +213,179 @@ mod tests {
         std::future::ready(())
     }
 
+    // ── Matrix test support items (module-level) ──────────────────────────
+
+    use crate::agent::dispatcher::NativeToolDispatcher;
+    use crate::observability::{NoopObserver, Observer};
+    use crate::tools::{Tool, ToolResult};
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::ModelProvider;
+    use zeroclaw_memory::Memory;
+    use zeroclaw_providers::ChatRequest;
+    use zeroclaw_providers::traits::TokenUsage;
+    use zeroclaw_providers::{ChatResponse, ToolCall};
+
+    /// Scripted two-call provider: call 1 emits a tool call + usage,
+    /// call 2 emits final text + usage. The drain must process both
+    /// Usage events plus the interleaved tool events without relocking
+    /// the agent (`execute_turn` holds `agent.lock()` for the whole turn).
+    struct TwoCallToolProvider {
+        first: ChatResponse,
+        second: ChatResponse,
+        done: std::sync::atomic::AtomicBool,
+        alias: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for TwoCallToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                Ok(self.first.clone())
+            } else {
+                Ok(self.second.clone())
+            }
+        }
+    }
+
+    impl Attributable for TwoCallToolProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    /// Minimal tool the provider can call. Counts invocations so the
+    /// test can assert the tool actually ran exactly once between the
+    /// two Usage events — proving the interleaved flow is real, not a
+    /// degenerate single-call path.
+    struct CountingTool {
+        name: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            self.name
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: format!("{}-out", self.name).into(),
+                error: None,
+            })
+        }
+    }
+
+    zeroclaw_api::tool_attribution!(CountingTool, ::zeroclaw_api::attribution::ToolKind::Plugin);
+
+    fn token_usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: Some(input),
+            cached_input_tokens: None,
+            output_tokens: Some(output),
+        }
+    }
+
+    /// One cell of the `(max_context_tokens × context_window)` matrix.
+    /// Each cell uses a distinct provider alias so they share no registry
+    /// entry. In every cell the resolved window tracks the provider's
+    /// `context_window` and ignores `max_context_tokens` entirely — the
+    /// negative control that proves the legacy 32k stub leak is gone.
+    #[derive(Clone, Copy)]
+    struct MatrixCell {
+        label: &'static str,
+        provider_ref: &'static str,
+        max_context_tokens: Option<usize>,
+        context_window: Option<u64>,
+        expected_resolved: Option<u64>,
+    }
+
+    impl MatrixCell {
+        const ALL: [MatrixCell; 4] = [
+            MatrixCell {
+                label: "(max=some, ctx=some)",
+                provider_ref: "openai.some_some",
+                max_context_tokens: Some(32_000),
+                context_window: Some(200_000),
+                expected_resolved: Some(200_000),
+            },
+            MatrixCell {
+                label: "(max=some, ctx=none)",
+                provider_ref: "openai.some_none",
+                max_context_tokens: Some(32_000),
+                context_window: None,
+                expected_resolved: None,
+            },
+            MatrixCell {
+                label: "(max=none, ctx=some)",
+                provider_ref: "openai.none_some",
+                max_context_tokens: None,
+                context_window: Some(200_000),
+                expected_resolved: Some(200_000),
+            },
+            MatrixCell {
+                label: "(max=none, ctx=none)",
+                provider_ref: "openai.none_none",
+                max_context_tokens: None,
+                context_window: None,
+                expected_resolved: None,
+            },
+        ];
+    }
+
+    /// Bundles the per-cell drain counters so the callback captures a
+    /// single `Arc<DrainCounters>` instead of seven separate `Arc`s.
+    struct DrainCounters {
+        usage_count: StdMutex<usize>,
+        tool_call_seen: StdMutex<bool>,
+        tool_result_seen: StdMutex<bool>,
+        chunk_after_second_usage: StdMutex<bool>,
+        resolved_windows: StdMutex<Vec<Option<u64>>>,
+        provider_refs_seen: StdMutex<Vec<String>>,
+        saw_second_usage: std::sync::atomic::AtomicBool,
+    }
+
+    impl DrainCounters {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                usage_count: StdMutex::new(0),
+                tool_call_seen: StdMutex::new(false),
+                tool_result_seen: StdMutex::new(false),
+                chunk_after_second_usage: StdMutex::new(false),
+                resolved_windows: StdMutex::new(vec![]),
+                provider_refs_seen: StdMutex::new(vec![]),
+                saw_second_usage: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn drain_must_not_idle_cancel_a_live_turn_across_a_long_tool_gap() {
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(8);
@@ -695,166 +868,10 @@ mod tests {
     #[tokio::test]
     async fn execute_turn_drain_resolves_window_across_provider_config_matrix_through_tool_turn() {
         use crate::agent::agent::Agent;
-        use crate::agent::dispatcher::NativeToolDispatcher;
-        use crate::observability::{NoopObserver, Observer};
-        use crate::tools::{Tool, ToolResult};
-        use async_trait::async_trait;
         use std::sync::Arc;
-        use std::sync::Mutex as StdMutex;
         use tokio::sync::Mutex;
-        use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-        use zeroclaw_api::model_provider::ModelProvider;
-        use zeroclaw_memory::Memory;
-        use zeroclaw_providers::ChatRequest;
-        use zeroclaw_providers::traits::TokenUsage;
-        use zeroclaw_providers::{ChatResponse, ToolCall};
 
-        // ── scripted two-call provider: call 1 emits a tool call + usage,
-        //    call 2 emits final text + usage. The drain must process both
-        //    Usage events plus the interleaved tool events without relocking
-        //    the agent (execute_turn holds agent.lock() for the whole turn).
-        struct TwoCallToolProvider {
-            first: ChatResponse,
-            second: ChatResponse,
-            done: std::sync::atomic::AtomicBool,
-            alias: &'static str,
-        }
-
-        #[async_trait]
-        impl ModelProvider for TwoCallToolProvider {
-            async fn chat_with_system(
-                &self,
-                _system: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                Ok("ok".into())
-            }
-
-            async fn chat(
-                &self,
-                _request: ChatRequest<'_>,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<ChatResponse> {
-                if !self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                    Ok(self.first.clone())
-                } else {
-                    Ok(self.second.clone())
-                }
-            }
-        }
-
-        impl Attributable for TwoCallToolProvider {
-            fn role(&self) -> Role {
-                Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
-            }
-            fn alias(&self) -> &str {
-                self.alias
-            }
-        }
-
-        // ── minimal tool the provider can call. Counts invocations so the
-        //    test can assert the tool actually ran exactly once between the
-        //    two Usage events — proving the interleaved flow is real, not a
-        //    degenerate single-call path.
-        struct CountingTool {
-            name: &'static str,
-            calls: Arc<std::sync::atomic::AtomicUsize>,
-        }
-
-        #[async_trait]
-        impl Tool for CountingTool {
-            fn name(&self) -> &str {
-                self.name
-            }
-            fn description(&self) -> &str {
-                self.name
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({"type": "object"})
-            }
-            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(ToolResult {
-                    success: true,
-                    output: format!("{}-out", self.name).into(),
-                    error: None,
-                })
-            }
-        }
-
-        zeroclaw_api::tool_attribution!(
-            CountingTool,
-            ::zeroclaw_api::attribution::ToolKind::Plugin
-        );
-
-        fn token_usage(input: u64, output: u64) -> TokenUsage {
-            TokenUsage {
-                input_tokens: Some(input),
-                cached_input_tokens: None,
-                output_tokens: Some(output),
-            }
-        }
-
-        // ── provider refs and the expected resolved window per (ctx, max) cell.
-        //    Each cell uses a distinct provider alias so they share no registry
-        //    entry. The (max_context_tokens, context_window) matrix:
-        //
-        //      ┌────────────────┬──────────────────┬───────────────────┐
-        //      │ max_context_   │ context_window = │ context_window =  │
-        //      │ tokens         │ Some(200_000)    │ None              │
-        //      ├────────────────┼──────────────────┼───────────────────┤
-        //      │ Some(32_000)    │ some_some, 200k  │ some_none, None   │
-        //      │ None           │ none_some, 200k  │ none_none, None   │
-        //      └────────────────┴──────────────────┴───────────────────┘
-        //
-        //    In every cell the resolved window tracks the provider's
-        //    context_window (Some → Some(200_000), None → None) and ignores
-        //    max_context_tokens entirely — the negative control that proves
-        //    the legacy 32k stub leak (None wrongly reported as 32_000) is gone.
-        #[derive(Clone, Copy)]
-        struct MatrixCell {
-            label: &'static str,
-            provider_ref: &'static str,
-            max_context_tokens: Option<usize>,
-            context_window: Option<u64>,
-            expected_resolved: Option<u64>,
-        }
-
-        let cells: [MatrixCell; 4] = [
-            MatrixCell {
-                label: "(max=some, ctx=some)",
-                provider_ref: "openai.some_some",
-                max_context_tokens: Some(32_000),
-                context_window: Some(200_000),
-                expected_resolved: Some(200_000),
-            },
-            MatrixCell {
-                label: "(max=some, ctx=none)",
-                provider_ref: "openai.some_none",
-                max_context_tokens: Some(32_000),
-                context_window: None,
-                expected_resolved: None,
-            },
-            MatrixCell {
-                label: "(max=none, ctx=some)",
-                provider_ref: "openai.none_some",
-                max_context_tokens: None,
-                context_window: Some(200_000),
-                expected_resolved: Some(200_000),
-            },
-            MatrixCell {
-                label: "(max=none, ctx=none)",
-                provider_ref: "openai.none_none",
-                max_context_tokens: None,
-                context_window: None,
-                expected_resolved: None,
-            },
-        ];
-
-        for cell in cells {
+        for cell in MatrixCell::ALL {
             // Build a config with this provider's context_window. Each case
             // uses a distinct (type, alias) so cell configs never collide.
             let (type_key, alias_key) = cell
@@ -885,8 +902,6 @@ mod tests {
             // Two scripted responses: call 1 carries a tool call + usage;
             // call 2 carries final text + usage. The drain sees the full
             // interleaved sequence through the real execute_turn boundary.
-            let first_usage = token_usage(10, 5);
-            let second_usage = token_usage(20, 8);
             let first = ChatResponse {
                 text: Some(String::new()),
                 tool_calls: vec![ToolCall {
@@ -895,13 +910,13 @@ mod tests {
                     arguments: "{}".into(),
                     extra_content: None,
                 }],
-                usage: Some(first_usage),
+                usage: Some(token_usage(10, 5)),
                 reasoning_content: None,
             };
             let second = ChatResponse {
                 text: Some("matrix done".into()),
                 tool_calls: vec![],
-                usage: Some(second_usage),
+                usage: Some(token_usage(20, 8)),
                 reasoning_content: None,
             };
 
@@ -929,30 +944,11 @@ mod tests {
                 .build()
                 .expect("agent builder should succeed");
 
-            // Per-cell counters collected by the drain callback. The callback
-            // invokes model_provider_context_window_opt(&cfg.read(), provider_ref)
-            // — the same config-read path production uses — proving it does not
-            // reacquire the agent mutex. Each of the two Usage events records
-            // its resolved window; we assert both match the cell expectation
-            // (i.e., the second call's resolution is NOT polluted by the first).
-            let usage_count = Arc::new(StdMutex::new(0usize));
-            let tool_call_seen = Arc::new(StdMutex::new(false));
-            let tool_result_seen = Arc::new(StdMutex::new(false));
-            let chunk_after_second_usage = Arc::new(StdMutex::new(false));
-            let resolved_windows: Arc<StdMutex<Vec<Option<u64>>>> = Arc::new(StdMutex::new(vec![]));
-            let provider_refs_seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(vec![]));
-            let saw_second_usage = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
+            let counters = DrainCounters::new();
             let cfg_for_cb: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>> =
                 Arc::new(config.into());
             let cfg_arc = Arc::clone(&cfg_for_cb);
-            let uc = Arc::clone(&usage_count);
-            let tcs = Arc::clone(&tool_call_seen);
-            let trs = Arc::clone(&tool_result_seen);
-            let cfa = Arc::clone(&chunk_after_second_usage);
-            let rw = Arc::clone(&resolved_windows);
-            let prs = Arc::clone(&provider_refs_seen);
-            let ssu = Arc::clone(&saw_second_usage);
+            let dc = Arc::clone(&counters);
 
             let outcome = execute_turn(
                 Arc::new(Mutex::new(agent)),
@@ -968,55 +964,46 @@ mod tests {
                 None,
                 move |event| {
                     let cfg = Arc::clone(&cfg_arc);
-                    let uc = Arc::clone(&uc);
-                    let tcs = Arc::clone(&tcs);
-                    let trs = Arc::clone(&trs);
-                    let cfa = Arc::clone(&cfa);
-                    let rw = Arc::clone(&rw);
-                    let prs = Arc::clone(&prs);
-                    let ssu = Arc::clone(&ssu);
+                    let dc = Arc::clone(&dc);
                     async move {
                         match &event {
                             TurnEvent::Usage { provider_ref, .. } => {
-                                *uc.lock().unwrap() += 1;
-                                let before_second = ssu.load(std::sync::atomic::Ordering::SeqCst);
-                                ssu.store(true, std::sync::atomic::Ordering::SeqCst);
-                                prs.lock().unwrap().push(provider_ref.clone());
-                                // Resolve model_context_window from the
-                                // embedded provider_ref via config.read() —
-                                // NOT via the agent mutex. This is the drain
-                                // fix path; if it locked the agent again the
-                                // drain would stall after the first Usage.
+                                *dc.usage_count.lock().unwrap() += 1;
+                                let before_second = dc
+                                    .saw_second_usage
+                                    .load(std::sync::atomic::Ordering::SeqCst);
+                                dc.saw_second_usage
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                dc.provider_refs_seen
+                                    .lock()
+                                    .unwrap()
+                                    .push(provider_ref.clone());
                                 let cfg = cfg.read();
                                 let window = cfg
                                     .model_provider_context_window_opt(provider_ref)
                                     .map(|v| v as u64);
-                                rw.lock().unwrap().push(window);
-                                // A Chunk arriving AFTER the first Usage but
-                                // before the second is the normal call-1 path;
-                                // we only care that a Chunk arrives after the
-                                // SECOND Usage too. Reset chunk-after flag on
-                                // each Usage so it only sticks on a Chunk seen
-                                // after the most-recent (second) Usage.
+                                dc.resolved_windows.lock().unwrap().push(window);
                                 if before_second {
-                                    *cfa.lock().unwrap() = false;
+                                    *dc.chunk_after_second_usage.lock().unwrap() = false;
                                 }
                             }
                             TurnEvent::ToolCall { id, .. } => {
                                 if id == "tc-matrix" {
-                                    *tcs.lock().unwrap() = true;
+                                    *dc.tool_call_seen.lock().unwrap() = true;
                                 }
                             }
                             TurnEvent::ToolResult { id, .. } => {
                                 if id == "tc-matrix" {
-                                    *trs.lock().unwrap() = true;
+                                    *dc.tool_result_seen.lock().unwrap() = true;
                                 }
                             }
                             TurnEvent::Chunk { delta }
                                 if delta.contains("matrix done")
-                                    && ssu.load(std::sync::atomic::Ordering::SeqCst) =>
+                                    && dc
+                                        .saw_second_usage
+                                        .load(std::sync::atomic::Ordering::SeqCst) =>
                             {
-                                *cfa.lock().unwrap() = true;
+                                *dc.chunk_after_second_usage.lock().unwrap() = true;
                             }
                             _ => {}
                         }
@@ -1026,9 +1013,6 @@ mod tests {
             .await
             .expect("turn should complete without deadlocking across the matrix");
 
-            // Outcome sanity: the turn completes normally (not cancelled,
-            // not panicked) regardless of provider config. TurnOutcome is not
-            // Debug on purpose, so match by shape.
             assert!(
                 matches!(outcome, TurnOutcome::Completed { .. }),
                 "{}: turn must complete normally (TurnOutcome::Completed) \
@@ -1037,22 +1021,15 @@ mod tests {
                 cell.label,
             );
 
-            // Two Usage events (one per LLM call) drained through the callback.
-            // This proves the drain continued past the first Usage AND through
-            // the interleaved tool events to the second Usage — a relock stall
-            // after the first Usage would prevent the second from arriving.
             assert_eq!(
-                *usage_count.lock().unwrap(),
+                *counters.usage_count.lock().unwrap(),
                 2,
                 "{}: exactly two Usage events must drain through the callback \
                  (one per LLM call); a relock would stall after the first",
                 cell.label,
             );
 
-            // Both Usage events carry the cell's serving provider_ref — the
-            // coherent-tuple invariant exercised at the
-            // RPC boundary, not just the agent-internal steering-state path.
-            let refs: Vec<String> = provider_refs_seen.lock().unwrap().clone();
+            let refs: Vec<String> = counters.provider_refs_seen.lock().unwrap().clone();
             assert_eq!(
                 refs.len(),
                 2,
@@ -1068,16 +1045,13 @@ mod tests {
                 refs,
             );
 
-            // The interleaved tool turn is real: the tool actually ran once
-            // between the two Usage events, and both ToolCall and ToolResult
-            // notifications were observed through the real RPC callback.
             assert!(
-                *tool_call_seen.lock().unwrap(),
+                *counters.tool_call_seen.lock().unwrap(),
                 "{}: ToolCall event must drain through the callback",
                 cell.label,
             );
             assert!(
-                *tool_result_seen.lock().unwrap(),
+                *counters.tool_result_seen.lock().unwrap(),
                 "{}: ToolResult event must drain through the callback",
                 cell.label,
             );
@@ -1089,21 +1063,14 @@ mod tests {
                 cell.label,
             );
 
-            // Final Chunk arrived AFTER the second Usage — the drain processed
-            // the whole interleaved sequence without stalling.
             assert!(
-                *chunk_after_second_usage.lock().unwrap(),
+                *counters.chunk_after_second_usage.lock().unwrap(),
                 "{}: a final Chunk must arrive after the second Usage event, \
                  proving the drain did not stall at the RPC callback boundary",
                 cell.label,
             );
 
-            // The matrix core: in every cell, model_provider_context_window_opt
-            // returns the PROVIDER's context_window and ONLY that — never the
-            // profile's max_context_tokens. Both Usage events in the cell
-            // resolve identically (the resolution is deterministic per
-            // provider_ref and not stateful across calls).
-            let windows: Vec<Option<u64>> = resolved_windows.lock().unwrap().clone();
+            let windows: Vec<Option<u64>> = counters.resolved_windows.lock().unwrap().clone();
             assert_eq!(
                 windows.len(),
                 2,

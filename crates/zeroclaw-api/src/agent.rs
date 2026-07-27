@@ -51,6 +51,13 @@ pub enum TurnEvent {
     /// The `provider_ref` and `model` identify the provider and model that
     /// actually served this call, accounting for vision routing, reliable
     /// fallback, and mid-turn provider switches.
+    ///
+    /// **Source-breaking change notice (for downstream crates):**
+    /// Adding required `provider_ref: String` and `model: String` fields to
+    /// this variant breaks exhaustive `match` on `TurnEvent` in downstream
+    /// Rust crates. Code using `..` rest patterns is unaffected. This is an
+    /// intentional API evolution to ensure coherent identity tracking across
+    /// provider switches.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic

@@ -1800,13 +1800,9 @@ impl RpcDispatcher {
                     // Resolve model_context_window per event from the embedded provider_ref.
                     // No lock acquisition - uses the live provider that served the turn.
                     let model_ctx_window = if let TurnEvent::Usage { provider_ref, .. } = &event {
-                        if provider_ref.is_empty() {
-                            None
-                        } else {
-                            let cfg = config.read();
-                            cfg.model_provider_context_window_opt(provider_ref)
-                                .map(|v| v as u64)
-                        }
+                        let cfg = config.read();
+                        cfg.model_provider_context_window_opt(provider_ref)
+                            .map(|v| v as u64)
                     } else {
                         None
                     };

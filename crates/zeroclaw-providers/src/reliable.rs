@@ -30,7 +30,9 @@ tokio::task_local! {
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
-/// Must be called within a `scope_provider_fallback` scope.
+/// Returns `None` when called outside a `scope_provider_fallback` scope
+/// (the fallback cell is opt-in telemetry; production paths that don't
+/// scope it simply observe no fallback).
 pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
     PROVIDER_FALLBACK
         .try_with(|cell| cell.borrow_mut().take())
@@ -42,7 +44,7 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
 /// Used by the turn loop to update `serving_provider_name` / `serving_model`
 /// before the `Usage` event is emitted, without consuming the record that
 /// `take_last_provider_fallback` will read after the round completes.
-/// Must be called within a `scope_provider_fallback` scope.
+/// Returns `None` when called outside a `scope_provider_fallback` scope.
 pub fn peek_last_provider_fallback() -> Option<ProviderFallbackInfo> {
     PROVIDER_FALLBACK
         .try_with(|cell| cell.borrow().clone())
@@ -62,7 +64,7 @@ pub fn peek_last_provider_fallback() -> Option<ProviderFallbackInfo> {
 /// model-fallback-notice semantics ("the final response was served by a
 /// different provider than requested"), since the user-facing response
 /// always comes from the last iteration's LLM call.
-/// Must be called within a `scope_provider_fallback` scope.
+/// No-ops when called outside a `scope_provider_fallback` scope.
 pub fn clear_last_provider_fallback() {
     let _ = PROVIDER_FALLBACK.try_with(|cell| {
         *cell.borrow_mut() = None;
@@ -78,6 +80,7 @@ pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Ou
 }
 
 /// Record a model_provider fallback event.
+/// No-ops when called outside a `scope_provider_fallback` scope.
 fn record_provider_fallback(
     requested_provider: &str,
     requested_model: &str,
@@ -5330,5 +5333,35 @@ mod tests {
             "ReliableModelProvider must not surface as model_provider_type=reliable",
         );
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    /// Regression: `clear_last_provider_fallback` wipes the per-iteration
+    /// cell so a stale fallback recorded in iteration N-1 doesn't leak
+    /// into iteration N's `Usage.provider_ref` / `serving_model` resolution.
+    #[tokio::test]
+    async fn clear_last_provider_fallback_wipes_stale_record() {
+        scope_provider_fallback(async {
+            // Record a fallback (iteration N-1)
+            record_provider_fallback(
+                "iter-n-1-provider",
+                "iter-n-1-model",
+                "actual-provider",
+                "actual-model",
+            );
+            assert!(
+                peek_last_provider_fallback().is_some(),
+                "fallback must be recorded"
+            );
+
+            // Clear it (top of iteration N)
+            clear_last_provider_fallback();
+
+            // Peek must now return None — no stale leak
+            assert!(
+                peek_last_provider_fallback().is_none(),
+                "after clear, peek must return None — stale N-1 record would leak into iteration N"
+            );
+        })
+        .await;
     }
 }

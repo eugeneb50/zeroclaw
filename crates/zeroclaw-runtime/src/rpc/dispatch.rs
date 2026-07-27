@@ -6812,8 +6812,7 @@ mod tests {
         );
         assert!(
             v["params"].get("model_context_window").is_none(),
-            "model_context_window must be absent when provider has no context_window \
-             — 32k stub would freeze meter (#8872)"
+            "model_context_window must be absent when provider has no context_window"
         );
     }
 

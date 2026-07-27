@@ -2181,8 +2181,6 @@ mod tests {
 
     /// done-frame model_context_window: present when the provider has an
     /// explicit `context_window`, absent when it does not.
-    /// Covers both halves of #8872: absence must be preserved at the producer
-    /// boundary and a set window must survive the wire.
     #[test]
     fn done_frame_model_context_window_presence_tracks_provider_config() {
         use std::collections::HashMap;
@@ -2276,8 +2274,7 @@ mod tests {
             } else {
                 assert!(
                     v.get("model_context_window").is_none(),
-                    "model_context_window must be absent when provider has no context_window \
-                     (#8872)"
+                    "model_context_window must be absent when provider has no context_window"
                 );
             }
         }

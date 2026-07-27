@@ -2035,57 +2035,11 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
 
 /// Regression: `TurnEvent::Usage` must carry a coherent tuple
 /// (provider_ref, model, resolved context_window, cost_usd) identifying the
-/// provider/model that actually served the call — across vision routing,
-/// reliable-provider fallback, in-turn model switches, and the vision+reliable
-/// combination. Each scenario drives the real production turn loop
-/// (`turn_streamed_with_steering_state`) and asserts the Usage event reflects
-/// the SERVING provider/model, never the originally-requested one, with cost
-/// computed from the serving provider's pricing entries only.
-///
-/// Drives the real production path
-/// (`turn_streamed_with_steering_state` → `run_tool_call_loop` →
-/// `clear_last_provider_fallback` → `call_provider` →
-/// `peek_last_provider_fallback` overrides `ctx.serving_provider_name` +
-/// `ctx.serving_model` together → `interpret_chat_response` emits `Usage`)
-/// across 4 scenarios × a 2×2 `(max_context_tokens, context_window)` provider-
-/// config matrix. The trim-budget axis is a negative control: the resolved
-/// window must track the provider's `context_window` and ONLY that — never the
-/// runtime profile's `max_context_tokens` budget (the legacy 32k stub leak),
-/// and never cross-contaminate when the provider has one.
-///
-/// Cells:
-///   (max_context_tokens, context_window) ∈
-///     {(some, some), (some, none), (none, some), (none, none)}
-///
-/// Scenarios:
-///   `ReliableFallback`            — failing primary → ReliableModelProvider
-///                                      pinned fallback to `openai.fallback`/
-///                                      `fallback-model`.
-///   `VisionRoute`                 — base text provider (no vision) → wiremock
-///                                      Anthropic vision route via config's
-///                                      `vision_model_provider`. Real
-///                                      `resolve_vision_provider` → real
-///                                      `AnthropicModelProvider`.
-///   `InTurnModelSwitch`           — pre-set `model_switch_state` to provider
-///                                      B's ref/model; ScriptedProvider triggers
-///                                      the switch. Asserts the post-switch
-///                                      `Usage` event describes provider B.
-///   `VisionRouteWithReliableFallback` — vision primary (failing) → reliable-
-///                                      pinned vision fallback to
-///                                      `anthropic.vision-2`/`vision-model-2`.
-///                                      Pre-wraps the vision provider as a
-///                                      `ReliableModelProvider` and drives the
-///                                      turn loop directly; exercises the
-///                                      coherent-tuple plumbing when the routed
-///                                      provider is itself a reliable wrapper
-///                                      that falls back.
-///
-/// `cost_usd` is asserted as a non-zero exact value (real CostTracker +
-/// provider-keyed pricing map scoped around the turn). The pricing map keys
-/// the FALLBACK/vision/switched provider only — so a coherent tuple's cost is
-/// the exact `(input*in_rate + output*out_rate)/1e6`, while a misattributed
-/// tuple (.Usage on the wrong provider) would resolve empty pricing and
-/// compute zero, failing the assertion.
+/// provider/model that actually served the call, across four scenarios
+/// (reliable fallback, vision routing, in-turn model switch, vision+reliable)
+/// × a 2×2 `(max_context_tokens, context_window)` provider-config matrix.
+/// The pricing map keys only the serving provider, so a misattributed tuple
+/// resolves empty pricing and computes zero cost, failing the assertion.
 mod reliable_mocks {
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
@@ -2111,7 +2065,7 @@ mod reliable_mocks {
             _md: &str,
             _t: Option<f64>,
         ) -> anyhow::Result<ChatResponse> {
-            Err(anyhow::anyhow!("simulated primary failure"))
+            Err(anyhow::Error::msg("simulated primary failure"))
         }
     }
 
@@ -2273,6 +2227,7 @@ async fn run_turn_and_assert_usage(
         + (output_tokens as f64) * output_rate / 1_000_000.0;
     let observed = usage.4.expect("Usage.cost_usd must be Some(_)");
     let diff = (observed - expected_cost).abs();
+    // Relative tolerance (1e-6) with 1e-9 floor for zero-cost edge cases.
     let tol = expected_cost.max(1e-9) * 1e-6;
     assert!(
         diff <= tol,

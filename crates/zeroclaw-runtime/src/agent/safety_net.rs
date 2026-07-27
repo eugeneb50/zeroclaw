@@ -2598,7 +2598,10 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         fn parameters_schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
             let state = crate::agent::turn::current_model_switch_state()?;
             *state.lock().unwrap() =
                 Some((self.target_provider.clone(), self.target_model.clone()));
@@ -2673,9 +2676,10 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         // call.  The trigger tool queues the switch; the turn loop detects
         // it, rebuilds the provider from ProviderSwitchConfig, and the next
         // call goes to the wiremock-backed switched-to provider.
-        let provider = ScriptedProvider::new(vec![
-            tool_response(vec![tool_call("1", "model_switch_trigger")]),
-        ]);
+        let provider = ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "1",
+            "model_switch_trigger",
+        )])]);
 
         let agent = Agent::builder()
             .model_provider(Box::new(provider))

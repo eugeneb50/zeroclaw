@@ -9129,7 +9129,11 @@ mod tests {
         assert_eq!(window_before, Some(128_000));
 
         // Apply in-turn switch
-        let result = agent.try_apply_model_switch("gpt-4o-mini", "ollama.provider-b".to_string(), "llama3".to_string());
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            "ollama.provider-b".to_string(),
+            "llama3".to_string(),
+        );
         assert_eq!(
             result.as_deref(),
             Some("llama3"),

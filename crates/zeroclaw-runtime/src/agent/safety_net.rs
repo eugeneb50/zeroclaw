@@ -2297,8 +2297,6 @@ async fn usage_event_coherent_tuple_reliable_fallback() {
     use zeroclaw_api::model_provider::ModelProvider;
     use zeroclaw_providers::reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 
-    crate::agent::loop_::clear_model_switch_request();
-
     // Two cells: one with the fallback provider exposing a context_window
     // (the resolved window must equal it), one without (resolved must be None,
     // never any trim budget). Both must emit a coherent Usage tuple on the
@@ -2389,8 +2387,6 @@ async fn usage_event_coherent_tuple_vision_route() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_config::schema::MultimodalConfig;
-
-    crate::agent::loop_::clear_model_switch_request();
 
     // Two cells: vision provider with and without an explicit context_window.
     // Vision routing must emit Usage with the vision provider's ref + model,
@@ -2579,14 +2575,43 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // Hold the global model-switch test lock so no other test can run its
-    // turn loop concurrently while we set and clear the switch state.
-    let _guard = crate::agent::loop_::MODEL_SWITCH_TEST_LOCK.lock().unwrap();
+    // Test tool that queues a pending model switch when executed, standing
+    // in for the real `model_switch` tool during a streamed turn.
+    struct ModelSwitchTriggerTool {
+        target_provider: String,
+        target_model: String,
+    }
+
+    zeroclaw_api::tool_attribution!(
+        ModelSwitchTriggerTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+
+    #[async_trait]
+    impl Tool for ModelSwitchTriggerTool {
+        fn name(&self) -> &str {
+            "model_switch_trigger"
+        }
+        fn description(&self) -> &str {
+            "test tool: queues a pending model switch"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            let state = crate::agent::turn::current_model_switch_state()?;
+            *state.lock().unwrap() =
+                Some((self.target_provider.clone(), self.target_model.clone()));
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "model switch queued".into(),
+                error: None,
+            })
+        }
+    }
 
     // Two cells: switched-to provider with and without an explicit context_window.
     for switch_window in [Some(200_000_u64), None] {
-        crate::agent::loop_::clear_model_switch_request();
-
         let (input_tokens, output_tokens) = (10_u64, 5_u64);
         let (input_rate, output_rate) = (1.5_f64, 3.0_f64);
 
@@ -2643,16 +2668,21 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         let switch_cfg = ProviderSwitchConfig {
             config: Some(cfg_arc.clone()),
         };
-        // Primary ScriptedProvider responds to the first call (pre-switch),
-        // then the wiremock-backed provider B serves the post-switch call.
-        let mut first = text_response("trigger switch");
-        first.usage = Some(token_usage(1, 1));
-        let mut second = text_response("switched response");
-        second.usage = Some(token_usage(input_tokens, output_tokens));
-        let provider = ScriptedProvider::new(vec![first, second]);
+
+        // The ScriptedProvider returns a tool_call on its first (and only)
+        // call.  The trigger tool queues the switch; the turn loop detects
+        // it, rebuilds the provider from ProviderSwitchConfig, and the next
+        // call goes to the wiremock-backed switched-to provider.
+        let provider = ScriptedProvider::new(vec![
+            tool_response(vec![tool_call("1", "model_switch_trigger")]),
+        ]);
+
         let agent = Agent::builder()
             .model_provider(Box::new(provider))
-            .tools(vec![])
+            .tools(vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "anthropic.provider-b".into(),
+                target_model: "claude-3-opus".into(),
+            })])
             .memory(mem_none())
             .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -2663,13 +2693,6 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
             .agent_alias("matrix-test".into())
             .build()
             .expect("agent builder should succeed");
-
-        // Set the switch state IMMEDIATELY before running the turn loop,
-        // with no async yield between setting state and executing the turn.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            *state.lock().unwrap() = Some(("anthropic.provider-b".into(), "claude-3-opus".into()));
-        }
 
         // Wire a real CostTracker + provider-keyed pricing map so cost_usd
         // is computed (mirrors ws.rs::process_chat_message). The pricing map
@@ -2683,8 +2706,6 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
             output_rate,
         );
 
-        // Run the turn loop INLINE (no spawn) so there is no async yield
-        // between setting the switch state and the turn applying it.
         let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
         let prompt = "complete the task".to_string();
         let mut agent = agent;
@@ -2702,11 +2723,11 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
             },
         );
         let _ = turn_result.expect("turn should succeed");
+
         // Find the post-switch Usage event the serving call emitted. The
-        // pre-switch call (token_usage(1,1) on the primary) also emits a
-        // Usage event when the model_switch check fires after iteration N=0,
-        // so we filter on the serving-call token counts (10, 5) to pin the
-        // assertions to the coherent tuple from anthropic.provider-b.
+        // pre-switch call (ScriptedProvider tool_call) carries no usage, so
+        // the only Usage event comes from the wiremock-backed call with the
+        // expected token counts (10, 5).
         let usage = events
             .iter()
             .find_map(|e| match e {
@@ -2760,10 +2781,6 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
         // ASSERTION 5: token counts flow through from the serving call
         assert_eq!(usage.2, Some(input_tokens), "input_tokens mismatch");
         assert_eq!(usage.3, Some(output_tokens), "output_tokens mismatch");
-
-        // Clean the global state so the next cell iteration (and any other
-        // parallel test) doesn't pick up a stale switch.
-        crate::agent::loop_::clear_model_switch_request();
     }
 }
 
@@ -2772,9 +2789,6 @@ async fn usage_event_coherent_tuple_vision_route_with_reliable_fallback() {
     use reliable_mocks::*;
     use zeroclaw_api::model_provider::ModelProvider;
     use zeroclaw_providers::reliable::{ReliableModelProvider, ReliableModelProviderEntry};
-
-    let _guard = crate::agent::loop_::MODEL_SWITCH_TEST_LOCK.lock().unwrap();
-    crate::agent::loop_::clear_model_switch_request();
 
     // Two cells: fallback vision provider with and without an explicit
     // context_window. The vision primary fails; the reliable wrapper falls

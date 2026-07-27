@@ -9099,9 +9099,6 @@ mod tests {
     /// provider switch, not the static agent alias.
     #[test]
     fn model_context_window_follows_in_turn_model_switch() {
-        let _guard = MODEL_SWITCH_TEST_GUARD.lock().unwrap();
-        crate::agent::loop_::clear_model_switch_request();
-
         let mut cfg = Config::default();
         let provider_a = cfg
             .providers
@@ -9121,13 +9118,6 @@ mod tests {
             config: Some(cfg_arc.clone()),
         };
 
-        // Pre-set a switch to a provider that has a 1M window.
-        {
-            let state = crate::agent::loop_::get_model_switch_state();
-            let mut guard = state.lock().unwrap();
-            *guard = Some(("ollama.provider-b".to_string(), "llama3".to_string()));
-        }
-
         let mut agent = build_test_agent("openai.provider-a", "gpt-4o-mini", Some(switch_cfg));
 
         // Before switch: resolve with provider A's ref
@@ -9139,7 +9129,7 @@ mod tests {
         assert_eq!(window_before, Some(128_000));
 
         // Apply in-turn switch
-        let result = agent.try_apply_pending_model_switch("gpt-4o-mini");
+        let result = agent.try_apply_model_switch("gpt-4o-mini", "ollama.provider-b".to_string(), "llama3".to_string());
         assert_eq!(
             result.as_deref(),
             Some("llama3"),

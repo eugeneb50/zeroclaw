@@ -1798,7 +1798,8 @@ impl RpcDispatcher {
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
                     // Resolve model_context_window per event from the embedded provider_ref.
-                    // No lock acquisition - uses the live provider that served the turn.
+                    // No agent-mutex reacquisition — resolve the live provider's window
+                    // from the config RwLock (read-only, non-blocking).
                     let model_ctx_window = if let TurnEvent::Usage { provider_ref, .. } = &event {
                         let cfg = config.read();
                         cfg.model_provider_context_window_opt(provider_ref)
@@ -4782,6 +4783,7 @@ fn notification_for_turn_event(
             session_id: session_id.to_string(),
             entries: entries.clone(),
         },
+        _ => return None,
     };
 
     let params = serde_json::to_value(update).ok()?;

@@ -1234,6 +1234,7 @@ async fn process_chat_message(
                             "type": "plan",
                             "entries": entries,
                         }),
+                        _ => continue,
                     };
                     let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                 }

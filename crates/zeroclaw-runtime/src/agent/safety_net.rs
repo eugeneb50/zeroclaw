@@ -2249,7 +2249,6 @@ async fn run_turn_and_assert_usage(
 #[tokio::test]
 async fn usage_event_coherent_tuple_reliable_fallback() {
     use reliable_mocks::*;
-    use zeroclaw_api::model_provider::ModelProvider;
 
     // Two cells: one with the fallback provider exposing a context_window
     // (the resolved window must equal it), one without (resolved must be None,
@@ -2739,7 +2738,6 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 #[tokio::test]
 async fn usage_event_coherent_tuple_vision_route_with_reliable_fallback() {
     use reliable_mocks::*;
-    use zeroclaw_api::model_provider::ModelProvider;
 
     // Two cells: fallback vision provider with and without an explicit
     // context_window. The vision primary fails; the reliable wrapper falls

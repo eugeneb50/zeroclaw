@@ -752,19 +752,19 @@ impl ReliableModelProviderEntry {
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
-}
+    }
 
-/// Build an entry that serves `pinned_model` regardless of the requested
-/// model. The [`crate::model_pin::ModelPinnedProvider`] wrapper is the
-/// source of truth for the pinned model; this entry reads it from the
-/// wrapper at use-time.
-pub(crate) fn new_pinned(
-    display_name: impl Into<String>,
-    cooldown_key: impl Into<String>,
-    alias: &str,
-    pinned_model: &str,
-    inner: Box<dyn ModelProvider>,
-) -> Self {
+    /// Build an entry that serves `pinned_model` regardless of the requested
+    /// model. The [`crate::model_pin::ModelPinnedProvider`] wrapper is the
+    /// source of truth for the pinned model; this entry reads it from the
+    /// wrapper at use-time.
+    pub(crate) fn new_pinned(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        alias: &str,
+        pinned_model: &str,
+        inner: Box<dyn ModelProvider>,
+    ) -> Self {
         Self {
             display_name: display_name.into(),
             cooldown_key: cooldown_key.into(),
@@ -2170,6 +2170,7 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
 /// types. Only compiled when the `test-helpers` feature is active.
 #[cfg(feature = "test-helpers")]
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn for_test_reliable_with_pinned_fallback(
     alias: &str,
     primary_name: &str,
@@ -2186,11 +2187,7 @@ pub fn for_test_reliable_with_pinned_fallback(
     Box::new(ReliableModelProvider::new_with_entries(
         alias,
         vec![
-            ReliableModelProviderEntry::new(
-                primary_name,
-                primary_cooldown_key,
-                primary_provider,
-            ),
+            ReliableModelProviderEntry::new(primary_name, primary_cooldown_key, primary_provider),
             ReliableModelProviderEntry::new_pinned(
                 fallback_name,
                 fallback_cooldown_key,

@@ -1,5 +1,6 @@
 use crate::plan::PlanEntry;
 
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).

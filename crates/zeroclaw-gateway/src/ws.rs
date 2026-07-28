@@ -2182,7 +2182,7 @@ mod tests {
         use zeroclaw_config::schema::{AliasedAgentConfig, Config, RuntimeProfileConfig};
 
         // (provider_alias, context_window, expected_model_window,
-        //  expected_max_context_tokens)
+        // expected_max_context_tokens)
         let cases: &[(&str, Option<usize>, Option<u64>, u64)] = &[
             // Provider has no context_window — field must be absent.
             ("openrouter.default", None, None, 128_000),

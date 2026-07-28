@@ -53,62 +53,7 @@ impl ToolArtifact {
         })
     }
 }
-
-/// Structured metadata for a tool that produced a file artifact (e.g.
-/// `deliver_file`). Carried on [`TurnEvent::ToolResult`] so a channel attaches
-/// the file from typed fields instead of parsing a text trailer out of the
-/// free-form `output` string. Trailer parsing let a crafted filename forge the
-/// delivered path (arbitrary-file-read / confused-deputy class).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolArtifact {
-    /// Absolute path of the delivered file on the agent host.
-    pub path: String,
-    /// Stable citation URI the client can reference (e.g. `attachment://…`).
-    pub uri: String,
-    /// Original filename.
-    pub filename: String,
-    /// Human-readable chat label; defaults to the filename.
-    pub title: String,
-    /// MIME type.
-    pub mime: String,
-    /// Size in bytes.
-    pub size: u64,
-}
 #[non_exhaustive]
-
-impl ToolArtifact {
-    /// Build from a tool's structured `output_data` when it declares a delivered
-    /// file (`delivered: true` with a non-empty `path`). Returns `None` for any
-    /// other structured output, keeping this a channel-neutral convention rather
-    /// than a hook tied to one tool name.
-    pub fn from_delivered_data(data: &serde_json::Value) -> Option<Self> {
-        if data.get("delivered").and_then(serde_json::Value::as_bool) != Some(true) {
-            return None;
-        }
-        let field = |key: &str| {
-            data.get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        let path = field("path");
-        if path.is_empty() {
-            return None;
-        }
-        Some(Self {
-            uri: field("uri"),
-            filename: field("filename"),
-            title: field("title"),
-            mime: field("mimeType"),
-            size: data
-                .get("bytes")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0),
-            path,
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).

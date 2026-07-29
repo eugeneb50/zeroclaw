@@ -36,12 +36,6 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [features]
 default = []
-# Exposes cross-crate test-only constructors (e.g.
-# `for_test_reliable_with_pinned_fallback`) so downstream test suites
-# can build reliable-provider fixtures without importing internal entry
-# types. Not part of the default surface — the helpers exist purely
-# to keep downstream tests self-contained.
-test-helpers = []
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["test-util"] }

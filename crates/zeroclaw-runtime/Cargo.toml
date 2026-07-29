@@ -12,7 +12,7 @@ zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-log.workspace = true
-zeroclaw-providers = { workspace = true, features = ["test-helpers"] }
+zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-sop-graph.workspace = true

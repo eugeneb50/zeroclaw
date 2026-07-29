@@ -1099,4 +1099,260 @@ mod tests {
             }
         }
     }
+
+    /// Regression test for REQ-W1: proves the production RPC forwarding
+    /// boundary (`notification_for_turn_event` → `RpcOutbound::send_raw`)
+    /// correctly serializes the full interleaved event sequence through a
+    /// real outbound writer while `execute_turn` owns the agent lock.
+    ///
+    /// The test constructs a real `RpcOutbound` backed by a bounded mpsc
+    /// channel, spawns a collector task that drains the writer, drives a
+    /// turn with `TwoCallToolProvider` (which yields Usage → ToolCall →
+    /// ToolResult → Usage → Chunk), and asserts the frames arrive in the
+    /// correct order and contain the expected JSON-RPC structure.
+    #[tokio::test]
+    async fn execute_turn_forwards_serialized_notifications_through_real_outbound_writer() {
+        use crate::rpc::dispatch::forward_turn_event;
+        use tokio::sync::mpsc;
+        use zeroclaw_api::jsonrpc::RpcOutbound;
+        use zeroclaw_config::schema::{Config, MemoryConfig};
+
+        // Build a config with a known context_window for the provider.
+        let mut config = Config::default();
+        let provider_entry = config
+            .providers
+            .models
+            .ensure("openai", "default")
+            .expect("ensure provider entry");
+        provider_entry.context_window = Some(128_000);
+
+        let memory_cfg = MemoryConfig {
+            backend: "none".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+
+        // Build the real outbound: bounded mpsc channel + RpcOutbound.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+
+        // Spawn receiver: collect all frames into a Vec<String>.
+        let received = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let recv_received = Arc::clone(&received);
+        let collector = zeroclaw_spawn::spawn!(async move {
+            while let Some(frame) = writer_rx.recv().await {
+                recv_received.lock().unwrap().push(frame);
+            }
+        });
+
+        // Two scripted responses: call 1 carries a tool call + usage;
+        // call 2 carries final text + usage. The drain sees the full
+        // interleaved sequence through the real execute_turn boundary.
+        let first = ChatResponse {
+            text: Some(String::new()),
+            tool_calls: vec![ToolCall {
+                id: "tc-w1".into(),
+                name: "echo".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            usage: Some(token_usage(100, 50)),
+            reasoning_content: None,
+        };
+        let second = ChatResponse {
+            text: Some("w1 done".into()),
+            tool_calls: vec![],
+            usage: Some(token_usage(200, 80)),
+            reasoning_content: None,
+        };
+
+        let provider = TwoCallToolProvider {
+            first,
+            second,
+            done: std::sync::atomic::AtomicBool::new(false),
+            alias: "openai.default",
+        };
+
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(vec![Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::clone(&tool_calls),
+            })])
+            .memory(mem)
+            .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("w1-model".into())
+            .model_provider_name("openai.default".into())
+            .agent_alias("rpc-w1".into())
+            .build()
+            .expect("agent builder should succeed");
+
+        // Use parking_lot::RwLock for config so that .read() returns the
+        // guard directly (no Result wrapping), matching the existing
+        // drain-callback pattern in the matrix test.
+        let cfg_arc: Arc<parking_lot::RwLock<Config>> = Arc::new(parking_lot::RwLock::new(config));
+        let cfg_for_cb = Arc::clone(&cfg_arc);
+
+        // Resolve max_context_tokens from the config using the public
+        // Config method (context_usage_max_tokens is private to dispatch).
+        let max_ctx = cfg_arc.read().effective_max_context_tokens("rpc-w1") as u64;
+
+        // Drive the turn through execute_turn, forwarding each event
+        // through the real RPC boundary using forward_turn_event.
+        let rpc_for_drop = Arc::clone(&rpc);
+        let outcome = execute_turn(
+            Arc::new(Mutex::new(agent)),
+            "w1".to_string(),
+            CancellationToken::new(),
+            TurnAttribution {
+                session_key: Some("w1-test".into()),
+                agent_alias: "rpc-w1".into(),
+                model_provider: "openai.default".into(),
+                model: "w1-model".into(),
+                channel: "rpc",
+            },
+            None,
+            move |event| {
+                let rpc = Arc::clone(&rpc);
+                let cfg = Arc::clone(&cfg_for_cb);
+                async move {
+                    // Resolve model_context_window per event from the embedded
+                    // provider_ref (only Usage events carry it).
+                    let model_ctx_window = if let TurnEvent::Usage { provider_ref, .. } = &event {
+                        let cfg = cfg.read();
+                        cfg.model_provider_context_window_opt(provider_ref)
+                            .map(|v| v as u64)
+                    } else {
+                        None
+                    };
+
+                    // Forward through the real RPC boundary.
+                    forward_turn_event(&rpc, "w1-test", &event, Some(max_ctx), model_ctx_window)
+                        .await;
+                }
+            },
+        )
+        .await
+        .expect("turn should complete without deadlocking");
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed { .. }),
+            "turn must complete normally"
+        );
+
+        // Drop the rpc to close the writer channel, then await collector.
+        drop(rpc_for_drop);
+        let _ = collector.await;
+
+        // Verify the serialized frames.
+        let frames = received.lock().unwrap().clone();
+        assert!(!frames.is_empty(), "at least one frame must be forwarded");
+
+        // Parse each frame as JSON and verify the sequence:
+        // Usage → ToolCall → ToolResult → Usage → Chunk
+        let mut seen_usage_1 = false;
+        let mut seen_tool_call = false;
+        let mut seen_tool_result = false;
+        let mut seen_usage_2 = false;
+        let mut seen_chunk = false;
+
+        for frame in &frames {
+            let v: serde_json::Value = serde_json::from_str(frame)
+                .unwrap_or_else(|_| panic!("frame must be valid JSON: {}", frame));
+
+            // Verify it's a JSON-RPC notification with method "session/update".
+            assert_eq!(
+                v.get("jsonrpc").and_then(|x| x.as_str()),
+                Some("2.0"),
+                "frame must be JSON-RPC 2.0: {}",
+                frame
+            );
+            assert_eq!(
+                v.get("method").and_then(|x| x.as_str()),
+                Some("session/update"),
+                "frame must be session/update notification: {}",
+                frame
+            );
+
+            // Check the params for the specific event type.
+            if let Some(params) = v.get("params") {
+                if let Some(update_type) = params.get("type").and_then(|x| x.as_str()) {
+                    match update_type {
+                        "context_usage" => {
+                            if !seen_usage_1 {
+                                seen_usage_1 = true;
+                                assert!(
+                                    params.get("input_tokens").is_some(),
+                                    "context_usage must have input_tokens"
+                                );
+                                assert!(
+                                    params.get("max_context_tokens").is_some(),
+                                    "context_usage must have max_context_tokens"
+                                );
+                                assert!(
+                                    params.get("model_context_window").is_some(),
+                                    "context_usage must have model_context_window"
+                                );
+                            } else {
+                                seen_usage_2 = true;
+                                assert!(
+                                    params.get("input_tokens").is_some(),
+                                    "second context_usage must have input_tokens"
+                                );
+                            }
+                        }
+                        "tool_call" => {
+                            seen_tool_call = true;
+                            assert_eq!(
+                                params.get("tool_call_id").and_then(|x| x.as_str()),
+                                Some("tc-w1"),
+                                "tool_call must have correct id"
+                            );
+                            assert_eq!(
+                                params.get("name").and_then(|x| x.as_str()),
+                                Some("echo"),
+                                "tool_call must have correct name"
+                            );
+                        }
+                        "tool_result" => {
+                            seen_tool_result = true;
+                            assert_eq!(
+                                params.get("tool_call_id").and_then(|x| x.as_str()),
+                                Some("tc-w1"),
+                                "tool_result must have correct id"
+                            );
+                        }
+                        "agent_message_chunk" => {
+                            seen_chunk = true;
+                            assert!(
+                                params.get("text").is_some(),
+                                "agent_message_chunk must have text"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Assert the required sequence occurred.
+        assert!(seen_usage_1, "must see first Usage (context_usage)");
+        assert!(seen_tool_call, "must see ToolCall (tool_call)");
+        assert!(seen_tool_result, "must see ToolResult (tool_result)");
+        assert!(seen_usage_2, "must see second Usage (context_usage)");
+        assert!(seen_chunk, "must see Chunk (agent_message_chunk)");
+
+        // Verify the tool actually ran exactly once.
+        assert_eq!(
+            tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "echo tool must run exactly once between the two Usage events"
+        );
+    }
 }

@@ -903,9 +903,24 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
-/// Build the `done`-frame JSON. `model_context_window` is only included
-/// when the provider has an explicit `context_window` — absent means
-/// clients fall back to `max_context_tokens`.
+/// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
+#[derive(Debug, Clone, Default)]
+struct ProviderUsageEntry {
+    provider_ref: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    cost_usd: f64,
+}
+
+/// Build the `done`-frame JSON.
+/// `provider` is alias-only for backward compatibility;
+/// `provider_ref` carries the full `<type>.<alias>` ref.
+/// `model_context_window` is only included when the provider has an
+/// explicit `context_window` — absent means clients fall back to
+/// `max_context_tokens`. `usage_by_provider` carries per-provider
+/// breakdowns so consumers can attribute tokens/cost across switches.
 fn build_done_frame_json(
     full_response: &str,
     input_tokens: Option<u64>,
@@ -914,9 +929,13 @@ fn build_done_frame_json(
     cost_usd: Option<f64>,
     model: &str,
     provider: &str,
+    provider_ref: &str,
     max_context_tokens: u64,
     model_context_window: Option<u64>,
     last_input_tokens: Option<u64>,
+    last_serving_provider_ref: Option<&str>,
+    last_serving_model: Option<&str>,
+    usage_by_provider: &[ProviderUsageEntry],
 ) -> serde_json::Value {
     let mut done = serde_json::json!({
         "type": "done",
@@ -927,8 +946,19 @@ fn build_done_frame_json(
         "cost_usd": cost_usd,
         "model": model,
         "provider": provider,
+        "provider_ref": provider_ref,
         "max_context_tokens": max_context_tokens,
         "last_input_tokens": last_input_tokens,
+        "last_serving_provider_ref": last_serving_provider_ref,
+        "last_serving_model": last_serving_model,
+        "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
+            "provider_ref": e.provider_ref,
+            "model": e.model,
+            "input_tokens": e.input_tokens,
+            "output_tokens": e.output_tokens,
+            "cached_input_tokens": e.cached_input_tokens,
+            "cost_usd": e.cost_usd,
+        })).collect::<Vec<_>>(),
     });
     if let Some(window) = model_context_window {
         done["model_context_window"] = serde_json::Value::from(window);
@@ -1063,6 +1093,11 @@ async fn process_chat_message(
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
 
+    // Per-provider breakdown — preserves identity of every LLM call so the
+    // done frame can attribute tokens/cost across provider switches.
+    let mut usage_by_provider: std::collections::HashMap<String, ProviderUsageEntry> =
+        std::collections::HashMap::new();
+
     let forward_fut = async {
         let mut cancel_drained = false;
         loop {
@@ -1185,9 +1220,9 @@ async fn process_chat_message(
                     let ws_msg = match event {
                         TurnEvent::Usage {
                             input_tokens,
-                            cached_input_tokens: _,
+                            cached_input_tokens,
                             output_tokens,
-                            cost_usd: _,
+                            cost_usd,
                             provider_ref,
                             model: served_model,
                         } => {
@@ -1199,6 +1234,27 @@ async fn process_chat_message(
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                            }
+                            // Per-provider breakdown accumulation
+                            let entry = usage_by_provider
+                                .entry(provider_ref.clone())
+                                .or_insert_with(|| ProviderUsageEntry {
+                                    provider_ref: provider_ref.clone(),
+                                    ..Default::default()
+                                });
+                            entry.model = served_model.clone();
+                            if let Some(it) = input_tokens {
+                                entry.input_tokens = entry.input_tokens.saturating_add(it);
+                            }
+                            if let Some(ot) = output_tokens {
+                                entry.output_tokens = entry.output_tokens.saturating_add(ot);
+                            }
+                            if let Some(ct) = cached_input_tokens {
+                                entry.cached_input_tokens =
+                                    entry.cached_input_tokens.saturating_add(ct);
+                            }
+                            if let Some(cu) = cost_usd {
+                                entry.cost_usd += cu;
                             }
                             continue;
                         }
@@ -1325,14 +1381,16 @@ async fn process_chat_message(
 
         // Broadcast agent_end event
         let cancel_model = last_model.as_deref().unwrap_or(&turn_model);
-        let cancel_provider = last_provider_ref
+        let cancel_provider_alias = last_provider_ref
             .as_deref()
             .map(|r| r.split('.').next_back().unwrap_or(r))
             .unwrap_or(&provider_label);
+        let cancel_provider_ref = last_provider_ref.as_deref().unwrap_or(&provider_label);
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
-            "model_provider": cancel_provider,
+            "model_provider": cancel_provider_alias,
             "model": cancel_model,
+            "provider_ref": cancel_provider_ref,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1342,8 +1400,9 @@ async fn process_chat_message(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model_provider": cancel_provider,
+                    "model_provider": cancel_provider_alias,
                     "model": cancel_model,
+                    "provider_ref": cancel_provider_ref,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1444,6 +1503,16 @@ async fn process_chat_message(
             // Use the last served model from usage events when available so
             // the terminal metadata is one coherent tuple with the provider.
             let effective_model = last_model.as_deref().unwrap_or(&turn_model);
+            // Full provider_ref for the done frame: last served ref when
+            // available, otherwise fall back to the turn-start provider label.
+            let provider_ref_full = last_provider_ref.as_deref().unwrap_or(&provider_label);
+            // Deterministic ordering: sort by provider_ref so the wire
+            // format is stable (avoids flaky assertions in tests).
+            let usage_by_provider_vec: Vec<ProviderUsageEntry> = {
+                let mut entries: Vec<_> = usage_by_provider.into_values().collect();
+                entries.sort_by(|a, b| a.provider_ref.cmp(&b.provider_ref));
+                entries
+            };
             let done = build_done_frame_json(
                 &outcome.response,
                 total_input_tokens,
@@ -1452,9 +1521,13 @@ async fn process_chat_message(
                 cost_usd,
                 effective_model,
                 &provider_ref_label,
+                provider_ref_full,
                 max_context_tokens,
                 model_context_window,
                 last_input_tokens,
+                last_provider_ref.as_deref(),
+                last_model.as_deref(),
+                &usage_by_provider_vec,
             );
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
@@ -1468,6 +1541,7 @@ async fn process_chat_message(
                 "type": "agent_end",
                 "model_provider": provider_ref_label,
                 "model": effective_model,
+                "provider_ref": provider_ref_full,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1480,6 +1554,7 @@ async fn process_chat_message(
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_ref_label,
                         "model": effective_model,
+                        "provider_ref": provider_ref_full,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
@@ -2254,9 +2329,13 @@ mod tests {
                 Some(0.001),
                 "glm-5.2",
                 vendor,
+                provider_alias,
                 max_ctx,
                 model_ctx_window,
                 Some(100),
+                Some(provider_alias),
+                Some("glm-5.2"),
+                &[],
             );
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
 
@@ -2264,6 +2343,14 @@ mod tests {
             assert_eq!(
                 v["max_context_tokens"], expected_max_ctx,
                 "profile budget must be emitted"
+            );
+            // REQ-B2: full provider_ref present, alias-only provider unchanged
+            assert_eq!(v["provider_ref"], provider_alias);
+            assert_eq!(v["last_serving_provider_ref"], provider_alias);
+            assert_eq!(v["last_serving_model"], "glm-5.2");
+            assert!(
+                v["usage_by_provider"].as_array().unwrap().is_empty(),
+                "usage_by_provider must be empty when no Usage events accumulated"
             );
             if let Some(window) = expected_window {
                 assert_eq!(
@@ -2353,9 +2440,13 @@ mod tests {
                 Some(0.001),
                 "glm-5.2",
                 "openrouter",
+                live_provider_ref,
                 max_ctx,
                 model_ctx_window,
                 Some(100),
+                Some(live_provider_ref),
+                Some("glm-5.2"),
+                &[],
             );
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
 
@@ -2364,6 +2455,10 @@ mod tests {
                 v["model_context_window"], 1_000_000,
                 "done-frame must carry B's live window after {label}, not A's static alias window"
             );
+            // REQ-B2: full provider_ref present, alias-only provider unchanged
+            assert_eq!(v["provider_ref"], live_provider_ref);
+            assert_eq!(v["last_serving_provider_ref"], live_provider_ref);
+            assert_eq!(v["last_serving_model"], "glm-5.2");
         }
     }
 }

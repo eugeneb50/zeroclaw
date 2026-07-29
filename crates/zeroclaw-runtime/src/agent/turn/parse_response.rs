@@ -170,16 +170,22 @@ pub(crate) async fn interpret_chat_response(
         })
         .map(|(_total_tokens, cost_usd)| cost_usd);
 
+    let (input_tokens, cached_input_tokens, output_tokens) = resp
+        .usage
+        .as_ref()
+        .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
+        .unwrap_or((None, None, None));
+
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
-    if let Some(tx) = ctx.event_tx
-        && let Some(ref usage) = resp.usage
-    {
+    // Emitted unconditionally so terminal identity reflects the serving
+    // provider/model even when the provider returns no usage data.
+    if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
                 cost_usd: call_cost_usd,
                 provider_ref: effective_provider_name.to_string(),
                 model: effective_model.to_string(),

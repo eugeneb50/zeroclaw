@@ -526,10 +526,8 @@ impl RpcDispatcher {
     }
 
     async fn forward_seed_event(&self, session_id: &str, event: Option<TurnEvent>) {
-        if let Some(event) = event
-            && let Some(notification) = notification_for_turn_event(session_id, &event, None, None)
-        {
-            let _ = self.rpc.send_raw(notification).await;
+        if let Some(event) = event {
+            forward_turn_event(&self.rpc, session_id, &event, None, None).await;
         }
     }
 
@@ -1249,9 +1247,9 @@ impl RpcDispatcher {
                             .unwrap_or_default();
                             if !plan.is_empty() {
                                 self.ctx.sessions.set_plan(&session_id, plan.clone()).await;
-                                if let Some(n) = plan_replay_notification(&session_id, &plan) {
-                                    let _ = self.rpc.send_raw(n).await;
-                                }
+                                let event = TurnEvent::Plan { entries: plan };
+                                forward_turn_event(&self.rpc, &session_id, &event, None, None)
+                                    .await;
                             }
                         }
                     }
@@ -1807,11 +1805,7 @@ impl RpcDispatcher {
                     } else {
                         None
                     };
-                    if let Some(n) =
-                        notification_for_turn_event(&sid, &event, max_ctx, model_ctx_window)
-                    {
-                        let _ = rpc.send_raw(n).await;
-                    }
+                    forward_turn_event(&rpc, &sid, &event, max_ctx, model_ctx_window).await;
                 }
             },
         )
@@ -4706,19 +4700,6 @@ async fn persist_plan_if_any(
     }
 }
 
-fn plan_replay_notification(
-    session_id: &str,
-    entries: &[zeroclaw_api::plan::PlanEntry],
-) -> Option<String> {
-    if entries.is_empty() {
-        return None;
-    }
-    let event = TurnEvent::Plan {
-        entries: entries.to_vec(),
-    };
-    notification_for_turn_event(session_id, &event, None, None)
-}
-
 fn notification_for_turn_event(
     session_id: &str,
     event: &TurnEvent,
@@ -4796,6 +4777,29 @@ fn notification_for_turn_event(
     let params = serde_json::to_value(update).ok()?;
     let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
     serde_json::to_string(&n).ok()
+}
+
+/// Forward a turn event through the outbound RPC writer as a
+/// serialized `session/update` notification.
+///
+/// Returns `true` when the event type maps to a notification and the
+/// send succeeded. Returns `false` when the event type is not forwarded
+/// (e.g. silent variants) or the writer channel is closed.
+///
+/// The caller is responsible for any pre-send side effects (ACP token
+/// persistence, plan persistence). This helper is the single forward
+/// path used by both production dispatch and regression tests.
+pub(super) async fn forward_turn_event(
+    rpc: &RpcOutbound,
+    session_id: &str,
+    event: &TurnEvent,
+    max_context_tokens: Option<u64>,
+    model_context_window: Option<u64>,
+) -> bool {
+    match notification_for_turn_event(session_id, event, max_context_tokens, model_context_window) {
+        Some(n) => rpc.send_raw(n).await,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -6483,17 +6487,16 @@ mod tests {
             priority: PlanPriority::Medium,
             active_form: None,
         }];
-        let json = plan_replay_notification("sess-9", &entries).expect("nonempty plan replays");
+        let event = TurnEvent::Plan {
+            entries: entries.clone(),
+        };
+        let json = notification_for_turn_event("sess-9", &event, None, None)
+            .expect("nonempty plan should serialize as notification");
         let v = parse(&json);
         assert_eq!(v["method"], "session/update");
         assert_eq!(v["params"]["type"], "plan");
         assert_eq!(v["params"]["session_id"], "sess-9");
         assert_eq!(v["params"]["entries"][0]["content"], "Resume me");
-    }
-
-    #[test]
-    fn resume_plan_notification_absent_for_empty_plan() {
-        assert!(plan_replay_notification("sess-9", &[]).is_none());
     }
 
     async fn store_with_one_session(sid: &str) -> Arc<crate::rpc::session::SessionStore> {

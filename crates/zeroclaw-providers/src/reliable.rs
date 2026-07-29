@@ -30,34 +30,12 @@ tokio::task_local! {
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
-/// Returns `None` when called outside a `scope_provider_fallback` scope
-/// (the fallback cell is opt-in telemetry; production paths that don't
-/// scope it simply observe no fallback).
+/// Must be called within a `scope_provider_fallback` scope.
 pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
     PROVIDER_FALLBACK
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
         .flatten()
-}
-
-/// Peek (non-consuming read) the last model_provider fallback info, if any.
-/// Used by the turn loop to update `serving_provider_name` / `serving_model`
-/// before the `Usage` event is emitted, without consuming the record that
-/// `take_last_provider_fallback` will read after the round completes.
-/// Returns `None` when called outside a `scope_provider_fallback` scope.
-pub fn peek_last_provider_fallback() -> Option<ProviderFallbackInfo> {
-    PROVIDER_FALLBACK
-        .try_with(|cell| cell.borrow().clone())
-        .ok()
-        .flatten()
-}
-
-/// Clear the per-iteration fallback cell so the next `call_provider` starts
-/// fresh. No-ops outside a `scope_provider_fallback` scope.
-pub fn clear_last_provider_fallback() {
-    let _ = PROVIDER_FALLBACK.try_with(|cell| {
-        *cell.borrow_mut() = None;
-    });
 }
 
 /// Run the given future within a provider-fallback scope.
@@ -2195,42 +2173,6 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
             None => &self.alias,
         }
     }
-}
-
-/// Build a [`ReliableModelProvider`] with a direct primary and a pinned
-/// fallback, without requiring the caller to depend on internal entry
-/// types. Only compiled when the `test-helpers` feature is active.
-#[cfg(feature = "test-helpers")]
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub fn for_test_reliable_with_pinned_fallback(
-    alias: &str,
-    primary_name: &str,
-    primary_cooldown_key: &str,
-    primary_provider: Box<dyn ModelProvider>,
-    fallback_name: &str,
-    fallback_cooldown_key: &str,
-    fallback_alias: &str,
-    fallback_model: &str,
-    fallback_provider: Box<dyn ModelProvider>,
-    max_retries: u32,
-    base_backoff_ms: u64,
-) -> Box<dyn ModelProvider> {
-    Box::new(ReliableModelProvider::new_with_entries(
-        alias,
-        vec![
-            ReliableModelProviderEntry::new(primary_name, primary_cooldown_key, primary_provider),
-            ReliableModelProviderEntry::new_pinned(
-                fallback_name,
-                fallback_cooldown_key,
-                fallback_alias,
-                fallback_model,
-                fallback_provider,
-            ),
-        ],
-        max_retries,
-        base_backoff_ms,
-    ))
 }
 
 #[cfg(test)]
@@ -5266,30 +5208,6 @@ mod tests {
 
             // Second take should be None.
             assert!(take_last_provider_fallback().is_none());
-
-            // Regression: `clear_last_provider_fallback` must wipe a stale
-            // record so `peek_last_provider_fallback` returns `None` on the
-            // next iteration. Without this, a fallback recorded in iteration
-            // N-1 would leak into iteration N's `Usage.provider_ref` /
-            // `serving_model` even when iteration N succeeded with the
-            // primary provider — resolving the wrong context window and
-            // attributing cost to the wrong provider.
-            //
-            // Re-record a fallback then clear it to prove the cell is wiped.
-            let _ = model_provider
-                .simple_chat("hi", "test-model", Some(0.0))
-                .await
-                .unwrap();
-            assert!(
-                peek_last_provider_fallback().is_some(),
-                "iteration N-1 must have re-recorded a fallback"
-            );
-            clear_last_provider_fallback();
-            assert!(
-                peek_last_provider_fallback().is_none(),
-                "after clear, the per-iteration cell must be empty — stale \
-                 N-1 record would leak into iteration N"
-            );
         })
         .await;
     }
@@ -5603,35 +5521,5 @@ mod tests {
             "ReliableModelProvider must not surface as model_provider_type=reliable",
         );
         zeroclaw_log::clear_broadcast_hook();
-    }
-
-    /// Regression: `clear_last_provider_fallback` wipes the per-iteration
-    /// cell so a stale fallback recorded in iteration N-1 doesn't leak
-    /// into iteration N's `Usage.provider_ref` / `serving_model` resolution.
-    #[tokio::test]
-    async fn clear_last_provider_fallback_wipes_stale_record() {
-        scope_provider_fallback(async {
-            // Record a fallback (iteration N-1)
-            record_provider_fallback(
-                "iter-n-1-provider",
-                "iter-n-1-model",
-                "actual-provider",
-                "actual-model",
-            );
-            assert!(
-                peek_last_provider_fallback().is_some(),
-                "fallback must be recorded"
-            );
-
-            // Clear it (top of iteration N)
-            clear_last_provider_fallback();
-
-            // Peek must now return None — no stale leak
-            assert!(
-                peek_last_provider_fallback().is_none(),
-                "after clear, peek must return None — stale N-1 record would leak into iteration N"
-            );
-        })
-        .await;
     }
 }

@@ -914,43 +914,46 @@ struct ProviderUsageEntry {
     cost_usd: f64,
 }
 
-/// Build the `done`-frame JSON.
-/// `provider` is alias-only for backward compatibility;
-/// `provider_ref` carries the full `<type>.<alias>` ref.
-/// `model_context_window` is only included when the provider has an
-/// explicit `context_window` — absent means clients fall back to
-/// `max_context_tokens`. `usage_by_provider` carries per-provider
-/// breakdowns so consumers can attribute tokens/cost across switches.
-fn build_done_frame_json(
-    full_response: &str,
+/// Scalar inputs to build a done-frame JSON.
+/// `usage_by_provider` is kept as a separate arg (different concern).
+#[derive(Debug, Clone)]
+struct DoneFrameMeta<'a> {
+    full_response: &'a str,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     tokens_used: Option<u64>,
     cost_usd: Option<f64>,
-    model: &str,
-    provider: &str,
-    provider_ref: &str,
+    model: &'a str,
+    provider: &'a str,
+    provider_ref: &'a str,
     max_context_tokens: u64,
     model_context_window: Option<u64>,
     last_input_tokens: Option<u64>,
-    last_serving_provider_ref: Option<&str>,
-    last_serving_model: Option<&str>,
+    last_serving_provider_ref: Option<&'a str>,
+    last_serving_model: Option<&'a str>,
+}
+
+/// Build the `done`-frame JSON.
+/// `provider` is alias-only for backward compatibility;
+/// `provider_ref` carries the full `<type>.<alias>` ref.
+fn build_done_frame_json(
+    meta: &DoneFrameMeta,
     usage_by_provider: &[ProviderUsageEntry],
 ) -> serde_json::Value {
     let mut done = serde_json::json!({
         "type": "done",
-        "full_response": full_response,
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-        "tokens_used": tokens_used,
-        "cost_usd": cost_usd,
-        "model": model,
-        "provider": provider,
-        "provider_ref": provider_ref,
-        "max_context_tokens": max_context_tokens,
-        "last_input_tokens": last_input_tokens,
-        "last_serving_provider_ref": last_serving_provider_ref,
-        "last_serving_model": last_serving_model,
+        "full_response": meta.full_response,
+        "input_tokens": meta.input_tokens,
+        "output_tokens": meta.output_tokens,
+        "tokens_used": meta.tokens_used,
+        "cost_usd": meta.cost_usd,
+        "model": meta.model,
+        "provider": meta.provider,
+        "provider_ref": meta.provider_ref,
+        "max_context_tokens": meta.max_context_tokens,
+        "last_input_tokens": meta.last_input_tokens,
+        "last_serving_provider_ref": meta.last_serving_provider_ref,
+        "last_serving_model": meta.last_serving_model,
         "usage_by_provider": usage_by_provider.iter().map(|e| serde_json::json!({
             "provider_ref": e.provider_ref,
             "model": e.model,
@@ -960,7 +963,7 @@ fn build_done_frame_json(
             "cost_usd": e.cost_usd,
         })).collect::<Vec<_>>(),
     });
-    if let Some(window) = model_context_window {
+    if let Some(window) = meta.model_context_window {
         done["model_context_window"] = serde_json::Value::from(window);
     }
     done
@@ -1513,22 +1516,22 @@ async fn process_chat_message(
                 entries.sort_by(|a, b| a.provider_ref.cmp(&b.provider_ref));
                 entries
             };
-            let done = build_done_frame_json(
-                &outcome.response,
-                total_input_tokens,
-                total_output_tokens,
-                total_tokens,
+            let meta = DoneFrameMeta {
+                full_response: &outcome.response,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+                tokens_used: total_tokens,
                 cost_usd,
-                effective_model,
-                &provider_ref_label,
-                provider_ref_full,
+                model: effective_model,
+                provider: &provider_ref_label,
+                provider_ref: provider_ref_full,
                 max_context_tokens,
                 model_context_window,
                 last_input_tokens,
-                last_provider_ref.as_deref(),
-                last_model.as_deref(),
-                &usage_by_provider_vec,
-            );
+                last_serving_provider_ref: last_provider_ref.as_deref(),
+                last_serving_model: last_model.as_deref(),
+            };
+            let done = build_done_frame_json(&meta, &usage_by_provider_vec);
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Set session state to idle
@@ -2321,22 +2324,22 @@ mod tests {
                 "model_provider_context_window_opt({provider_alias}) must return {expected_window:?}"
             );
 
-            let done = build_done_frame_json(
-                "ok",
-                Some(100),
-                Some(50),
-                Some(150),
-                Some(0.001),
-                "glm-5.2",
-                vendor,
-                provider_alias,
-                max_ctx,
-                model_ctx_window,
-                Some(100),
-                Some(provider_alias),
-                Some("glm-5.2"),
-                &[],
-            );
+            let meta = DoneFrameMeta {
+                full_response: "ok",
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                tokens_used: Some(150),
+                cost_usd: Some(0.001),
+                model: "glm-5.2",
+                provider: vendor,
+                provider_ref: provider_alias,
+                max_context_tokens: max_ctx,
+                model_context_window: model_ctx_window,
+                last_input_tokens: Some(100),
+                last_serving_provider_ref: Some(provider_alias),
+                last_serving_model: Some("glm-5.2"),
+            };
+            let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
 
             assert_eq!(v["type"], "done");
@@ -2432,22 +2435,22 @@ mod tests {
             );
 
             let max_ctx = cfg.effective_max_context_tokens("coder") as u64;
-            let done = build_done_frame_json(
-                "ok",
-                Some(100),
-                Some(50),
-                Some(150),
-                Some(0.001),
-                "glm-5.2",
-                "openrouter",
-                live_provider_ref,
-                max_ctx,
-                model_ctx_window,
-                Some(100),
-                Some(live_provider_ref),
-                Some("glm-5.2"),
-                &[],
-            );
+            let meta = DoneFrameMeta {
+                full_response: "ok",
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                tokens_used: Some(150),
+                cost_usd: Some(0.001),
+                model: "glm-5.2",
+                provider: "openrouter",
+                provider_ref: live_provider_ref,
+                max_context_tokens: max_ctx,
+                model_context_window: model_ctx_window,
+                last_input_tokens: Some(100),
+                last_serving_provider_ref: Some(live_provider_ref),
+                last_serving_model: Some("glm-5.2"),
+            };
+            let done = build_done_frame_json(&meta, &[]);
             let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
 
             assert_eq!(v["type"], "done");

@@ -1281,62 +1281,62 @@ mod tests {
             );
 
             // Check the params for the specific event type.
-            if let Some(params) = v.get("params") {
-                if let Some(update_type) = params.get("type").and_then(|x| x.as_str()) {
-                    match update_type {
-                        "context_usage" => {
-                            if !seen_usage_1 {
-                                seen_usage_1 = true;
-                                assert!(
-                                    params.get("input_tokens").is_some(),
-                                    "context_usage must have input_tokens"
-                                );
-                                assert!(
-                                    params.get("max_context_tokens").is_some(),
-                                    "context_usage must have max_context_tokens"
-                                );
-                                assert!(
-                                    params.get("model_context_window").is_some(),
-                                    "context_usage must have model_context_window"
-                                );
-                            } else {
-                                seen_usage_2 = true;
-                                assert!(
-                                    params.get("input_tokens").is_some(),
-                                    "second context_usage must have input_tokens"
-                                );
-                            }
-                        }
-                        "tool_call" => {
-                            seen_tool_call = true;
-                            assert_eq!(
-                                params.get("tool_call_id").and_then(|x| x.as_str()),
-                                Some("tc-w1"),
-                                "tool_call must have correct id"
-                            );
-                            assert_eq!(
-                                params.get("name").and_then(|x| x.as_str()),
-                                Some("echo"),
-                                "tool_call must have correct name"
-                            );
-                        }
-                        "tool_result" => {
-                            seen_tool_result = true;
-                            assert_eq!(
-                                params.get("tool_call_id").and_then(|x| x.as_str()),
-                                Some("tc-w1"),
-                                "tool_result must have correct id"
-                            );
-                        }
-                        "agent_message_chunk" => {
-                            seen_chunk = true;
+            if let Some(params) = v.get("params")
+                && let Some(update_type) = params.get("type").and_then(|x| x.as_str())
+            {
+                match update_type {
+                    "context_usage" => {
+                        if !seen_usage_1 {
+                            seen_usage_1 = true;
                             assert!(
-                                params.get("text").is_some(),
-                                "agent_message_chunk must have text"
+                                params.get("input_tokens").is_some(),
+                                "context_usage must have input_tokens"
+                            );
+                            assert!(
+                                params.get("max_context_tokens").is_some(),
+                                "context_usage must have max_context_tokens"
+                            );
+                            assert!(
+                                params.get("model_context_window").is_some(),
+                                "context_usage must have model_context_window"
+                            );
+                        } else {
+                            seen_usage_2 = true;
+                            assert!(
+                                params.get("input_tokens").is_some(),
+                                "second context_usage must have input_tokens"
                             );
                         }
-                        _ => {}
                     }
+                    "tool_call" => {
+                        seen_tool_call = true;
+                        assert_eq!(
+                            params.get("tool_call_id").and_then(|x| x.as_str()),
+                            Some("tc-w1"),
+                            "tool_call must have correct id"
+                        );
+                        assert_eq!(
+                            params.get("name").and_then(|x| x.as_str()),
+                            Some("echo"),
+                            "tool_call must have correct name"
+                        );
+                    }
+                    "tool_result" => {
+                        seen_tool_result = true;
+                        assert_eq!(
+                            params.get("tool_call_id").and_then(|x| x.as_str()),
+                            Some("tc-w1"),
+                            "tool_result must have correct id"
+                        );
+                    }
+                    "agent_message_chunk" => {
+                        seen_chunk = true;
+                        assert!(
+                            params.get("text").is_some(),
+                            "agent_message_chunk must have text"
+                        );
+                    }
+                    _ => {}
                 }
             }
         }

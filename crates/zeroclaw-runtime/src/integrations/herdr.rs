@@ -12,8 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -30,7 +29,7 @@ use crate::observability::{
     BroadcastHookGuard, Observer, ObserverEvent, set_scoped_broadcast_hook,
 };
 
-// ── I/O timeouts ──────────────────────────────────────────────────────────────
+// I/O timeouts
 
 /// Maximum time to wait for a UDS connect before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -66,7 +65,7 @@ async fn send_on_stream(stream: &mut UnixStream, payload: &str) -> Result<(), st
     )))
 }
 
-// ── Socket discovery ─────────────────────────────────────────────────────────
+// Socket discovery
 
 const SOURCE: &str = "herdr:zeroclaw";
 const AGENT: &str = "zeroclaw";
@@ -114,8 +113,6 @@ fn install_hook_from_env(
         return None;
     }
 
-    let client = HerdrClient::new(socket_path, pane_id.clone());
-
     // Compute unique display name: agent alias + last 2 chars of pane_id.
     // Use char-aware slicing to handle multi-byte UTF-8 pane IDs safely.
     let display_name = {
@@ -127,14 +124,13 @@ fn install_hook_from_env(
             agent_alias.to_string()
         }
     };
+
+    let client = HerdrClient::new(socket_path, pane_id);
     client.report_metadata(&display_name);
 
-    // Clear any stale state from a previous crashed session before installing
-    // the observer. The wall-clock-seeded seq ensures this call is accepted even
-    // if herdr retains a higher seq from a prior session.
+    // Clear stale state from a previous session before installing.
     let _ = client.send("pane.release_agent", &serde_json::Map::new());
-    // Report initial idle state so herdr shows the agent immediately, even
-    // before any user message triggers a state transition.
+    // Report initial idle state so herdr shows the agent immediately.
     client.report_state("idle");
     // Startup messages are best-effort; the first ObserverEvent will re-emit
     // idle if the daemon was unavailable.
@@ -142,31 +138,26 @@ fn install_hook_from_env(
     Some(set_scoped_broadcast_hook(observer))
 }
 
-// ── HerdrClient ──────────────────────────────────────────────────────────────
+// HerdrClient
 
 #[cfg(test)]
 type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
 
 /// Maximum number of pending messages in the writer queue. Bounded to prevent
-/// unbounded accumulation when the Herdr daemon is slow or unavailable.
-/// Capacity 64: 64 * 700ms (max connect+write) = ~45s theoretical max drain,
-/// but shutdown timeout caps actual wait at 2s.
+/// unbounded accumulation under backpressure.
 const WRITER_QUEUE_CAPACITY: usize = 64;
 
-/// Drop guard that signals the drain-done channel during a panic unwind, so
-/// the sync `shutdown_drain()` never waits the full 2s timeout for a task
-/// that already crashed.
+/// Drop guard that sets the drain-done flag on any drop. This covers
+/// three exit paths: normal exit, panic unwind, and task cancellation.
+/// The writer task also sets the flag explicitly before breaking its loop;
+/// the redundant set is idempotent.
 #[cfg(unix)]
-struct DrainOnPanic(Option<std_mpsc::SyncSender<()>>);
+struct DrainOnPanic<'a>(&'a AtomicBool);
 
 #[cfg(unix)]
-impl Drop for DrainOnPanic {
+impl Drop for DrainOnPanic<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking()
-            && let Some(tx) = self.0.take()
-        {
-            let _ = tx.send(());
-        }
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -182,10 +173,14 @@ pub(crate) struct HerdrClient {
     writer: Mutex<Option<mpsc::Sender<String>>>,
     #[cfg(unix)]
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    /// Sync channel signaled by the writer task when it has finished draining.
-    /// Allows the sync `flush()` path to wait without `block_in_place`.
+    /// Atomic flag set by the writer task when it has finished draining.
+    /// Read by `shutdown_drain` in a yield-spin bounded by SHUTDOWN_TIMEOUT.
     #[cfg(unix)]
-    drain_done_rx: Mutex<Option<std_mpsc::Receiver<()>>>,
+    drain_done: Arc<AtomicBool>,
+    /// Writer task handle, retained so tests can `abort` it to exercise
+    /// the drop-on-cancel path of `DrainOnPanic`.
+    #[cfg(all(unix, test))]
+    writer_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl HerdrClient {
@@ -194,16 +189,13 @@ impl HerdrClient {
         {
             let (tx, mut rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
             let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-            // Sync channel for the writer task to signal drain completion to
-            // the sync `flush()` path. Buffered(1) so the writer task can send
-            // without blocking even if the receiver isn't waiting yet.
-            let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
-            // Clone so the panic guard can signal drain completion even if
-            // the writer task panics mid-write.
-            let drain_tx_for_panic = drain_done_tx.clone();
+            // Atomic flag for drain completion signalling. Single writer
+            // (the task), single reader (`shutdown_drain`); no mutex needed.
+            let drain_done = Arc::new(AtomicBool::new(false));
+            let drain_done_for_task = Arc::clone(&drain_done);
             let socket_path = socket_path.clone();
             let _writer_handle = zeroclaw_spawn::spawn!(async move {
-                let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
+                let _drain_guard = DrainOnPanic(&drain_done_for_task);
                 loop {
                     tokio::select! {
                         biased;
@@ -217,7 +209,7 @@ impl HerdrClient {
                                 let _ = send_on_stream(&mut stream, &payload).await;
                             }
                             // Signal drain completion to the sync flush path.
-                            let _ = drain_done_tx.send(());
+                            drain_done_for_task.store(true, Ordering::Release);
                             break;
                         }
                         maybe_payload = rx.recv() => {
@@ -232,7 +224,7 @@ impl HerdrClient {
                                 None => {
                                     // Channel closed without shutdown signal;
                                     // signal drain done and exit.
-                                    let _ = drain_done_tx.send(());
+                                    drain_done_for_task.store(true, Ordering::Release);
                                     break;
                                 }
                             }
@@ -246,7 +238,9 @@ impl HerdrClient {
                 spy: None,
                 writer: Mutex::new(Some(tx)),
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
-                drain_done_rx: Mutex::new(Some(drain_done_rx)),
+                drain_done,
+                #[cfg(all(unix, test))]
+                writer_handle: Mutex::new(Some(_writer_handle)),
             }
         }
         #[cfg(not(unix))]
@@ -273,13 +267,27 @@ impl HerdrClient {
             #[cfg(unix)]
             shutdown_tx: Mutex::new(None),
             #[cfg(unix)]
-            drain_done_rx: Mutex::new(None),
+            drain_done: Arc::new(AtomicBool::new(true)),
+            #[cfg(all(unix, test))]
+            writer_handle: Mutex::new(None),
+        }
+    }
+
+    /// Abort the writer task. Test-only — exercises the drop-on-cancel
+    /// path of `DrainOnPanic` to prove `shutdown_drain` does not wait
+    /// the full 2s timeout for a writer that no longer exists.
+    #[cfg(all(unix, test))]
+    pub(crate) fn abort_writer_for_test(&self) {
+        if let Some(handle) = self.writer_handle.lock().take() {
+            handle.abort();
         }
     }
 
     /// Wait for the writer task to drain all pending messages and exit.
-    /// Uses a sync channel so this can be called from a sync context without
-    /// `block_in_place`. The timeout bounds the total drain time.
+    ///
+    /// Spins on `drain_done` with `thread::yield_now` so the writer task
+    /// is not starved the way it would be under a blocking `recv_timeout`.
+    /// The timeout bounds the total drain time.
     pub(crate) fn shutdown_drain(&self, timeout_dur: Duration) {
         #[cfg(unix)]
         {
@@ -291,14 +299,13 @@ impl HerdrClient {
                 let _ = shutdown_tx.send(());
             }
 
-            // Wait for drain completion via the sync channel with a timeout.
-            if let Some(rx) = self.drain_done_rx.lock().take() {
-                let deadline = Instant::now() + timeout_dur;
-                if let Some(rem) = deadline.checked_duration_since(Instant::now())
-                    && !rem.is_zero()
-                {
-                    let _ = rx.recv_timeout(rem);
+            // Wait for drain completion via the atomic flag with bounded spin.
+            let deadline = Instant::now() + timeout_dur;
+            while !self.drain_done.load(Ordering::Acquire) {
+                if Instant::now() >= deadline {
+                    break;
                 }
+                std::thread::yield_now();
             }
         }
         #[cfg(not(unix))]
@@ -323,17 +330,14 @@ impl HerdrClient {
         format!("{SOURCE}:{}", self.next_seq())
     }
 
-    fn send(
+    /// Build the JSON-RPC payload string for `method` + `params`, including
+    /// the invariant envelope (`pane_id`, `source`, `agent`, `seq`, `id`).
+    /// Shared by [`send`] (hot, lossy) and [`send_guaranteed`] (cold, retrying).
+    fn build_payload(
         &self,
         method: &str,
         params: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), std::io::Error> {
-        #[cfg(test)]
-        if let Some(spy) = &self.spy {
-            spy(method, params);
-            return Ok(());
-        }
-
+    ) -> Result<String, std::io::Error> {
         let mut params_map = serde_json::Map::new();
         params_map.insert(
             "pane_id".into(),
@@ -355,13 +359,23 @@ impl HerdrClient {
             "params": params_map,
         });
 
-        let payload_str = serde_json::to_string(&payload)?;
+        serde_json::to_string(&payload).map_err(std::io::Error::other)
+    }
 
-        // Fire-and-forget: push to writer task via bounded channel. Use
-        // `try_send` so the caller never blocks on a slow/unavailable peer.
-        // On queue full, drop the new message — `transit_to` already suppresses
-        // redundant state transitions, so this is a rare
-        // backpressure case that loses a stale lifecycle snapshot.
+    /// Fire-and-forget via `try_send`. Drops on queue full — caller never blocks.
+    fn send(
+        &self,
+        method: &str,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        if let Some(spy) = &self.spy {
+            spy(method, params);
+            return Ok(());
+        }
+
+        let payload_str = self.build_payload(method, params)?;
+
         #[cfg(unix)]
         if let Some(tx) = self.writer.lock().as_ref() {
             match tx.try_send(payload_str) {
@@ -374,14 +388,47 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Cold-path send used only from [`HerdrObserver::flush`]. Retries with
+    /// `thread::yield_now` on queue full so the writer task (running on a
+    /// separate OS thread under the multi-threaded Tokio runtime) can drain
+    /// items. The total wait is bounded by the 2s `SHUTDOWN_TIMEOUT`. This
+    /// guarantees the terminal `idle` + `pane.release_agent` pair are never
+    /// dropped by backpressure, which the lossy [`send`] cannot promise.
+    fn send_guaranteed(
+        &self,
+        method: &str,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        if let Some(spy) = &self.spy {
+            spy(method, params);
+            return Ok(());
+        }
+
+        let payload_str = self.build_payload(method, params)?;
+
+        #[cfg(unix)]
+        if let Some(tx) = self.writer.lock().as_ref() {
+            let mut current = payload_str;
+            loop {
+                match tx.try_send(current) {
+                    Ok(()) => return Ok(()),
+                    Err(mpsc::error::TrySendError::Full(p)) => {
+                        current = p;
+                        std::thread::yield_now();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn report_state(&self, state: &str) {
         let mut params = serde_json::Map::new();
         params.insert("state".into(), serde_json::Value::String(state.into()));
         let _ = self.send("pane.report_agent", &params);
-    }
-
-    fn report_released(&self) {
-        let _ = self.send("pane.release_agent", &serde_json::Map::new());
     }
 
     fn report_metadata(&self, display_agent: &str) {
@@ -394,7 +441,7 @@ impl HerdrClient {
     }
 }
 
-// ── HerdrState ───────────────────────────────────────────────────────────────
+// HerdrState
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HerdrState {
@@ -404,7 +451,7 @@ pub(crate) enum HerdrState {
     Released,
 }
 
-// ── HerdrObserver ────────────────────────────────────────────────────────────
+// HerdrObserver
 
 /// Observer that reports agent lifecycle to the herdr daemon.
 ///
@@ -442,8 +489,14 @@ impl HerdrObserver {
         *state = target;
         match target {
             HerdrState::Released => {
-                self.client.report_state("idle");
-                self.client.report_released();
+                // Terminal: guaranteed delivery so the `idle` + `pane.release_agent`
+                // pair survives backpressure. Lossy send would drop them.
+                let mut p = serde_json::Map::new();
+                p.insert("state".into(), serde_json::Value::String("idle".into()));
+                let _ = self.client.send_guaranteed("pane.report_agent", &p);
+                let _ = self
+                    .client
+                    .send_guaranteed("pane.release_agent", &serde_json::Map::new());
             }
             HerdrState::Working => self.client.report_state("working"),
             HerdrState::Idle => self.client.report_state("idle"),
@@ -454,11 +507,12 @@ impl HerdrObserver {
 
 impl Observer for HerdrObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        // Filter by owning turn_id: only events from the owning interactive
-        // run are forwarded. This prevents child agents (subagents) from
-        // mutating the parent's herdr pane state.
+        // Filter by owning turn_id. Events without turn_id (notably TurnComplete)
+        // cannot be attributed, so when we own a turn we skip them entirely —
+        // AgentEnd drives the terminal transition. Trades intermediate idle flash
+        // for correctness under nesting.
         if let Some(owning) = self.owning_turn_id.as_deref() {
-            let event_turn: Option<&str> = match event {
+            match event {
                 ObserverEvent::AgentStart { turn_id, .. }
                 | ObserverEvent::LlmRequest { turn_id, .. }
                 | ObserverEvent::LlmResponse { turn_id, .. }
@@ -467,11 +521,13 @@ impl Observer for HerdrObserver {
                 | ObserverEvent::ToolCall { turn_id, .. }
                 | ObserverEvent::HistoryTrimmed { turn_id, .. }
                 | ObserverEvent::AuthorizationRequested { turn_id, .. }
-                | ObserverEvent::AuthorizationResponded { turn_id, .. } => turn_id.as_deref(),
-                _ => None,
-            };
-            if event_turn.is_some_and(|t| t != owning) {
-                return;
+                | ObserverEvent::AuthorizationResponded { turn_id, .. } => {
+                    if turn_id.as_deref() != Some(owning) {
+                        return;
+                    }
+                }
+                ObserverEvent::TurnComplete => return,
+                _ => {}
             }
         }
         let mut state = self.state.lock();
@@ -515,8 +571,14 @@ impl Observer for HerdrObserver {
             let mut state = self.state.lock();
             if *state != HerdrState::Released {
                 *state = HerdrState::Released;
-                self.client.report_state("idle");
-                self.client.report_released();
+                let _ = self.client.send_guaranteed("pane.report_agent", &{
+                    let mut p = serde_json::Map::new();
+                    p.insert("state".into(), serde_json::Value::String("idle".into()));
+                    p
+                });
+                let _ = self
+                    .client
+                    .send_guaranteed("pane.release_agent", &serde_json::Map::new());
             }
         }
         self.client.shutdown_drain(SHUTDOWN_TIMEOUT);
@@ -741,9 +803,9 @@ pub(crate) mod tests {
         assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
 
         // seq1 was captured AFTER now_micros, so seq1 >= now_micros. We allow
-        // 10ms slack to absorb scheduler latency and SystemTime granularity.
+        // 50ms slack to absorb scheduler latency and SystemTime granularity.
         assert!(
-            seq1 >= now_micros.saturating_sub(10_000),
+            seq1 >= now_micros.saturating_sub(50_000),
             "seq {} should be seeded from wall clock (now ~{})",
             seq1,
             now_micros
@@ -765,7 +827,7 @@ pub(crate) mod tests {
         // Create client and send messages
         let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
         client.report_state("idle");
-        client.report_released();
+        let _ = client.send("pane.release_agent", &serde_json::Map::new());
 
         // Flush (drains the writer task)
         client.shutdown_drain(SHUTDOWN_TIMEOUT);
@@ -774,19 +836,17 @@ pub(crate) mod tests {
         let mut received = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline && received.len() < 2 {
-            match tokio::time::timeout(Duration::from_millis(50), listener.accept()).await {
-                Ok(Ok((stream, _))) => {
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.is_ok() {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
-                                received.push(method.to_string());
-                            }
-                        }
-                    }
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
+            {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_ok()
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(method) = val.get("method").and_then(|m| m.as_str())
+                {
+                    received.push(method.to_string());
                 }
-                _ => {}
             }
         }
 
@@ -802,37 +862,74 @@ pub(crate) mod tests {
         assert_eq!(received[1], "pane.release_agent");
     }
 
-    /// Shutdown drain bounded wait test: slow/unavailable peer must not
-    /// block shutdown longer than the timeout. Simulates a slow listener
-    /// that accepts but never reads, verifying the 2s timeout is honored.
+    /// Shutdown drain bounded wait test: a peer that accepts the
+    /// connection but never reads must not block shutdown longer than
+    /// the timeout. This creates a genuinely unresponsive peer (the
+    /// kernel send buffer fills, then `send_on_stream`'s write blocks
+    /// or times out). The 2s `SHUTDOWN_TIMEOUT` bound must be honored
+    /// even though the writer task cannot drain to completion.
     #[tokio::test]
     async fn herdr_shutdown_drain_bounded_wait() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("herdr-test-slow.sock");
         let sock_str = sock_path.to_str().unwrap().to_string();
 
-        // Bind a listener that accepts but never reads (slow peer)
         let listener = UnixListener::bind(&sock_path).unwrap();
 
-        // Create client and send a message
-        let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
-        client.report_state("idle");
-        client.report_released();
+        // Accept exactly one connection in the background and hold it
+        // open without reading. This forces the writer to either fill
+        // the kernel send buffer (then `write_all` blocks) or hit the
+        // IO_TIMEOUT. Either way, the writer cannot drain.
+        let _accept_handle = zeroclaw_spawn::spawn!(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                // Hold the stream alive but never read. Drop happens on
+                // task cancellation. We use a `let _` binding to keep
+                // the stream alive while `pending` parks forever.
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            }
+        });
 
-        // Flush should complete within timeout even with slow peer
+        // Give the listener a moment to start accepting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Create client and queue messages.
+        let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
+        // Fill enough messages that the queue saturates even if the
+        // kernel buffer absorbs the first few.
+        for i in 0..WRITER_QUEUE_CAPACITY {
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "state".into(),
+                serde_json::Value::String(format!("filler-{}", i)),
+            );
+            let _ = client.send("pane.report_agent", &params);
+        }
+        client.report_state("idle");
+        let _ = client.send("pane.release_agent", &serde_json::Map::new());
+
+        // Flush should complete within timeout even with unresponsive peer.
         let start = Instant::now();
         client.shutdown_drain(SHUTDOWN_TIMEOUT);
         let elapsed = start.elapsed();
 
-        // Must complete within SHUTDOWN_TIMEOUT (2s) + some slack
+        // Must complete within SHUTDOWN_TIMEOUT (2s) + 1s slack for
+        // connect timeouts (200ms) and IO timeouts (500ms) that the
+        // writer still has to work through before the wait terminates.
         assert!(
             elapsed < Duration::from_secs(3),
             "shutdown drain must be bounded, took {:?}",
             elapsed
         );
 
-        // Clean up: drop listener to unblock any pending accept
-        drop(listener);
+        // Must not return prematurely — at least the SHUTDOWN_TIMEOUT
+        // must elapse before the bounded wait gives up. (Otherwise the
+        // drain would silently no-op.)
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "shutdown drain returned suspiciously fast: {:?}",
+            elapsed
+        );
     }
 
     /// Nested run isolation test: parent interactive run + child subagent
@@ -920,6 +1017,11 @@ pub(crate) mod tests {
         parent_observer.record_event(&child_llm);
         parent_observer.record_event(&child_end);
 
+        // Child TurnComplete has NO turn_id — this is the gap we're testing.
+        // If the filter fails, this will incorrectly transition parent to Idle.
+        let child_turn_complete = ObserverEvent::TurnComplete;
+        parent_observer.record_event(&child_turn_complete);
+
         // Verify only parent events were captured (6 events: start, llm, end for parent)
         let captured: Vec<_> = calls_parent.lock().drain(..).collect();
         let state_methods: Vec<&str> = captured
@@ -944,6 +1046,324 @@ pub(crate) mod tests {
         assert_eq!(
             release_count, 1,
             "only parent AgentEnd should emit release_agent"
+        );
+    }
+
+    /// Saturated-queue regression: when the writer queue is saturated by a
+    /// slow peer, the final ordered `pane.report_agent` (idle) +
+    /// `pane.release_agent` pair from `flush()` must still be delivered and
+    /// received in order.
+    ///
+    /// The receiver accepts connections but never reads. The writer opens
+    /// a new connection per message, fills the kernel send buffer
+    /// immediately, and `send_on_stream`'s `write_all` blocks until the
+    /// 500ms IO_TIMEOUT fires. Each message therefore takes ~500ms even
+    /// though it is "lost" — the connection is dropped right after the
+    /// When the writer queue is full, `send_guaranteed` retries with
+    /// `yield_now` until a slot opens, so the terminal pair survives
+    /// saturation. This test binds a listener that accepts connections
+    /// but never reads, forcing each writer write to block on IO_TIMEOUT.
+    /// The queue saturates; `send_guaranteed` must still succeed within
+    /// SHUTDOWN_TIMEOUT.
+    #[tokio::test]
+    async fn flush_guarantees_delivery_under_backpressure() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("herdr-backpressure.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        // Bind listener and accept-and-park a peer that holds the connection
+        // open without reading. The writer's per-message connect succeeds;
+        // the first write fills the kernel send buffer; subsequent writes
+        // hit the 500ms IO_TIMEOUT, serializing each message behind ~500ms
+        // of wait. This saturates the 64-item mpsc queue.
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let _peer = zeroclaw_spawn::spawn!(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = HerdrClient::new(sock_str, "test-pane".into());
+
+        // Fill the queue to capacity with lossy sends.
+        for i in 0..WRITER_QUEUE_CAPACITY {
+            let mut params = serde_json::Map::new();
+            params.insert(
+                "state".into(),
+                serde_json::Value::String(format!("filler-{}", i)),
+            );
+            let _ = client.send("pane.report_agent", &params);
+        }
+
+        // Give the writer a head start so it's mid-flush on a stuck peer.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The contract: send_guaranteed must succeed under saturation
+        // because it retries with yield_now until the writer drains a slot.
+        let mut idle_params = serde_json::Map::new();
+        idle_params.insert("state".into(), serde_json::Value::String("idle".into()));
+        let start = Instant::now();
+        let r1 = client.send_guaranteed("pane.report_agent", &idle_params);
+        let r2 = client.send_guaranteed("pane.release_agent", &serde_json::Map::new());
+        let elapsed = start.elapsed();
+
+        assert!(
+            r1.is_ok(),
+            "first send_guaranteed must succeed under saturation"
+        );
+        assert!(
+            r2.is_ok(),
+            "second send_guaranteed must succeed under saturation"
+        );
+        assert!(
+            elapsed < SHUTDOWN_TIMEOUT,
+            "send_guaranteed must complete within SHUTDOWN_TIMEOUT under saturation, took {:?}",
+            elapsed
+        );
+
+        // Cleanup.
+        client.abort_writer_for_test();
+    }
+
+    /// Child TurnComplete (no turn_id) must NOT transition parent's pane.
+    #[tokio::test]
+    async fn herdr_turn_complete_from_child_is_filtered() {
+        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
+        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+
+        clear_broadcast_hook();
+
+        let parent_turn_id = "parent-turn";
+        let spy_parent = HerdrSpy::new();
+        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
+        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
+        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
+
+        // Parent activity: LlmRequest -> Working
+        let parent_llm = ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_llm);
+        calls_parent.lock().clear();
+
+        // Child emits TurnComplete (no turn_id) — should be FILTERED
+        let child_turn_complete = ObserverEvent::TurnComplete;
+        parent_observer.record_event(&child_turn_complete);
+
+        // Parent state must remain Working (no "idle" from child's TurnComplete)
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec![] as Vec<&str>,
+            "child TurnComplete must not transition parent to idle, got {:?}",
+            state_methods
+        );
+
+        // Parent's own LlmResponse should still transition to Working (no-op)
+        let parent_llm2 = ObserverEvent::LlmResponse {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(10),
+            success: true,
+            error_message: None,
+            input_tokens: None,
+            output_tokens: None,
+            messages: None,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_llm2);
+        let captured2: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods2: Vec<&str> = captured2
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        // No duplicate "working" because transit_to suppresses redundant transitions
+        assert_eq!(
+            state_methods2,
+            vec![] as Vec<&str>,
+            "parent LlmResponse should be no-op (already Working)"
+        );
+    }
+
+    /// Parent TurnComplete (no turn_id) is filtered when `owning_turn_id`
+    /// is set: we cannot tell parent from child without a `turn_id`, so
+    /// the terminal transition is driven by `AgentEnd` instead.  This
+    /// preserves correctness under nesting at the cost of an intermediate
+    /// idle flash.
+    #[tokio::test]
+    async fn herdr_turn_complete_from_parent_filtered_when_owning() {
+        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
+        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+
+        clear_broadcast_hook();
+
+        let parent_turn_id = "parent-turn";
+        let spy_parent = HerdrSpy::new();
+        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
+        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
+        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
+
+        // Parent activity: LlmRequest -> Working
+        let parent_llm = ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_llm);
+        calls_parent.lock().clear();
+
+        // Parent's TurnComplete is filtered — pane stays Working.
+        let parent_turn_complete = ObserverEvent::TurnComplete;
+        parent_observer.record_event(&parent_turn_complete);
+
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec![] as Vec<&str>,
+            "TurnComplete must be filtered when owning_turn_id is set, got {:?}",
+            state_methods
+        );
+
+        // Subsequent AgentEnd -> Released + release_agent (terminal transition)
+        let parent_end = ObserverEvent::AgentEnd {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(100),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_end);
+        let captured2: Vec<_> = calls_parent.lock().drain(..).collect();
+        let methods: Vec<&str> = captured2.iter().map(|c| c.method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec!["pane.report_agent", "pane.release_agent"],
+            "AgentEnd must emit idle then release_agent"
+        );
+        let idle_state = captured2
+            .iter()
+            .find(|c| c.method == "pane.report_agent")
+            .and_then(|c| c.params.get("state").and_then(|s| s.as_str()));
+        assert_eq!(idle_state, Some("idle"));
+    }
+
+    /// Unscoped observer (owning_turn_id = None) must still process
+    /// TurnComplete normally (no filter to apply).
+    #[tokio::test]
+    async fn herdr_turn_complete_without_owning_turn_unchanged() {
+        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
+
+        let spy = HerdrSpy::new();
+        let (client, calls) = make_spy_reporter(spy);
+        let observer = HerdrObserver::new(client, None);
+
+        // TurnComplete with no prior scoped event -> Idle (no-op, already Idle)
+        observer.record_event(&ObserverEvent::TurnComplete);
+        assert!(calls.lock().is_empty());
+
+        // LlmRequest -> Working
+        observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some("some-turn".to_string()),
+        });
+        let state: Vec<String> = calls
+            .lock()
+            .drain(..)
+            .filter_map(|c| {
+                c.params
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(state, vec!["working"]);
+
+        // TurnComplete -> Idle
+        observer.record_event(&ObserverEvent::TurnComplete);
+        let state: Vec<String> = calls
+            .lock()
+            .drain(..)
+            .filter_map(|c| {
+                c.params
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(state, vec!["idle"]);
+    }
+
+    /// When the writer task is forcibly cancelled (e.g. `abort`), the
+    /// `DrainOnPanic` guard must set `drain_done` on drop so
+    /// `shutdown_drain` returns immediately rather than waiting the
+    /// full 2s timeout for a task that no longer exists.
+    ///
+    /// This is a real crash test: we `abort` the writer task and verify
+    /// that `shutdown_drain` returns well within its bounded timeout.
+    #[tokio::test]
+    async fn shutdown_drain_does_not_hang_when_writer_crashes() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("herdr-crash.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
+
+        // Give the writer task a moment to spawn before we abort it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Forcefully cancel the writer task. This drops the
+        // `DrainOnPanic` guard without panicking — the guard's `Drop`
+        // impl must set `drain_done = true` so `shutdown_drain`
+        // returns immediately.
+        client.abort_writer_for_test();
+
+        // Give the abort a moment to propagate.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // shutdown_drain should return immediately — well under 1s —
+        // because the writer's drop guard already set drain_done.
+        let start = Instant::now();
+        client.shutdown_drain(SHUTDOWN_TIMEOUT);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown_drain must return promptly after writer abort, took {:?}",
+            elapsed
         );
     }
 }

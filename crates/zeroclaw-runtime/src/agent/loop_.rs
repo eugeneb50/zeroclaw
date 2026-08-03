@@ -1792,7 +1792,7 @@ pub async fn run(
                 if interactive {
                     println!("{final_output}");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete);
+                observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
                 return Ok(final_output);
             }
 
@@ -2100,7 +2100,7 @@ pub async fn run(
             if interactive {
                 println!("{final_output}");
             }
-            observer.record_event(&ObserverEvent::TurnComplete);
+            observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
 
             if config.skills.skill_improvement.enabled {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
@@ -2305,7 +2305,7 @@ pub async fn run(
                     {
                         eprintln!("\nError sending CLI response: {e}\n");
                     }
-                    observer.record_event(&ObserverEvent::TurnComplete);
+observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
                     if let Some(sys_msg) = history.first_mut()
                         && sys_msg.role == "system"
                     {
@@ -2706,7 +2706,7 @@ pub async fn run(
                 {
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete);
+                observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
 
                 // Display context usage for this turn.
                 if let Some(ref ctx) = cost_tracking_context {

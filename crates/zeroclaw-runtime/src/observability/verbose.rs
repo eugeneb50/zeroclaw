@@ -54,7 +54,7 @@ impl Observer for VerboseObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
             }
-            ObserverEvent::TurnComplete => {
+            ObserverEvent::TurnComplete { .. } => {
                 eprintln!("< Complete");
             }
             _ => {}
@@ -130,6 +130,6 @@ mod tests {
             agent_alias: None,
             turn_id: None,
         });
-        obs.record_event(&ObserverEvent::TurnComplete);
+        obs.record_event(&ObserverEvent::TurnComplete { turn_id: None });
     }
 }

@@ -218,7 +218,9 @@ fn project(event: &LogEvent) -> Option<ObserverEvent> {
             channel,
             direction: "outbound".to_string(),
         }),
-        "turn_complete" => Some(ObserverEvent::TurnComplete),
+        "turn_complete" => Some(ObserverEvent::TurnComplete {
+            turn_id: attribution.get("turn_id").map(|s| s.to_string()),
+        }),
         "heartbeat_tick" => Some(ObserverEvent::HeartbeatTick),
         "error" => Some(ObserverEvent::Error {
             component: attribution

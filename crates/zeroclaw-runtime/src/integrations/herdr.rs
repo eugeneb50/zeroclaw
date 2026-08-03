@@ -547,7 +547,11 @@ impl Observer for HerdrObserver {
                         return;
                     }
                 }
-                ObserverEvent::TurnComplete => return,
+                ObserverEvent::TurnComplete { turn_id, .. } => {
+                    if turn_id.as_deref() != Some(owning) {
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -565,7 +569,7 @@ impl Observer for HerdrObserver {
             ObserverEvent::ToolCall { .. } => {
                 self.transit_to(&mut state, HerdrState::Working);
             }
-            ObserverEvent::TurnComplete => {
+            ObserverEvent::TurnComplete { .. } => {
                 self.transit_to(&mut state, HerdrState::Idle);
             }
             ObserverEvent::AgentEnd { .. } => {
@@ -1033,9 +1037,9 @@ pub(crate) mod tests {
         parent_observer.record_event(&child_llm);
         parent_observer.record_event(&child_end);
 
-        // Child TurnComplete has NO turn_id — this is the gap we're testing.
-        // If the filter fails, this will incorrectly transition parent to Idle.
-        let child_turn_complete = ObserverEvent::TurnComplete;
+        // Child TurnComplete has a DIFFERENT turn_id — should be FILTERED.
+        // This verifies the owning-turn filter works for TurnComplete.
+        let child_turn_complete = ObserverEvent::TurnComplete { turn_id: Some(child_turn_id.to_string()) };
         parent_observer.record_event(&child_turn_complete);
 
         // Verify only parent events were captured (6 events: start, llm, end for parent)
@@ -1174,8 +1178,8 @@ pub(crate) mod tests {
         parent_observer.record_event(&parent_llm);
         calls_parent.lock().clear();
 
-        // Child emits TurnComplete (no turn_id) — should be FILTERED
-        let child_turn_complete = ObserverEvent::TurnComplete;
+        // Child emits TurnComplete with different turn_id — should be FILTERED
+        let child_turn_complete = ObserverEvent::TurnComplete { turn_id: Some("child-turn".to_string()) };
         parent_observer.record_event(&child_turn_complete);
 
         // Parent state must remain Working (no "idle" from child's TurnComplete)
@@ -1253,8 +1257,8 @@ pub(crate) mod tests {
         parent_observer.record_event(&parent_llm);
         calls_parent.lock().clear();
 
-        // Parent's TurnComplete is filtered — pane stays Working.
-        let parent_turn_complete = ObserverEvent::TurnComplete;
+        // Parent's TurnComplete with matching turn_id is PROCESSED (not filtered) — transitions to Idle.
+        let parent_turn_complete = ObserverEvent::TurnComplete { turn_id: Some(parent_turn_id.to_string()) };
         parent_observer.record_event(&parent_turn_complete);
 
         let captured: Vec<_> = calls_parent.lock().drain(..).collect();
@@ -1263,10 +1267,11 @@ pub(crate) mod tests {
             .filter(|c| c.method == "pane.report_agent")
             .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
             .collect();
+        // Parent's TurnComplete with matching turn_id transitions to Idle
         assert_eq!(
             state_methods,
-            vec![] as Vec<&str>,
-            "TurnComplete must be filtered when owning_turn_id is set, got {:?}",
+            vec!["idle"],
+            "parent TurnComplete with matching turn_id should transition to idle, got {:?}",
             state_methods
         );
 
@@ -1307,7 +1312,7 @@ pub(crate) mod tests {
         let observer = HerdrObserver::new(client, None);
 
         // TurnComplete with no prior scoped event -> Idle (no-op, already Idle)
-        observer.record_event(&ObserverEvent::TurnComplete);
+        observer.record_event(&ObserverEvent::TurnComplete { turn_id: None });
         assert!(calls.lock().is_empty());
 
         // LlmRequest -> Working
@@ -1333,7 +1338,7 @@ pub(crate) mod tests {
         assert_eq!(state, vec!["working"]);
 
         // TurnComplete -> Idle
-        observer.record_event(&ObserverEvent::TurnComplete);
+        observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some("some-turn".to_string()) });
         let state: Vec<String> = calls
             .lock()
             .drain(..)

@@ -809,6 +809,12 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = Cette requête n'a pas été traitée : { $reason }
 turn-tool-interrupted-before-result = [interrompu par l'utilisateur avant que cet outil ne produise un résultat]
 channel-runtime-malformed-tool-output = J'ai généré une erreur de format d'appel d'outil interne et n'ai pas pu terminer cette requête. Veuillez réessayer.
+channel-runtime-progress-received = Reçu
+channel-runtime-progress-planning = Planification
+channel-runtime-progress-waiting-on-model = En attente du modèle
+channel-runtime-progress-running-tool = Exécution d’un outil
+channel-runtime-progress-compacting-context = Compactage du contexte
+channel-runtime-progress-finalizing-response = Finalisation de la réponse
 channel-runtime-new-session = Historique de conversation effacé. Nouveau départ.
 channel-runtime-stop-sent = Signal d'arrêt envoyé.
 channel-runtime-stop-no-task = Aucune tâche en cours pour ce périmètre d'expéditeur.
@@ -816,6 +822,8 @@ channel-runtime-model-empty = L'ID du modèle ne peut pas être vide. Utilisez `
 channel-runtime-model-switched = Modèle changé vers `{ $model }` (model_provider : `{ $provider }`). Contexte conservé.
 channel-runtime-agent-scope-rejected = L'expéditeur `{ $sender }` n'est pas autorisé à utiliser `/model --agent` sur l'agent `{ $agent }`. Utilisez `/model --user { $model }` pour un remplacement limité à la session, ou demandez à un administrateur de marquer un groupe de pairs `admin_for_agent_scope = true` avec vous comme membre.
 channel-runtime-request-timeout = ⚠️ La requête a expiré en attendant le modèle. Veuillez réessayer.
+channel-runtime-no-reply-refused = 🚫 Je ne peux pas répondre à cette demande.
+channel-runtime-no-reply-failed = ⚠️ Je n'ai pas pu traiter cette demande.
 channel-runtime-current-model-status =
     model_provider actuel : `{ $provider }`
     Modèle actuel : `{ $model }`

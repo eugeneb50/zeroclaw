@@ -806,6 +806,12 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
 channel-runtime-malformed-tool-output = 内部ツール呼び出し形式のエラーが発生し、このリクエストを完了できませんでした。もう一度お試しください。
+channel-runtime-progress-received = 受信しました
+channel-runtime-progress-planning = 計画中
+channel-runtime-progress-waiting-on-model = モデルの応答を待っています
+channel-runtime-progress-running-tool = ツールを実行中
+channel-runtime-progress-compacting-context = コンテキストを圧縮中
+channel-runtime-progress-finalizing-response = 応答を最終処理中
 channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
 channel-runtime-stop-sent = 停止シグナルを送信しました。
 channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
@@ -813,6 +819,8 @@ channel-runtime-model-empty = モデル ID は空にできません。`/model <m
 channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
 channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
 channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
+channel-runtime-no-reply-refused = 🚫 そのリクエストにはお応えできません。
+channel-runtime-no-reply-failed = ⚠️ そのリクエストを完了できませんでした。
 channel-runtime-current-model-status =
     現在の model_provider: `{ $provider }`
     現在のモデル: `{ $model }`

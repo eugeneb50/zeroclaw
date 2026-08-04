@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-use zeroclaw_api::observability_traits::ObserverMetric;
+use zeroclaw_api::observability_traits::{ObserverMetric, SidecarObserver};
 
 use crate::observability::{
     BroadcastHookGuard, Observer, ObserverEvent, set_scoped_broadcast_hook,
@@ -73,21 +74,55 @@ async fn send_on_stream(stream: &mut UnixStream, payload: &str) -> Result<(), st
 const SOURCE: &str = "herdr:zeroclaw";
 const AGENT: &str = "zeroclaw";
 
-/// Try to install a HerdrObserver via the broadcast hook. Returns a guard
-/// that uninstalls it on drop, or `None` if the herdr environment isn't
-/// active (not running inside a herdr pane) or the caller is not the
-/// interactive CLI agent path.
+/// Install the hook from already-resolved env values. Factored out of
+/// [`try_install_herdr_sidecar`] so the gating logic can be tested without
+/// touching the process environment (`std::env::set_var` is `unsafe` on
+/// Rust >= 1.80 because it is not thread-safe with concurrent reads).
 ///
-/// `interactive` must be `true` for the hook to be installed. The Herdr
+/// Constructs the `HerdrClient` + `HerdrObserver` and stores a weak
+/// back-reference so [`SidecarObserver::attach`] can recover the `Arc`
+/// for the broadcast hook. Does **not** install the hook or emit any
+/// startup messages — `attach` does both so the sidecar can be
+/// re-attached to a different turn without re-constructing the client.
+fn install_hook_from_env(
+    socket_path: String,
+    pane_id: String,
+    _agent_alias: &str,
+) -> Option<Arc<HerdrObserver>> {
+    // UDS is Unix-only; silently skip on other platforms.
+    #[cfg(not(unix))]
+    {
+        let _ = (socket_path, pane_id);
+        return None;
+    }
+
+    let client = HerdrClient::new(socket_path, pane_id);
+    let observer = Arc::new(HerdrObserver::new(client, None));
+    let _ = observer.self_weak.set(Arc::downgrade(&observer));
+    Some(observer)
+}
+
+/// Try to install a Herdr sidecar for the interactive CLI agent path.
+/// Returns `Some(Arc<dyn SidecarObserver>)` when the Herdr environment is
+/// active (`HERDR_ENV=1`, `HERDR_SOCKET_PATH`, `HERDR_PANE_ID` all set) and
+/// the caller is interactive; otherwise `None`.
+///
+/// The returned observer is **not yet attached** — the caller must invoke
+/// [`SidecarObserver::attach`] with the owning turn id and agent alias so
+/// the sidecar installs its broadcast hook and emits the initial idle +
+/// metadata startup pair. Likewise the caller (or its `SidecarScope` drop
+/// guard) must invoke [`SidecarObserver::detach`] at turn end so the
+/// terminal `release_agent` notification is flushed before teardown.
+///
+/// `interactive` must be `true` for the sidecar to be returned. The Herdr
 /// integration is advertised as CLI-interactive-only; daemon, cron, channel,
 /// and subagent callers pass `interactive = false` and must not mutate the
 /// pane's process-wide Herdr state, since their lifecycle and flush
 /// assumptions differ from the CLI one-shot / REPL path.
-pub fn try_install_hook(
+pub fn try_install_herdr_sidecar(
     interactive: bool,
     agent_alias: &str,
-    owning_turn_id: Option<&str>,
-) -> Option<BroadcastHookGuard> {
+) -> Option<Arc<dyn SidecarObserver>> {
     if !interactive {
         return None;
     }
@@ -96,49 +131,8 @@ pub fn try_install_hook(
     }
     let socket_path = std::env::var("HERDR_SOCKET_PATH").ok()?;
     let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
-    install_hook_from_env(socket_path, pane_id, agent_alias, owning_turn_id)
-}
-
-/// Install the hook from already-resolved env values. Factored out of
-/// [`try_install_hook`] so the gating logic can be tested without touching
-/// the process environment (`std::env::set_var` is `unsafe` on Rust >= 1.80
-/// because it is not thread-safe with concurrent reads).
-fn install_hook_from_env(
-    socket_path: String,
-    pane_id: String,
-    agent_alias: &str,
-    owning_turn_id: Option<&str>,
-) -> Option<BroadcastHookGuard> {
-    // UDS is Unix-only; silently skip on other platforms.
-    #[cfg(not(unix))]
-    {
-        let _ = (socket_path, pane_id, agent_alias, owning_turn_id);
-        return None;
-    }
-
-    // Compute unique display name: agent alias + last 2 chars of pane_id.
-    // Use char-aware slicing to handle multi-byte UTF-8 pane IDs safely.
-    let display_name = {
-        let chars: Vec<char> = pane_id.chars().collect();
-        if chars.len() > 2 {
-            let suffix: String = chars[chars.len() - 2..].iter().collect();
-            format!("{}-{}", agent_alias, suffix)
-        } else {
-            agent_alias.to_string()
-        }
-    };
-
-    let client = HerdrClient::new(socket_path, pane_id);
-    client.report_metadata(&display_name);
-
-    // Clear stale state from a previous session before installing.
-    let _ = client.send("pane.release_agent", &serde_json::Map::new());
-    // Report initial idle state so herdr shows the agent immediately.
-    client.report_state("idle");
-    // Startup messages are best-effort; the first ObserverEvent will re-emit
-    // idle if the daemon was unavailable.
-    let observer = Arc::new(HerdrObserver::new(client, owning_turn_id));
-    Some(set_scoped_broadcast_hook(observer))
+    install_hook_from_env(socket_path, pane_id, agent_alias)
+        .map(|obs| obs as Arc<dyn SidecarObserver>)
 }
 
 // HerdrClient
@@ -471,15 +465,29 @@ pub(crate) enum HerdrState {
 /// Events are filtered by `owning_turn_id`: only events whose `turn_id`
 /// matches the owning interactive run are forwarded to herdr. This isolates
 /// nested non-interactive runs (subagents) from the parent's pane state.
-/// Child agents pass `interactive = false` to `try_install_hook`, which
-/// returns `None` and installs no hook; even if they did install one, the
-/// `owning_turn_id` filter would prevent their events from reaching the
+/// Child agents pass `interactive = false` to `try_install_herdr_sidecar`,
+/// which returns `None` and installs no hook; even if they did install one,
+/// the `owning_turn_id` filter would prevent their events from reaching the
 /// parent's observer.
+///
+/// Implements [`SidecarObserver`] so the agent loop can attach/detach the
+/// sidecar at turn boundaries via a `SidecarScope` guard, rather than
+/// relying on the implicit drop order of a `BroadcastHookGuard` plus a
+/// separate `FlushGuard`.
 pub struct HerdrObserver {
     state: Mutex<HerdrState>,
     client: HerdrClient,
-    /// Owning turn identity for event filtering.
-    owning_turn_id: Option<String>,
+    /// Owning turn identity for event filtering. Set by `attach`, cleared by
+    /// `detach`. Wrapped in a `Mutex` so `attach`/`detach` can mutate it
+    /// through a `&self` reference after construction.
+    owning_turn_id: Mutex<Option<String>>,
+    /// Broadcast hook guard, held for the lifetime of the attached turn.
+    /// `Some` while attached; `None` when detached or never attached.
+    hook: Mutex<Option<BroadcastHookGuard>>,
+    /// Weak back-reference to ourselves, set once at construction so
+    /// `attach` can upgrade to an `Arc` and register it as the broadcast
+    /// hook without requiring the caller to hand back the same `Arc`.
+    self_weak: OnceLock<Weak<HerdrObserver>>,
 }
 
 impl HerdrObserver {
@@ -487,8 +495,18 @@ impl HerdrObserver {
         Self {
             state: Mutex::new(HerdrState::Idle),
             client,
-            owning_turn_id: owning_turn_id.map(|s| s.to_owned()),
+            owning_turn_id: Mutex::new(owning_turn_id.map(|s| s.to_owned())),
+            hook: Mutex::new(None),
+            self_weak: OnceLock::new(),
         }
+    }
+
+    /// Store a weak reference to ourselves so [`SidecarObserver::attach`]
+    /// can recover an `Arc` for the broadcast hook. Test-only — production
+    /// callers register the weak via [`try_install_herdr_sidecar`].
+    #[cfg(test)]
+    pub(crate) fn seed_self_weak(self: &Arc<Self>) {
+        let _ = self.self_weak.set(Arc::downgrade(self));
     }
 }
 
@@ -506,8 +524,10 @@ impl HerdrObserver {
             let mut p = serde_json::Map::new();
             p.insert("state".into(), serde_json::Value::String("idle".into()));
             let r1 = self.client.send_guaranteed("pane.report_agent", &p);
-            let r2 = self.client.send_guaranteed("pane.release_agent", &serde_json::Map::new());
-            if !r1.is_ok() || !r2.is_ok() {
+            let r2 = self
+                .client
+                .send_guaranteed("pane.release_agent", &serde_json::Map::new());
+            if r1.is_err() || r2.is_err() {
                 // Failed to enqueue terminal pair; don't commit state.
                 // The next AgentEnd/flush can retry.
                 return;
@@ -532,27 +552,30 @@ impl Observer for HerdrObserver {
         // cannot be attributed, so when we own a turn we skip them entirely —
         // AgentEnd drives the terminal transition. Trades intermediate idle flash
         // for correctness under nesting.
-        if let Some(owning) = self.owning_turn_id.as_deref() {
-            match event {
-                ObserverEvent::AgentStart { turn_id, .. }
-                | ObserverEvent::LlmRequest { turn_id, .. }
-                | ObserverEvent::LlmResponse { turn_id, .. }
-                | ObserverEvent::AgentEnd { turn_id, .. }
-                | ObserverEvent::ToolCallStart { turn_id, .. }
-                | ObserverEvent::ToolCall { turn_id, .. }
-                | ObserverEvent::HistoryTrimmed { turn_id, .. }
-                | ObserverEvent::AuthorizationRequested { turn_id, .. }
-                | ObserverEvent::AuthorizationResponded { turn_id, .. } => {
-                    if turn_id.as_deref() != Some(owning) {
+        {
+            let owning = self.owning_turn_id.lock();
+            if let Some(owning) = owning.as_deref() {
+                match event {
+                    ObserverEvent::AgentStart { turn_id, .. }
+                    | ObserverEvent::LlmRequest { turn_id, .. }
+                    | ObserverEvent::LlmResponse { turn_id, .. }
+                    | ObserverEvent::AgentEnd { turn_id, .. }
+                    | ObserverEvent::ToolCallStart { turn_id, .. }
+                    | ObserverEvent::ToolCall { turn_id, .. }
+                    | ObserverEvent::HistoryTrimmed { turn_id, .. }
+                    | ObserverEvent::AuthorizationRequested { turn_id, .. }
+                    | ObserverEvent::AuthorizationResponded { turn_id, .. } => {
+                        if turn_id.as_deref() != Some(owning) {
+                            return;
+                        }
+                    }
+                    ObserverEvent::TurnComplete { turn_id, .. }
+                        if turn_id.as_deref() != Some(owning) =>
+                    {
                         return;
                     }
+                    _ => {}
                 }
-                ObserverEvent::TurnComplete { turn_id, .. } => {
-                    if turn_id.as_deref() != Some(owning) {
-                        return;
-                    }
-                }
-                _ => {}
             }
         }
         let mut state = self.state.lock();
@@ -613,6 +636,78 @@ impl Observer for HerdrObserver {
     }
 }
 
+impl SidecarObserver for HerdrObserver {
+    fn attach(&self, turn_id: &str, agent_alias: &str) {
+        // Idempotent: if hook already installed, this is a no-op.
+        if self.hook.lock().is_some() {
+            return;
+        }
+
+        // Set the owning turn before installing the hook so the first routed
+        // event (an `AgentStart` from the agent loop) is not filtered out.
+        {
+            let mut owning = self.owning_turn_id.lock();
+            *owning = Some(turn_id.to_string());
+        }
+
+        // Compute unique display name: agent alias + last 2 chars of pane_id.
+        // Use char-aware slicing to handle multi-byte UTF-8 pane IDs safely.
+        let display_name = {
+            let chars: Vec<char> = self.client.pane_id.chars().collect();
+            if chars.len() > 2 {
+                let suffix: String = chars[chars.len() - 2..].iter().collect();
+                format!("{agent_alias}-{suffix}")
+            } else {
+                agent_alias.to_string()
+            }
+        };
+
+        // Emit the startup sequence so herdr shows the agent immediately:
+        // metadata + initial idle state. Stale state from a prior session is
+        // cleared by releasing first (best-effort, ignored on failure).
+        let _ = self
+            .client
+            .send("pane.release_agent", &serde_json::Map::new());
+        self.client.report_metadata(&display_name);
+        self.client.report_state("idle");
+
+        // Install the broadcast hook so this observer receives every event
+        // routed through the primary observer's fan-out. Recover the `Arc`
+        // from the weak reference set at construction time.
+        if let Some(arc) = self.self_weak.get().and_then(|weak| weak.upgrade()) {
+            let guard = set_scoped_broadcast_hook(arc);
+            *self.hook.lock() = Some(guard);
+        }
+    }
+
+    fn detach(&self) {
+        // Idempotent: if hook was never installed (or already detached),
+        // take() returns None and we no-op.
+        let guard = self.hook.lock().take();
+        if let Some(guard) = guard {
+            // Flush the terminal pair (idle + release_agent) and drain pending
+            // writes. flush() only emits the terminal pair when state != Released;
+            // subsequent calls are a no-op.
+            self.flush();
+            // Drop the guard to uninstall the broadcast hook. We hold it
+            // until after flush() so events emitted during flush are still
+            // routed (though after flush no further events are expected).
+            drop(guard);
+            // Clear ownership so stale events cannot re-enter the state machine.
+            *self.owning_turn_id.lock() = None;
+        }
+    }
+
+    fn owns_turn(&self, turn_id: Option<&str>) -> bool {
+        let owning = self.owning_turn_id.lock();
+        match (owning.as_deref(), turn_id) {
+            (Some(owned), Some(id)) => owned == id,
+            (Some(_), None) => false,
+            (None, _) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -661,38 +756,22 @@ pub(crate) mod tests {
         (client, calls)
     }
 
+    /// Startup path with stale socket must return quickly and handle
+    /// non-ASCII pane IDs. `install_hook_from_env` creates a client, then
+    /// `attach()` sends the startup sequence (release_agent + metadata +
+    /// idle). With a stale socket, each connect attempt times out in 200ms.
+    /// Using an emoji pane_id also exercises the char-aware display_name
+    /// suffix extraction (would panic on byte indexing).
     #[tokio::test]
-    async fn send_fire_and_forget_returns_immediately() {
-        let client = HerdrClient::new(
-            "/tmp/nonexistent-herdr-test-socket.sock".into(),
-            "test-pane".into(),
-        );
-
+    async fn attach_with_stale_socket_returns_quickly_and_handles_utf8() {
         let start = std::time::Instant::now();
-        let _result = client.send("pane.report_agent", &serde_json::Map::new());
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "fire-and-forget send should not block the caller, took {:?}",
-            elapsed,
-        );
-    }
-
-    /// Startup path with stale socket must return quickly. This tests the
-    /// real blocker: install_hook_from_env creates a client, sends two
-    /// messages (release_agent + report_state), and returns. With a stale
-    /// socket, each connect attempt times out in 200ms; two messages = 400ms.
-    /// We allow some slack for task spawn overhead.
-    #[tokio::test]
-    async fn startup_with_stale_socket_returns_quickly() {
-        let start = std::time::Instant::now();
-        let _guard = install_hook_from_env(
+        let sidecar = install_hook_from_env(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
-            "test-pane".into(),
+            "test-🦀".into(),
             "test-agent",
-            None,
-        );
+        )
+        .expect("install_hook_from_env should succeed");
+        sidecar.attach("turn-1", "test-agent");
         let elapsed = start.elapsed();
 
         assert!(
@@ -700,38 +779,26 @@ pub(crate) mod tests {
             "startup with unavailable herdr socket should return quickly, took {:?}",
             elapsed,
         );
+        sidecar.detach();
     }
 
-    /// `try_install_hook(interactive)` must return `None` for non-interactive
-    /// callers (daemon, cron, channels, subagents) regardless of env state.
-    /// The integration is advertised as CLI-interactive-only and must not
-    /// mutate pane state from other paths.
+    /// `try_install_herdr_sidecar(interactive)` must return `None` for
+    /// non-interactive callers (daemon, cron, channels, subagents)
+    /// regardless of env state. The integration is advertised as
+    /// CLI-interactive-only and must not mutate pane state from other paths.
     ///
     /// We avoid `std::env::set_var` here because it is `unsafe` on Rust >= 1.80
     /// (not thread-safe with concurrent reads). The `interactive` gate runs
     /// before any env access, so we can verify it without touching the
     /// environment.
     #[test]
-    fn try_install_hook_skips_non_interactive() {
-        // Non-interactive callers must never install the hook, even if env
+    fn try_install_herdr_sidecar_skips_non_interactive() {
+        // Non-interactive callers must never get a sidecar, even if env
         // vars were set by some other process. The gate short-circuits before
         // any env read.
         assert!(
-            try_install_hook(false, "test-agent", None).is_none(),
-            "try_install_hook(false) must return None without consulting env vars"
-        );
-    }
-
-    /// Non-ASCII pane IDs (e.g., emoji) must not panic on UTF-8 slicing.
-    /// This tests the fix: display_name uses char-aware suffix extraction
-    /// instead of byte indexing, which would panic on multi-byte chars like 🦀.
-    #[tokio::test]
-    async fn non_ascii_pane_id_does_not_panic() {
-        let _guard = install_hook_from_env(
-            "/tmp/nonexistent-herdr-test-socket.sock".into(),
-            "test-🦀".into(),
-            "test-agent",
-            None,
+            try_install_herdr_sidecar(false, "test-agent").is_none(),
+            "try_install_herdr_sidecar(false) must return None without consulting env vars"
         );
     }
 
@@ -796,24 +863,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// `next_seq()` must return monotonically increasing values starting from
-    /// a wall-clock-seeded base. This ensures restart resilience: a process
-    /// restarted after herdr stores a prior seq will have a higher starting
-    /// value, avoiding silent message rejection.
+    /// `next_seq()` must return monotonically increasing values. The
+    /// counter is seeded from wall clock on first use (process-wide) to
+    /// provide restart resilience: a process restarted after herdr stores a
+    /// prior seq will have a higher starting value, avoiding silent message
+    /// rejection. Monotonicity within a process is the testable property.
     #[tokio::test]
-    async fn next_seq_is_monotonic_and_restart_safe() {
+    async fn next_seq_is_monotonic() {
         let client = HerdrClient::new(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-pane".into(),
         );
-
-        // Capture `now_micros` BEFORE generating seq. The seq counter is
-        // seeded from wall clock on first use, so seq1 should be >= the
-        // clock value captured here (within the resolution of SystemTime).
-        let now_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
 
         let seq1 = client.next_seq();
         let seq2 = client.next_seq();
@@ -821,15 +881,6 @@ pub(crate) mod tests {
 
         assert!(seq2 > seq1, "seq must be monotonic: {} <= {}", seq2, seq1);
         assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
-
-        // seq1 was captured AFTER now_micros, so seq1 >= now_micros. We allow
-        // 50ms slack to absorb scheduler latency and SystemTime granularity.
-        assert!(
-            seq1 >= now_micros.saturating_sub(50_000),
-            "seq {} should be seeded from wall clock (now ~{})",
-            seq1,
-            now_micros
-        );
     }
 
     /// Shutdown drain test: verify ordered receipt of `idle` then
@@ -958,7 +1009,6 @@ pub(crate) mod tests {
     /// release parent's pane.
     #[tokio::test]
     async fn herdr_nested_run_isolation() {
-        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
         use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
 
         clear_broadcast_hook();
@@ -1039,7 +1089,9 @@ pub(crate) mod tests {
 
         // Child TurnComplete has a DIFFERENT turn_id — should be FILTERED.
         // This verifies the owning-turn filter works for TurnComplete.
-        let child_turn_complete = ObserverEvent::TurnComplete { turn_id: Some(child_turn_id.to_string()) };
+        let child_turn_complete = ObserverEvent::TurnComplete {
+            turn_id: Some(child_turn_id.to_string()),
+        };
         parent_observer.record_event(&child_turn_complete);
 
         // Verify only parent events were captured (6 events: start, llm, end for parent)
@@ -1151,171 +1203,230 @@ pub(crate) mod tests {
         client_for_fill.abort_writer_for_test();
     }
 
-    /// Child TurnComplete (no turn_id) must NOT transition parent's pane.
+    /// Table-driven matrix covering all TurnComplete filter combinations.
+    ///
+    /// Cases:
+    /// - No owner + None turn_id: processed (already Idle → no-op, no call)
+    /// - No owner + Some turn_id: processed → Working then Idle
+    /// - Owning + matching turn_id: processed → Idle
+    /// - Owning + different turn_id: FILTERED
+    /// - Owning + None turn_id: FILTERED (the gap that was missing before)
     #[tokio::test]
-    async fn herdr_turn_complete_from_child_is_filtered() {
-        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+    async fn turn_complete_filter_matrix() {
+        // Helper to build an LlmRequest event for the given turn_id.
+        fn llm_request(turn_id: Option<&str>) -> ObserverEvent {
+            ObserverEvent::LlmRequest {
+                model_provider: "test".into(),
+                model: "test".into(),
+                messages_count: 1,
+                channel: None,
+                agent_alias: None,
+                parent_agent_alias: None,
+                turn_id: turn_id.map(|s| s.to_string()),
+            }
+        }
 
-        clear_broadcast_hook();
+        // Helper to build a TurnComplete event for the given turn_id.
+        fn turn_complete(turn_id: Option<&str>) -> ObserverEvent {
+            ObserverEvent::TurnComplete {
+                turn_id: turn_id.map(|s| s.to_string()),
+            }
+        }
 
-        let parent_turn_id = "parent-turn";
-        let spy_parent = HerdrSpy::new();
-        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
-        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
-        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
+        // Helper to extract state transitions from captured calls.
+        fn captured_states(calls: &Arc<Mutex<Vec<HerdrSpyCall>>>) -> Vec<String> {
+            calls
+                .lock()
+                .iter()
+                .filter(|c| c.method == "pane.report_agent")
+                .filter_map(|c| {
+                    c.params
+                        .get("state")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        }
 
-        // Parent activity: LlmRequest -> Working
-        let parent_llm = ObserverEvent::LlmRequest {
-            model_provider: "test".into(),
-            model: "test".into(),
-            messages_count: 1,
-            channel: None,
-            agent_alias: None,
-            parent_agent_alias: None,
-            turn_id: Some(parent_turn_id.to_string()),
-        };
-        parent_observer.record_event(&parent_llm);
-        calls_parent.lock().clear();
+        // Case 1: No owner + None turn_id — Idle → Idle (no-op, no calls)
+        {
+            let spy = HerdrSpy::new();
+            let (client, calls) = make_spy_reporter(spy);
+            let observer = HerdrObserver::new(client, None);
+            observer.record_event(&turn_complete(None));
+            assert!(
+                calls.lock().is_empty(),
+                "no owner + None turn_id: should be no-op (already Idle)"
+            );
+        }
 
-        // Child emits TurnComplete with different turn_id — should be FILTERED
-        let child_turn_complete = ObserverEvent::TurnComplete { turn_id: Some("child-turn".to_string()) };
-        parent_observer.record_event(&child_turn_complete);
+        // Case 2: No owner + Some turn_id — processed normally
+        {
+            let spy = HerdrSpy::new();
+            let (client, calls) = make_spy_reporter(spy);
+            let observer = HerdrObserver::new(client, None);
+            // LlmRequest → Working, then TurnComplete → Idle
+            observer.record_event(&llm_request(Some("t1")));
+            observer.record_event(&turn_complete(Some("t1")));
+            let states = captured_states(&calls);
+            assert_eq!(
+                states,
+                vec!["working", "idle"],
+                "no owner: TurnComplete should transition to idle"
+            );
+        }
 
-        // Parent state must remain Working (no "idle" from child's TurnComplete)
-        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
-        let state_methods: Vec<&str> = captured
-            .iter()
-            .filter(|c| c.method == "pane.report_agent")
-            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
-            .collect();
-        assert_eq!(
-            state_methods,
-            vec![] as Vec<&str>,
-            "child TurnComplete must not transition parent to idle, got {:?}",
-            state_methods
-        );
+        // Case 3: Owning + matching turn_id — processed → Idle
+        {
+            let spy = HerdrSpy::new();
+            let (client, calls) = make_spy_reporter(spy);
+            let observer = HerdrObserver::new(client, Some("own-turn"));
+            observer.record_event(&llm_request(Some("own-turn")));
+            calls.lock().clear();
+            observer.record_event(&turn_complete(Some("own-turn")));
+            let states = captured_states(&calls);
+            assert_eq!(
+                states,
+                vec!["idle"],
+                "owning + matching turn_id: should transition to idle"
+            );
+        }
 
-        // Parent's own LlmResponse should still transition to Working (no-op)
-        let parent_llm2 = ObserverEvent::LlmResponse {
-            model_provider: "test".into(),
-            model: "test".into(),
-            duration: Duration::from_millis(10),
-            success: true,
-            error_message: None,
-            input_tokens: None,
-            output_tokens: None,
-            messages: None,
-            channel: None,
-            agent_alias: None,
-            parent_agent_alias: None,
-            turn_id: Some(parent_turn_id.to_string()),
-        };
-        parent_observer.record_event(&parent_llm2);
-        let captured2: Vec<_> = calls_parent.lock().drain(..).collect();
-        let state_methods2: Vec<&str> = captured2
-            .iter()
-            .filter(|c| c.method == "pane.report_agent")
-            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
-            .collect();
-        // No duplicate "working" because transit_to suppresses redundant transitions
-        assert_eq!(
-            state_methods2,
-            vec![] as Vec<&str>,
-            "parent LlmResponse should be no-op (already Working)"
-        );
+        // Case 4: Owning + different turn_id — FILTERED
+        {
+            let spy = HerdrSpy::new();
+            let (client, calls) = make_spy_reporter(spy);
+            let observer = HerdrObserver::new(client, Some("own-turn"));
+            observer.record_event(&llm_request(Some("own-turn")));
+            calls.lock().clear();
+            observer.record_event(&turn_complete(Some("other-turn")));
+            let states = captured_states(&calls);
+            assert!(
+                states.is_empty(),
+                "owning + different turn_id: TurnComplete must be filtered"
+            );
+        }
+
+        // Case 5: Owning + None turn_id — FILTERED (the previously untested gap)
+        {
+            let spy = HerdrSpy::new();
+            let (client, calls) = make_spy_reporter(spy);
+            let observer = HerdrObserver::new(client, Some("own-turn"));
+            observer.record_event(&llm_request(Some("own-turn")));
+            calls.lock().clear();
+            observer.record_event(&turn_complete(None));
+            let states = captured_states(&calls);
+            assert!(
+                states.is_empty(),
+                "owning + None turn_id: TurnComplete must be filtered (cannot attribute)"
+            );
+        }
     }
 
-    /// Parent TurnComplete (no turn_id) is filtered when `owning_turn_id`
-    /// is set: we cannot tell parent from child without a `turn_id`, so
-    /// the terminal transition is driven by `AgentEnd` instead.  This
-    /// preserves correctness under nesting at the cost of an intermediate
-    /// idle flash.
+    /// `attach()` must emit the exact startup sequence: `release_agent` →
+    /// `report_metadata` (with display_name = `{agent_alias}-{last2 pane_id}`) →
+    /// `report_state("idle")`. Also verifies the display_name suffix is
+    /// correct for a normal ASCII pane_id.
     #[tokio::test]
-    async fn herdr_turn_complete_from_parent_filtered_when_owning() {
-        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
-
-        clear_broadcast_hook();
-
-        let parent_turn_id = "parent-turn";
-        let spy_parent = HerdrSpy::new();
-        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
-        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
-        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
-
-        // Parent activity: LlmRequest -> Working
-        let parent_llm = ObserverEvent::LlmRequest {
-            model_provider: "test".into(),
-            model: "test".into(),
-            messages_count: 1,
-            channel: None,
-            agent_alias: None,
-            parent_agent_alias: None,
-            turn_id: Some(parent_turn_id.to_string()),
-        };
-        parent_observer.record_event(&parent_llm);
-        calls_parent.lock().clear();
-
-        // Parent's TurnComplete with matching turn_id is PROCESSED (not filtered) — transitions to Idle.
-        let parent_turn_complete = ObserverEvent::TurnComplete { turn_id: Some(parent_turn_id.to_string()) };
-        parent_observer.record_event(&parent_turn_complete);
-
-        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
-        let state_methods: Vec<&str> = captured
-            .iter()
-            .filter(|c| c.method == "pane.report_agent")
-            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
-            .collect();
-        // Parent's TurnComplete with matching turn_id transitions to Idle
-        assert_eq!(
-            state_methods,
-            vec!["idle"],
-            "parent TurnComplete with matching turn_id should transition to idle, got {:?}",
-            state_methods
-        );
-
-        // Subsequent AgentEnd -> Released + release_agent (terminal transition)
-        let parent_end = ObserverEvent::AgentEnd {
-            model_provider: "test".into(),
-            model: "test".into(),
-            duration: Duration::from_millis(100),
-            tokens_used: None,
-            cost_usd: None,
-            channel: None,
-            agent_alias: None,
-            turn_id: Some(parent_turn_id.to_string()),
-        };
-        parent_observer.record_event(&parent_end);
-        let captured2: Vec<_> = calls_parent.lock().drain(..).collect();
-        let methods: Vec<&str> = captured2.iter().map(|c| c.method.as_str()).collect();
-        assert_eq!(
-            methods,
-            vec!["pane.report_agent", "pane.release_agent"],
-            "AgentEnd must emit idle then release_agent"
-        );
-        let idle_state = captured2
-            .iter()
-            .find(|c| c.method == "pane.report_agent")
-            .and_then(|c| c.params.get("state").and_then(|s| s.as_str()));
-        assert_eq!(idle_state, Some("idle"));
-    }
-
-    /// Unscoped observer (owning_turn_id = None) must still process
-    /// TurnComplete normally (no filter to apply).
-    #[tokio::test]
-    async fn herdr_turn_complete_without_owning_turn_unchanged() {
-        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-
+    async fn attach_emits_startup_sequence_with_correct_display_name() {
         let spy = HerdrSpy::new();
         let (client, calls) = make_spy_reporter(spy);
-        let observer = HerdrObserver::new(client, None);
+        let observer = Arc::new(HerdrObserver::new(client, None));
+        observer.seed_self_weak();
+        observer.attach("turn-1", "my-agent");
 
-        // TurnComplete with no prior scoped event -> Idle (no-op, already Idle)
-        observer.record_event(&ObserverEvent::TurnComplete { turn_id: None });
-        assert!(calls.lock().is_empty());
+        let captured: Vec<_> = calls.lock().drain(..).collect();
+        assert_eq!(
+            captured.len(),
+            3,
+            "attach must emit exactly 3 messages: release, metadata, idle"
+        );
+        assert_eq!(captured[0].method, "pane.release_agent");
+        assert_eq!(captured[1].method, "pane.report_metadata");
+        // pane_id = "test-pane" → last 2 chars = "ne" → display_name = "my-agent-ne"
+        assert_eq!(
+            captured[1]
+                .params
+                .get("display_agent")
+                .and_then(|s| s.as_str()),
+            Some("my-agent-ne"),
+            "display_name must be {{agent_alias}}-{{last2 pane_id}}"
+        );
+        assert_eq!(captured[2].method, "pane.report_agent");
+        assert_eq!(
+            captured[2].params.get("state").and_then(|s| s.as_str()),
+            Some("idle")
+        );
+        observer.detach();
+    }
 
-        // LlmRequest -> Working
+    /// `attach()` must be idempotent: calling it twice with the same turn
+    /// must not re-install the hook or emit duplicate startup messages.
+    #[tokio::test]
+    async fn attach_is_idempotent() {
+        let spy = HerdrSpy::new();
+        let (client, calls) = make_spy_reporter(spy);
+        let observer = Arc::new(HerdrObserver::new(client, None));
+        observer.seed_self_weak();
+        observer.attach("turn-1", "test-agent");
+        let first_count = calls.lock().len();
+        observer.attach("turn-1", "test-agent");
+        assert_eq!(
+            calls.lock().len(),
+            first_count,
+            "second attach must not emit duplicate messages"
+        );
+        observer.detach();
+    }
+
+    /// `detach()` must be idempotent: calling it when not attached is a
+    /// no-op, and calling it after a real detach is also a no-op.
+    #[tokio::test]
+    async fn detach_is_idempotent() {
+        let spy = HerdrSpy::new();
+        let (client, calls) = make_spy_reporter(spy);
+        let observer = Arc::new(HerdrObserver::new(client, None));
+        observer.seed_self_weak();
+
+        // Detach when never attached — no-op.
+        observer.detach();
+        assert!(
+            calls.lock().is_empty(),
+            "detach when never attached must be a no-op"
+        );
+
+        // Attach then detach — emits terminal pair.
+        observer.attach("turn-1", "test-agent");
+        calls.lock().clear();
+        observer.detach();
+        let count_after_first = calls.lock().len();
+        assert!(
+            count_after_first > 0,
+            "detach after attach must emit terminal messages"
+        );
+
+        // Second detach — no-op.
+        observer.detach();
+        assert_eq!(
+            calls.lock().len(),
+            count_after_first,
+            "second detach must not emit duplicate messages"
+        );
+    }
+
+    /// Re-attach after detach must transition to the new turn and filter
+    /// events from the old turn. This is the core production path for REPL
+    /// multi-turn support — the entire reason the SidecarObserver pattern
+    /// exists.
+    #[tokio::test]
+    async fn reattach_after_detach_transitions_to_new_turn() {
+        let spy = HerdrSpy::new();
+        let (client, calls) = make_spy_reporter(spy);
+        let observer = Arc::new(HerdrObserver::new(client, None));
+        observer.seed_self_weak();
+
+        // First turn — attach, emit an event, detach.
+        observer.attach("turn-A", "test-agent");
         observer.record_event(&ObserverEvent::LlmRequest {
             model_provider: "test".into(),
             model: "test".into(),
@@ -1323,25 +1434,31 @@ pub(crate) mod tests {
             channel: None,
             agent_alias: None,
             parent_agent_alias: None,
-            turn_id: Some("some-turn".to_string()),
+            turn_id: Some("turn-A".to_string()),
         });
-        let state: Vec<String> = calls
-            .lock()
-            .drain(..)
-            .filter_map(|c| {
-                c.params
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .map(str::to_string)
-            })
-            .collect();
-        assert_eq!(state, vec!["working"]);
+        observer.detach();
+        calls.lock().clear();
 
-        // TurnComplete -> Idle
-        observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some("some-turn".to_string()) });
-        let state: Vec<String> = calls
+        // Second turn — re-attach to turn-B.
+        observer.attach("turn-B", "test-agent");
+        // Clear startup emissions (release_agent + metadata + idle) before
+        // checking the actual event-driven transitions.
+        calls.lock().clear();
+
+        // Events with turn-B must be processed.
+        observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some("turn-B".to_string()),
+        });
+        let states: Vec<String> = calls
             .lock()
-            .drain(..)
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
             .filter_map(|c| {
                 c.params
                     .get("state")
@@ -1349,7 +1466,41 @@ pub(crate) mod tests {
                     .map(str::to_string)
             })
             .collect();
-        assert_eq!(state, vec!["idle"]);
+        assert_eq!(
+            states,
+            vec!["working"],
+            "turn-B events must be processed after re-attach"
+        );
+
+        // Events with the OLD turn-A must be filtered.
+        calls.lock().clear();
+        observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(10),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some("turn-A".to_string()),
+        });
+        let states2: Vec<String> = calls
+            .lock()
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| {
+                c.params
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            states2.is_empty(),
+            "turn-A events must be filtered after re-attach to turn-B"
+        );
+
+        observer.detach();
     }
 
     /// When the writer task is forcibly cancelled (e.g. `abort`), the

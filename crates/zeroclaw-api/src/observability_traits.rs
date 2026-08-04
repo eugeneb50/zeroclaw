@@ -447,10 +447,73 @@ impl<T: Observer + ?Sized> Observer for std::sync::Arc<T> {
     }
 }
 
+/// An [`Observer`] that drives an external sidecar application's state
+/// rather than (or in addition to) recording pure telemetry.
+///
+/// Sidecars — e.g. the Herdr sidebar, TUI dashboards, IDE integrations —
+/// maintain mutable UI state keyed to a specific interactive agent turn.
+/// Unlike a normal observer backend (OTel, Prometheus, log) which is
+/// process-wide and stateless, a sidecar:
+///
+/// - is **scoped**: it owns a single `turn_id` and ignores events from
+///   nested or unrelated turns;
+/// - has **lifecycle**: it must be attached at turn start and detached at
+///   turn end, emitting a terminal handshake on detach;
+/// - may have **external side effects**: attaching/detaching can install or
+///   remove process-wide broadcast hooks and drive I/O to an external
+///   daemon.
+///
+/// Implementations must be idempotent: `attach` with the same turn is a
+/// no-op once already attached; `detach` is a no-op if never attached or
+/// already detached.
+///
+/// # Example
+///
+/// ```ignore
+/// impl SidecarObserver for HerdrObserver {
+///     fn attach(&self, turn_id: &str, agent_alias: &str) {
+///         // set owning turn, install broadcast hook, emit initial idle
+///     }
+///     fn detach(&self) {
+///         // flush terminal pair, uninstall hook, clear owning turn
+///     }
+///     fn owns_turn(&self, turn_id: Option<&str>) -> bool {
+///         // true when the given turn matches our owning turn
+///     }
+/// }
+/// ```
+pub trait SidecarObserver: Observer {
+    /// Bind this sidecar to a specific interactive turn.
+    ///
+    /// Called exactly once at turn start. Implementations install any
+    /// broadcast hook, set the owning turn id, and emit an initial state
+    /// report so the sidecar UI shows the agent immediately. Must be
+    /// idempotent: calling `attach` again with the same turn is a no-op.
+    fn attach(&self, turn_id: &str, agent_alias: &str);
+
+    /// Detach from the current turn.
+    ///
+    /// Flushes any terminal handshake (e.g. `idle` + `release_agent`),
+    /// uninstalls the broadcast hook, and clears the owning turn id so
+    /// subsequent events are not forwarded. Must be idempotent: calling
+    /// `detach` when not attached is a no-op. `Drop` implementations of a
+    /// scope guard typically call this.
+    fn detach(&self);
+
+    /// Fast-path filter: whether this sidecar owns the given turn.
+    ///
+    /// `None` indicates the event is unattributed (legacy emitter); the
+    /// sidecar decides whether to pass it through. `Some(id)` returns
+    /// `true` only when `id` matches this sidecar's owning turn.
+    fn owns_turn(&self, turn_id: Option<&str>) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[derive(Default)]
@@ -501,6 +564,109 @@ mod tests {
         observer.flush();
         assert_eq!(observer.name(), "dummy-observer");
         assert!(observer.as_any().downcast_ref::<DummyObserver>().is_some());
+    }
+
+    /// Minimal SidecarObserver test double — verifies the blanket
+    /// `Arc<T>` delegation carries through to `SidecarObserver` methods.
+    struct DummySidecar {
+        attach_calls: AtomicUsize,
+        detach_calls: AtomicUsize,
+        owning_turn: Mutex<Option<String>>,
+    }
+
+    impl Default for DummySidecar {
+        fn default() -> Self {
+            Self {
+                attach_calls: AtomicUsize::new(0),
+                detach_calls: AtomicUsize::new(0),
+                owning_turn: Mutex::new(None),
+            }
+        }
+    }
+
+    impl Observer for DummySidecar {
+        fn record_event(&self, _event: &ObserverEvent) {}
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+        fn flush(&self) {}
+        fn name(&self) -> &str {
+            "dummy-sidecar"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    impl SidecarObserver for DummySidecar {
+        fn attach(&self, turn_id: &str, _agent_alias: &str) {
+            let mut owning = self.owning_turn.lock();
+            if owning.is_some() {
+                return;
+            }
+            *owning = Some(turn_id.to_string());
+            self.attach_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn detach(&self) {
+            let mut owning = self.owning_turn.lock();
+            if owning.is_none() {
+                return;
+            }
+            *owning = None;
+            self.detach_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn owns_turn(&self, turn_id: Option<&str>) -> bool {
+            let owning = self.owning_turn.lock();
+            match (owning.as_deref(), turn_id) {
+                (Some(owned), Some(id)) => owned == id,
+                (Some(_), None) => false,
+                (None, _) => false,
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_observer_attach_sets_ownership() {
+        let sidecar = DummySidecar::default();
+        assert!(!sidecar.owns_turn(Some("turn-1")));
+        sidecar.attach("turn-1", "default");
+        assert_eq!(sidecar.attach_calls.load(Ordering::SeqCst), 1);
+        assert!(sidecar.owns_turn(Some("turn-1")));
+        assert!(!sidecar.owns_turn(Some("turn-2")));
+        assert!(!sidecar.owns_turn(None));
+    }
+
+    #[test]
+    fn sidecar_observer_attach_is_idempotent() {
+        let sidecar = DummySidecar::default();
+        sidecar.attach("turn-1", "default");
+        sidecar.attach("turn-1", "default");
+        assert_eq!(sidecar.attach_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sidecar_observer_detach_is_idempotent_and_clears_ownership() {
+        let sidecar = DummySidecar::default();
+        sidecar.detach();
+        assert_eq!(sidecar.detach_calls.load(Ordering::SeqCst), 0);
+        sidecar.attach("turn-1", "default");
+        sidecar.detach();
+        assert_eq!(sidecar.detach_calls.load(Ordering::SeqCst), 1);
+        assert!(!sidecar.owns_turn(Some("turn-1")));
+        sidecar.detach();
+        assert_eq!(sidecar.detach_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn sidecar_observer_arc_delegates_methods() {
+        let sidecar = Arc::new(DummySidecar::default());
+        let arc: Arc<dyn SidecarObserver> = sidecar.clone();
+        arc.attach("turn-1", "default");
+        assert!(arc.owns_turn(Some("turn-1")));
+        arc.detach();
+        assert!(!arc.owns_turn(Some("turn-1")));
+        assert_eq!(sidecar.attach_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sidecar.detach_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

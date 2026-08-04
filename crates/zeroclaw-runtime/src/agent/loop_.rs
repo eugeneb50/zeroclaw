@@ -43,6 +43,25 @@ pub fn register_peripheral_tools_fn(f: PeripheralToolsFn) {
     let _ = PERIPHERAL_TOOLS_FN.set(f);
 }
 
+/// RAII guard that detaches a [`SidecarObserver`] on drop.
+/// Used to ensure the Herdr sidecar's terminal handshake is flushed
+/// and its broadcast hook is uninstalled when the agent turn ends.
+struct SidecarScope(Option<Arc<dyn zeroclaw_api::observability_traits::SidecarObserver>>);
+
+impl SidecarScope {
+    fn new(sidecar: Arc<dyn zeroclaw_api::observability_traits::SidecarObserver>) -> Self {
+        Self(Some(sidecar))
+    }
+}
+
+impl Drop for SidecarScope {
+    fn drop(&mut self) {
+        if let Some(sidecar) = self.0.take() {
+            sidecar.detach();
+        }
+    }
+}
+
 /// Public helper for other crates (e.g. channels orchestrator) to load
 /// peripheral tools through the registered factory. Returns empty vec
 /// when nothing is registered (hardware feature off or not yet wired).
@@ -1196,19 +1215,25 @@ pub async fn run(
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let turn_id = uuid::Uuid::new_v4().to_string();
         let channel_name = if interactive { "cli" } else { "daemon" };
-        // Install the Herdr broadcast hook BEFORE the FlushGuard so that, on
-        // teardown, Rust's reverse-declaration drop order fires the FlushGuard
-        // first — while the Herdr hook is still installed — and the Herdr
-        // observer's idle + release_agent notifications get drained via
-        // `TeeObserver::flush()` fanning out to the broadcast hook. The Herdr
-        // guard then drops, removing the hook and releasing the I/O thread.
-        // Daemon/cron/subagent callers pass `interactive = false`; the Herdr
-        // integration is CLI-interactive-only and must not mutate pane state
-        // from those paths. The `turn_id` filter ensures nested non-interactive
-        // subagent runs cannot mutate the parent's pane state even though they
-        // share the same process.
-        let _herdr_guard =
-            crate::integrations::herdr::try_install_hook(interactive, agent_alias, Some(&turn_id));
+        // Install the Herdr sidecar BEFORE the FlushGuard so that, on teardown,
+        // Rust's reverse-declaration drop order fires the FlushGuard first —
+        // while the sidecar's broadcast hook is still installed — and the
+        // sidecar's idle + release_agent notifications get drained via
+        // `TeeObserver::flush()` fanning out to the broadcast hook. The
+        // SidecarScope then drops, calling `detach()` which flushes the
+        // terminal pair (idempotent), drains pending writes, and removes the
+        // hook. Daemon/cron/subagent callers pass `interactive = false`; the
+        // Herdr integration is CLI-interactive-only and must not mutate pane
+        // state from those paths. The `owning_turn_id` filter ensures nested
+        // non-interactive subagent runs cannot mutate the parent's pane state
+        // even though they share the same process.
+        let _sidecar_scope =
+            crate::integrations::herdr::try_install_herdr_sidecar(interactive, agent_alias).map(
+                |sidecar| {
+                    sidecar.attach(&turn_id, agent_alias);
+                    SidecarScope::new(sidecar)
+                },
+            );
         // CLI one-shot / REPL (`interactive = true`) exits before the OTLP batch
         // exporter's background interval fires. Hold a FlushGuard for the rest of
         // this body so every return path — including `?` errors — pushes buffered
@@ -1693,10 +1718,6 @@ pub async fn run(
             }
         });
 
-        // Herdr session_id reporting is deferred until Herdr accepts the
-        // ("herdr:zeroclaw", "zeroclaw") (source, agent) pair contract. `memory_session_id`
-        // is still used below for internal memory operations and local correlation.
-
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
             crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
@@ -1792,7 +1813,9 @@ pub async fn run(
                 if interactive {
                     println!("{final_output}");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
+                observer.record_event(&ObserverEvent::TurnComplete {
+                    turn_id: Some(turn_id.clone()),
+                });
                 return Ok(final_output);
             }
 
@@ -2100,7 +2123,9 @@ pub async fn run(
             if interactive {
                 println!("{final_output}");
             }
-            observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
+            observer.record_event(&ObserverEvent::TurnComplete {
+                turn_id: Some(turn_id.clone()),
+            });
 
             if config.skills.skill_improvement.enabled {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
@@ -2305,7 +2330,9 @@ pub async fn run(
                     {
                         eprintln!("\nError sending CLI response: {e}\n");
                     }
-observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
+                    observer.record_event(&ObserverEvent::TurnComplete {
+                        turn_id: Some(turn_id.clone()),
+                    });
                     if let Some(sys_msg) = history.first_mut()
                         && sys_msg.role == "system"
                     {
@@ -2707,7 +2734,9 @@ observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone
                 {
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone()) });
+                observer.record_event(&ObserverEvent::TurnComplete {
+                    turn_id: Some(turn_id.clone()),
+                });
 
                 // Display context usage for this turn.
                 if let Some(ref ctx) = cost_tracking_context {
@@ -2777,6 +2806,12 @@ observer.record_event(&ObserverEvent::TurnComplete { turn_id: Some(turn_id.clone
         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
         turn_guard.set_usage(tokens_used, None);
         turn_guard.finish();
+
+        // Explicitly detach the sidecar so its terminal handshake is flushed
+        // before the runtime tears down. Drop handles error paths; this covers
+        // the happy path where turn_guard.finish() emits AgentEnd but the
+        // sidecar's detach() drains the pending writes.
+        drop(_sidecar_scope);
 
         Ok(final_output)
     };

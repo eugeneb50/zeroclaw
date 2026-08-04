@@ -205,7 +205,7 @@ pub fn clear_broadcast_hook() {
     broadcast_hook_slot().write().entries.clear();
 }
 
-fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
+pub(crate) fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
     broadcast_hook_slot().read().current()
 }
 

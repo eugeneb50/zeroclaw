@@ -117,50 +117,49 @@ macro_rules! assert_state_sequence {
 }
 
 #[tokio::test]
-async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
-    clear_broadcast_hook();
-    let spy = HerdrSpy::new();
-    let (client, calls) = make_spy_reporter(spy);
-    let herdr = Arc::new(HerdrObserver::new(client, None));
-    let _guard = set_scoped_broadcast_hook(herdr.clone());
+async fn approval_gate_herdr_state_transitions() {
+    let cases: [(ChannelApprovalResponse, bool, Vec<&str>); 2] = [
+        (
+            ChannelApprovalResponse::Approve,
+            true,
+            vec!["blocked", "working"],
+        ),
+        (
+            ChannelApprovalResponse::Deny,
+            false,
+            vec!["blocked", "idle"],
+        ),
+    ];
 
-    let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
-    let channel = Arc::new(TestChannel::new(
-        ChannelApprovalResponse::Approve,
-        Arc::new(AtomicUsize::new(0)),
-    )) as Arc<dyn Channel>;
-    let (tx, _rx) = mpsc::channel(8);
-    let pacing = PacingConfig::default();
-    let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);
+    for (response, expect_approved, expect_seq) in cases {
+        let label = format!("{response:?}");
+        clear_broadcast_hook();
+        let spy = HerdrSpy::new();
+        let (client, calls) = make_spy_reporter(spy);
+        let herdr = Arc::new(HerdrObserver::new(client, None));
+        let _guard = set_scoped_broadcast_hook(herdr.clone());
 
-    let outcome =
-        gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "echo hi"}), 0).await;
-    assert!(matches!(
-        outcome,
-        ApprovalGateOutcome::Proceed { approved: true }
-    ));
-    assert_state_sequence!(calls, vec!["blocked", "working"]);
-}
+        let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
+        let channel =
+            Arc::new(TestChannel::new(response, Arc::new(AtomicUsize::new(0)))) as Arc<dyn Channel>;
+        let (tx, _rx) = mpsc::channel(8);
+        let pacing = PacingConfig::default();
+        let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);
 
-#[tokio::test]
-async fn approval_gate_herdr_deny_transitions_blocked_to_idle() {
-    clear_broadcast_hook();
-    let spy = HerdrSpy::new();
-    let (client, calls) = make_spy_reporter(spy);
-    let herdr = Arc::new(HerdrObserver::new(client, None));
-    let _guard = set_scoped_broadcast_hook(herdr.clone());
+        let outcome =
+            gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "test"}), 0).await;
 
-    let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
-    let channel = Arc::new(TestChannel::new(
-        ChannelApprovalResponse::Deny,
-        Arc::new(AtomicUsize::new(0)),
-    )) as Arc<dyn Channel>;
-    let (tx, _rx) = mpsc::channel(8);
-    let pacing = PacingConfig::default();
-    let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);
-
-    let outcome =
-        gate_tool_approval(&ctx, "shell", &serde_json::json!({"cmd": "rm -rf /"}), 0).await;
-    assert!(matches!(outcome, ApprovalGateOutcome::Deny(_)));
-    assert_state_sequence!(calls, vec!["blocked", "idle"]);
+        if expect_approved {
+            assert!(
+                matches!(outcome, ApprovalGateOutcome::Proceed { approved: true }),
+                "expected Proceed approved for {label}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, ApprovalGateOutcome::Deny(_)),
+                "expected Deny for {label}"
+            );
+        }
+        assert_state_sequence!(calls, expect_seq);
+    }
 }

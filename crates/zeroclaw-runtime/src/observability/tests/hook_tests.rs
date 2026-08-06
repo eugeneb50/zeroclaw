@@ -18,7 +18,7 @@ impl Observer for CountingObserver {
 
 #[test]
 fn tee_observer_flush_drives_broadcast_hook() {
-    let _guard = HOOK_TEST_LOCK.lock();
+    let _guard = HOOK_TEST_LOCK.blocking_lock();
     clear_broadcast_hook();
     let hook = Arc::new(CountingObserver::default());
     set_broadcast_hook(hook.clone());
@@ -32,7 +32,7 @@ fn tee_observer_flush_drives_broadcast_hook() {
 
 #[test]
 fn flush_guard_drains_broadcast_hook_on_drop() {
-    let _guard = HOOK_TEST_LOCK.lock();
+    let _guard = HOOK_TEST_LOCK.blocking_lock();
     clear_broadcast_hook();
     let hook = Arc::new(CountingObserver::default());
     let _hook_guard = set_scoped_broadcast_hook(hook.clone());

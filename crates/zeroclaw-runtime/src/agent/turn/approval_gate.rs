@@ -7,7 +7,7 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
-use zeroclaw_api::observability_traits::{AuthorizationResponseType, ObserverEvent};
+use zeroclaw_api::observability_traits::ObserverEvent;
 
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
@@ -37,11 +37,10 @@ pub(crate) async fn gate_tool_approval(
             arguments: tool_args.clone(),
         };
 
-        // Emit AuthorizationRequested before prompting
         let arguments_summary = crate::approval::summarize_args(tool_args);
         let event = ObserverEvent::AuthorizationRequested {
             tool_name: tool_name.to_string(),
-            arguments_summary,
+            arguments_summary: arguments_summary.clone(),
             channel: Some(ctx.channel_name.to_string()),
             turn_id: Some(ctx.turn_id.to_string()),
         };
@@ -55,7 +54,7 @@ pub(crate) async fn gate_tool_approval(
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary: arguments_summary.clone(),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
@@ -119,17 +118,9 @@ pub(crate) async fn gate_tool_approval(
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 
-        // Emit AuthorizationResponded event
-        let response_type = match decision {
-            ApprovalResponse::Yes => AuthorizationResponseType::Yes,
-            ApprovalResponse::Always => AuthorizationResponseType::Always,
-            ApprovalResponse::No => AuthorizationResponseType::No,
-            ApprovalResponse::ReplaceWith(_) => AuthorizationResponseType::ReplaceWith,
-        };
         let event = ObserverEvent::AuthorizationResponded {
             tool_name: tool_name.to_string(),
             granted: matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always),
-            response_type,
             channel: Some(ctx.channel_name.to_string()),
             turn_id: Some(ctx.turn_id.to_string()),
         };

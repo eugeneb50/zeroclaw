@@ -147,33 +147,13 @@ fn install_hook_from_env(
 #[cfg(test)]
 type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
 
-/// Maximum number of pending messages in the writer queue. Bounded to prevent
-/// unbounded accumulation when the Herdr daemon is slow or unavailable.
-/// Capacity 64: 64 * 700ms (max connect+write) = ~45s theoretical max drain,
-/// but shutdown timeout caps actual wait at 2s.
+/// Maximum number of pending messages in the writer queue.
 const WRITER_QUEUE_CAPACITY: usize = 64;
-
-/// Drop guard that signals the drain-done channel during a panic unwind, so
-/// the sync `shutdown_drain()` never waits the full 2s timeout for a task
-/// that already crashed.
-#[cfg(unix)]
-struct DrainOnPanic(Option<std_mpsc::SyncSender<()>>);
-
-#[cfg(unix)]
-impl Drop for DrainOnPanic {
-    fn drop(&mut self) {
-        if std::thread::panicking()
-            && let Some(tx) = self.0.take()
-        {
-            let _ = tx.send(());
-        }
-    }
-}
 
 /// Client that sends JSON-RPC notifications to the herdr daemon via tokio UDS.
 /// The `send()` method serializes and fires off an async write — it never
 /// blocks the caller. Call `shutdown_drain()` to wait until pending writes complete
-/// (used at startup and shutdown for guaranteed delivery).
+/// (used at startup and shutdown for best-effort delivery).
 pub(crate) struct HerdrClient {
     pane_id: String,
     #[cfg(test)]
@@ -198,12 +178,8 @@ impl HerdrClient {
             // the sync `flush()` path. Buffered(1) so the writer task can send
             // without blocking even if the receiver isn't waiting yet.
             let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
-            // Clone so the panic guard can signal drain completion even if
-            // the writer task panics mid-write.
-            let drain_tx_for_panic = drain_done_tx.clone();
             let socket_path = socket_path.clone();
             let _writer_handle = zeroclaw_spawn::spawn!(async move {
-                let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
                 loop {
                     tokio::select! {
                         biased;
@@ -261,7 +237,7 @@ impl HerdrClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_spy<F>(_socket_path: String, pane_id: String, spy: F) -> Self
+    pub(crate) fn new_with_spy<F>(pane_id: String, spy: F) -> Self
     where
         F: Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync + 'static,
     {
@@ -359,9 +335,7 @@ impl HerdrClient {
 
         // Fire-and-forget: push to writer task via bounded channel. Use
         // `try_send` so the caller never blocks on a slow/unavailable peer.
-        // On queue full, drop the new message — `transit_to` already suppresses
-        // redundant state transitions, so this is a rare
-        // backpressure case that loses a stale lifecycle snapshot.
+        // On queue full, drop the new message.
         #[cfg(unix)]
         if let Some(tx) = self.writer.lock().as_ref() {
             match tx.try_send(payload_str) {
@@ -432,9 +406,7 @@ impl HerdrObserver {
             owning_turn_id: owning_turn_id.map(|s| s.to_owned()),
         }
     }
-}
 
-impl HerdrObserver {
     fn transit_to(&self, state: &mut HerdrState, target: HerdrState) {
         if *state == target {
             return;
@@ -513,11 +485,7 @@ impl Observer for HerdrObserver {
     fn flush(&self) {
         {
             let mut state = self.state.lock();
-            if *state != HerdrState::Released {
-                *state = HerdrState::Released;
-                self.client.report_state("idle");
-                self.client.report_released();
-            }
+            self.transit_to(&mut state, HerdrState::Released);
         }
         self.client.shutdown_drain(SHUTDOWN_TIMEOUT);
     }
@@ -553,21 +521,17 @@ pub(crate) mod tests {
     }
 
     impl HerdrSpy {
-        pub(crate) fn new() -> Self {
-            Self::default()
-        }
-
         pub(crate) fn into_inner(self) -> Arc<Mutex<Vec<HerdrSpyCall>>> {
             self.calls
         }
     }
 
-    /// Build a `HerdrClient` with the spy instead of connecting to a real UDS socket.
-    pub(crate) fn make_spy_reporter(spy: HerdrSpy) -> (HerdrClient, Arc<Mutex<Vec<HerdrSpyCall>>>) {
+    /// Build a `HerdrClient` with a spy instead of connecting to a real UDS socket.
+    pub(crate) fn make_spy_reporter() -> (HerdrClient, Arc<Mutex<Vec<HerdrSpyCall>>>) {
+        let spy = HerdrSpy::default();
         let calls = spy.into_inner();
         let calls_clone = calls.clone();
         let client = HerdrClient::new_with_spy(
-            "/tmp/test-herdr.sock".into(),
             "test-pane".into(),
             move |method, params| {
                 calls_clone.lock().push(HerdrSpyCall {
@@ -658,8 +622,7 @@ pub(crate) mod tests {
     /// AgentEnd / run-teardown drain contract.
     #[tokio::test]
     async fn herdr_observer_flush_drains_release_messages() {
-        let spy = HerdrSpy::new();
-        let (client, calls) = make_spy_reporter(spy);
+        let (client, calls) = make_spy_reporter();
         let observer = HerdrObserver::new(client, None);
 
         // Simulate the agent reaching Working state first so flush has
@@ -841,15 +804,14 @@ pub(crate) mod tests {
     /// release parent's pane.
     #[tokio::test]
     async fn herdr_nested_run_isolation() {
-        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
+        use crate::integrations::herdr::tests::make_spy_reporter;
         use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
 
         clear_broadcast_hook();
 
         // Parent installs hook with owning turn_id
         let parent_turn_id = "parent-turn-123";
-        let spy_parent = HerdrSpy::new();
-        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
+        let (client_parent, calls_parent) = make_spy_reporter();
         let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
         let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
 

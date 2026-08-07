@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,20 @@ const IO_TIMEOUT: Duration = Duration::from_millis(500);
 /// Maximum time to wait for the writer task to drain all pending messages
 /// at shutdown. Bounds the total teardown latency.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Wall-clock seed for the sequence counter, in microseconds since the epoch.
+///
+/// Seeding from the clock is what makes sequence numbers survive a restart:
+/// Herdr orders reports by `seq`, so a fresh process must not resume from a
+/// value below the one it last sent. Split out from `next_seq` so the seeding
+/// rule can be tested independently of the process-global counter, whose value
+/// depends on whichever caller initialized it first.
+fn seq_base() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(1_000_000_000_000_000)
+}
 
 /// Connect to a Unix domain socket with a timeout using tokio.
 #[cfg(unix)]
@@ -153,6 +167,25 @@ type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Sen
 /// but shutdown timeout caps actual wait at 2s.
 const WRITER_QUEUE_CAPACITY: usize = 64;
 
+/// Reserved capacity for terminal lifecycle payloads (`idle` + `release_agent`).
+///
+/// Terminal state is an operator-visible contract — a pane that exited must stop
+/// being displayed as `working` — so it cannot share the snapshot queue, where a
+/// saturated writer silently drops new messages. A client emits the pair at most
+/// once; four slots leave headroom for a retry after a failed enqueue.
+const TERMINAL_QUEUE_CAPACITY: usize = 4;
+
+/// Connect and write one payload, ignoring transport failures.
+///
+/// Delivery is best-effort per message; the caller decides whether losing it is
+/// acceptable (snapshots) or must suppress a state commit (terminal pair).
+#[cfg(unix)]
+async fn write_payload(socket_path: &str, payload: &str) {
+    if let Ok(mut stream) = connect_with_timeout(socket_path).await {
+        let _ = send_on_stream(&mut stream, payload).await;
+    }
+}
+
 /// Drop guard that signals the drain-done channel during a panic unwind, so
 /// the sync `shutdown_drain()` never waits the full 2s timeout for a task
 /// that already crashed.
@@ -180,6 +213,11 @@ pub(crate) struct HerdrClient {
     spy: Option<SpyFn>,
     #[cfg(unix)]
     writer: Mutex<Option<mpsc::Sender<String>>>,
+    /// Reserved sender for the terminal pair. Kept separate from `writer` so a
+    /// saturated snapshot queue cannot drop it, and so the writer task can
+    /// service it ahead of any queued snapshot.
+    #[cfg(unix)]
+    terminal: Mutex<Option<mpsc::Sender<String>>>,
     #[cfg(unix)]
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     /// Sync channel signaled by the writer task when it has finished draining.
@@ -193,6 +231,7 @@ impl HerdrClient {
         #[cfg(unix)]
         {
             let (tx, mut rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
+            let (terminal_tx, mut terminal_rx) = mpsc::channel::<String>(TERMINAL_QUEUE_CAPACITY);
             let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
             // Sync channel for the writer task to signal drain completion to
             // the sync `flush()` path. Buffered(1) so the writer task can send
@@ -207,14 +246,20 @@ impl HerdrClient {
                 loop {
                     tokio::select! {
                         biased;
+                        // Terminal payloads outrank queued snapshots: the pane's
+                        // final state is a lifecycle contract, a snapshot is not.
+                        Some(payload) = terminal_rx.recv() => {
+                            write_payload(&socket_path, &payload).await;
+                        }
                         _ = &mut shutdown_rx => {
-                            // Shutdown signal received, drain remaining messages
-                            while let Some(payload) = rx.recv().await {
-                                let mut stream = match connect_with_timeout(&socket_path).await {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-                                let _ = send_on_stream(&mut stream, &payload).await;
+                            // Terminal-first drain. Pending snapshots are
+                            // superseded by the terminal `idle`, so they are
+                            // coalesced away instead of spending the shutdown
+                            // budget — 64 queued snapshots at up to 700ms each
+                            // (connect + write) would exhaust it many times over
+                            // and lose the pair that actually matters.
+                            while let Ok(payload) = terminal_rx.try_recv() {
+                                write_payload(&socket_path, &payload).await;
                             }
                             // Signal drain completion to the sync flush path.
                             let _ = drain_done_tx.send(());
@@ -223,15 +268,15 @@ impl HerdrClient {
                         maybe_payload = rx.recv() => {
                             match maybe_payload {
                                 Some(payload) => {
-                                    let mut stream = match connect_with_timeout(&socket_path).await {
-                                        Ok(s) => s,
-                                        Err(_) => continue,
-                                    };
-                                    let _ = send_on_stream(&mut stream, &payload).await;
+                                    write_payload(&socket_path, &payload).await;
                                 }
                                 None => {
-                                    // Channel closed without shutdown signal;
-                                    // signal drain done and exit.
+                                    // Snapshot channel closed without a shutdown
+                                    // signal: still deliver any queued terminal
+                                    // payload before exiting.
+                                    while let Ok(payload) = terminal_rx.try_recv() {
+                                        write_payload(&socket_path, &payload).await;
+                                    }
                                     let _ = drain_done_tx.send(());
                                     break;
                                 }
@@ -245,6 +290,7 @@ impl HerdrClient {
                 #[cfg(test)]
                 spy: None,
                 writer: Mutex::new(Some(tx)),
+                terminal: Mutex::new(Some(terminal_tx)),
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
                 drain_done_rx: Mutex::new(Some(drain_done_rx)),
             }
@@ -270,6 +316,8 @@ impl HerdrClient {
             spy: Some(Arc::new(spy)),
             #[cfg(unix)]
             writer: Mutex::new(None),
+            #[cfg(unix)]
+            terminal: Mutex::new(None),
             #[cfg(unix)]
             shutdown_tx: Mutex::new(None),
             #[cfg(unix)]
@@ -309,13 +357,7 @@ impl HerdrClient {
 
     fn next_seq(&self) -> u64 {
         static NEXT_SEQ: OnceLock<AtomicU64> = OnceLock::new();
-        let counter = NEXT_SEQ.get_or_init(|| {
-            let base = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_micros() as u64)
-                .unwrap_or(1_000_000_000_000_000);
-            AtomicU64::new(base)
-        });
+        let counter = NEXT_SEQ.get_or_init(|| AtomicU64::new(seq_base()));
         counter.fetch_add(1, Ordering::Relaxed)
     }
 
@@ -323,17 +365,11 @@ impl HerdrClient {
         format!("{SOURCE}:{}", self.next_seq())
     }
 
-    fn send(
+    fn build_payload(
         &self,
         method: &str,
         params: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), std::io::Error> {
-        #[cfg(test)]
-        if let Some(spy) = &self.spy {
-            spy(method, params);
-            return Ok(());
-        }
-
+    ) -> Result<String, std::io::Error> {
         let mut params_map = serde_json::Map::new();
         params_map.insert(
             "pane_id".into(),
@@ -355,7 +391,23 @@ impl HerdrClient {
             "params": params_map,
         });
 
-        let payload_str = serde_json::to_string(&payload)?;
+        Ok(serde_json::to_string(&payload)?)
+    }
+
+    /// Enqueue a lifecycle *snapshot*. Best-effort: a saturated queue drops the
+    /// message, which is acceptable because the next transition supersedes it.
+    fn send(
+        &self,
+        method: &str,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        if let Some(spy) = &self.spy {
+            spy(method, params);
+            return Ok(());
+        }
+
+        let payload_str = self.build_payload(method, params)?;
 
         // Fire-and-forget: push to writer task via bounded channel. Use
         // `try_send` so the caller never blocks on a slow/unavailable peer.
@@ -374,14 +426,57 @@ impl HerdrClient {
         Ok(())
     }
 
+    /// Enqueue a *terminal* payload on the reserved path.
+    ///
+    /// Returns `true` only when the payload reached the writer. Callers must not
+    /// commit terminal state on `false`: `transit_to` suppresses repeat
+    /// transitions, so a committed-but-undelivered `Released` would block the
+    /// retry that `flush()` would otherwise make, stranding the pane as
+    /// `working` forever.
+    fn send_terminal(
+        &self,
+        method: &str,
+        params: &serde_json::Map<String, serde_json::Value>,
+    ) -> bool {
+        #[cfg(test)]
+        if let Some(spy) = &self.spy {
+            spy(method, params);
+            return true;
+        }
+
+        let Ok(payload_str) = self.build_payload(method, params) else {
+            return false;
+        };
+
+        #[cfg(unix)]
+        {
+            let tx = self.terminal.lock();
+            match tx.as_ref() {
+                Some(tx) => tx.try_send(payload_str).is_ok(),
+                None => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = payload_str;
+            true
+        }
+    }
+
     fn report_state(&self, state: &str) {
         let mut params = serde_json::Map::new();
         params.insert("state".into(), serde_json::Value::String(state.into()));
         let _ = self.send("pane.report_agent", &params);
     }
 
-    fn report_released(&self) {
-        let _ = self.send("pane.release_agent", &serde_json::Map::new());
+    /// Report the terminal pair (`idle` then `release_agent`) on the reserved
+    /// path. Returns `true` only when both payloads were queued.
+    fn report_terminal(&self) -> bool {
+        let mut params = serde_json::Map::new();
+        params.insert("state".into(), serde_json::Value::String("idle".into()));
+        let idle_queued = self.send_terminal("pane.report_agent", &params);
+        let release_queued = self.send_terminal("pane.release_agent", &serde_json::Map::new());
+        idle_queued && release_queued
     }
 
     fn report_metadata(&self, display_agent: &str) {
@@ -422,6 +517,13 @@ pub struct HerdrObserver {
     client: HerdrClient,
     /// Owning turn identity for event filtering.
     owning_turn_id: Option<String>,
+    /// Nested non-owning runs currently in flight, bracketed by their
+    /// `AgentStart`/`AgentEnd` (both of which carry a `turn_id`).
+    ///
+    /// `ObserverEvent::TurnComplete` carries no identity, so it cannot be
+    /// attributed on its own. This counter is the attributed boundary: while it
+    /// is non-zero a completion belongs to a child, not to the pane's owner.
+    nested_runs: AtomicUsize,
 }
 
 impl HerdrObserver {
@@ -430,6 +532,7 @@ impl HerdrObserver {
             state: Mutex::new(HerdrState::Idle),
             client,
             owning_turn_id: owning_turn_id.map(|s| s.to_owned()),
+            nested_runs: AtomicUsize::new(0),
         }
     }
 }
@@ -439,15 +542,27 @@ impl HerdrObserver {
         if *state == target {
             return;
         }
-        *state = target;
         match target {
+            // Commit only once the pair is queued on the reserved path. If the
+            // enqueue fails the state stays put so `flush()` can retry, rather
+            // than reporting a release that was never sent.
             HerdrState::Released => {
-                self.client.report_state("idle");
-                self.client.report_released();
+                if self.client.report_terminal() {
+                    *state = target;
+                }
             }
-            HerdrState::Working => self.client.report_state("working"),
-            HerdrState::Idle => self.client.report_state("idle"),
-            HerdrState::Blocked => self.client.report_state("blocked"),
+            HerdrState::Working => {
+                *state = target;
+                self.client.report_state("working");
+            }
+            HerdrState::Idle => {
+                *state = target;
+                self.client.report_state("idle");
+            }
+            HerdrState::Blocked => {
+                *state = target;
+                self.client.report_state("blocked");
+            }
         }
     }
 }
@@ -471,6 +586,24 @@ impl Observer for HerdrObserver {
                 _ => None,
             };
             if event_turn.is_some_and(|t| t != owning) {
+                // Foreign run: drop the event, but bracket its lifetime first so
+                // unscoped events arriving while it runs can be attributed.
+                match event {
+                    ObserverEvent::AgentStart { .. } => {
+                        self.nested_runs.fetch_add(1, Ordering::Relaxed);
+                    }
+                    ObserverEvent::AgentEnd { .. } => {
+                        // `fetch_update` floors at zero: an `AgentEnd` whose
+                        // `AgentStart` predates this observer must not wrap the
+                        // counter and disable owner completions forever.
+                        let _ = self.nested_runs.fetch_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |depth| Some(depth.saturating_sub(1)),
+                        );
+                    }
+                    _ => {}
+                }
                 return;
             }
         }
@@ -489,7 +622,13 @@ impl Observer for HerdrObserver {
                 self.transit_to(&mut state, HerdrState::Working);
             }
             ObserverEvent::TurnComplete => {
-                self.transit_to(&mut state, HerdrState::Idle);
+                // Unscoped event: it proves no owner, so it may only idle the
+                // pane when no nested run is in flight. Otherwise a subagent
+                // finishing would mark the parent idle while the parent is still
+                // working or waiting on an approval.
+                if self.nested_runs.load(Ordering::Relaxed) == 0 {
+                    self.transit_to(&mut state, HerdrState::Idle);
+                }
             }
             ObserverEvent::AgentEnd { .. } => {
                 self.transit_to(&mut state, HerdrState::Released);
@@ -513,10 +652,8 @@ impl Observer for HerdrObserver {
     fn flush(&self) {
         {
             let mut state = self.state.lock();
-            if *state != HerdrState::Released {
+            if *state != HerdrState::Released && self.client.report_terminal() {
                 *state = HerdrState::Released;
-                self.client.report_state("idle");
-                self.client.report_released();
             }
         }
         self.client.shutdown_drain(SHUTDOWN_TIMEOUT);
@@ -725,72 +862,83 @@ pub(crate) mod tests {
             "test-pane".into(),
         );
 
-        // Capture `now_micros` BEFORE generating seq. The seq counter is
-        // seeded from wall clock on first use, so seq1 should be >= the
-        // clock value captured here (within the resolution of SystemTime).
-        let now_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-
         let seq1 = client.next_seq();
         let seq2 = client.next_seq();
         let seq3 = client.next_seq();
 
         assert!(seq2 > seq1, "seq must be monotonic: {} <= {}", seq2, seq1);
         assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
+    }
 
-        // seq1 was captured AFTER now_micros, so seq1 >= now_micros. We allow
-        // 10ms slack to absorb scheduler latency and SystemTime granularity.
+    /// Restart-safety lives in the seed, not in the counter: `next_seq` reads a
+    /// process-global `OnceLock` that any earlier test may have initialized, so
+    /// asserting its value against a fresh clock sample is order-dependent (it
+    /// passes alone and fails under the parallel gate). Test the seeding rule
+    /// directly instead — that is the property restart-safety actually needs.
+    #[test]
+    fn seq_base_is_seeded_from_wall_clock() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let base = seq_base();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(u64::MAX);
+
         assert!(
-            seq1 >= now_micros.saturating_sub(10_000),
-            "seq {} should be seeded from wall clock (now ~{})",
-            seq1,
-            now_micros
+            base >= before && base <= after,
+            "seq base {base} must fall inside the sampling window [{before}, {after}]"
         );
     }
 
-    /// Shutdown drain test: verify ordered receipt of `idle` then
-    /// `pane.release_agent` before shutdown completes. Uses a real
-    /// `UnixListener` to receive messages and confirm ordering.
-    #[tokio::test]
+    /// Accept connections and record the JSON-RPC `method` of each payload
+    /// until `want` messages arrive or the deadline passes. One payload per
+    /// connection — the writer connects per message.
+    async fn collect_methods(listener: UnixListener, want: usize, budget: Duration) -> Vec<String> {
+        let mut received = Vec::new();
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline && received.len() < want {
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
+            {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_ok()
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(method) = val.get("method").and_then(|m| m.as_str())
+                {
+                    received.push(method.to_string());
+                }
+            }
+        }
+        received
+    }
+
+    /// Ordered receipt of the terminal pair, proven *concurrently*: the
+    /// receiver runs on its own task while the sync `shutdown_drain()` blocks a
+    /// worker, so this asserts delivery rather than merely reading whatever
+    /// happened to land after teardown returned. Requires a multi-thread
+    /// runtime — on the single-thread flavor the blocking caller starves the
+    /// writer task and nothing can be delivered while it waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn herdr_shutdown_drain_ordered_receipt() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("herdr-test.sock");
         let sock_str = sock_path.to_str().unwrap().to_string();
 
-        // Bind a listener before starting the client
         let listener = UnixListener::bind(&sock_path).unwrap();
+        let collector = zeroclaw_spawn::spawn!(async move {
+            collect_methods(listener, 2, Duration::from_secs(3)).await
+        });
 
-        // Create client and send messages
         let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
-        client.report_state("idle");
-        client.report_released();
+        assert!(client.report_terminal(), "terminal pair must enqueue");
 
-        // Flush (drains the writer task)
         client.shutdown_drain(SHUTDOWN_TIMEOUT);
 
-        // Now accept and read messages from the listener
-        let mut received = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && received.len() < 2 {
-            match tokio::time::timeout(Duration::from_millis(50), listener.accept()).await {
-                Ok(Ok((stream, _))) => {
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.is_ok() {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
-                                received.push(method.to_string());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Verify ordered receipt: idle then release_agent
+        let received = collector.await.unwrap();
         assert_eq!(
             received.len(),
             2,
@@ -802,37 +950,225 @@ pub(crate) mod tests {
         assert_eq!(received[1], "pane.release_agent");
     }
 
-    /// Shutdown drain bounded wait test: slow/unavailable peer must not
-    /// block shutdown longer than the timeout. Simulates a slow listener
-    /// that accepts but never reads, verifying the 2s timeout is honored.
-    #[tokio::test]
+    /// Saturation regression: the terminal pair must survive a snapshot queue
+    /// that is full. Enqueues well past `WRITER_QUEUE_CAPACITY` so `try_send`
+    /// is dropping snapshots, then asserts the release still reaches the peer.
+    /// Before the reserved terminal path this lost the release outright, and
+    /// the committed `Released` state suppressed any retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn herdr_terminal_pair_survives_saturated_queue() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("herdr-test-saturated.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        // Ask for more than can arrive so the collector runs to its deadline and
+        // captures the tail of the stream rather than stopping early.
+        let collector = zeroclaw_spawn::spawn!(async move {
+            collect_methods(listener, 4096, Duration::from_secs(5)).await
+        });
+
+        let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
+        // Saturate: 4x capacity, enqueued far faster than the writer can drain
+        // (each payload costs a connect + write).
+        for _ in 0..(WRITER_QUEUE_CAPACITY * 4) {
+            client.report_state("working");
+        }
+        assert!(
+            client.report_terminal(),
+            "terminal pair must enqueue even when the snapshot queue is full"
+        );
+
+        client.shutdown_drain(SHUTDOWN_TIMEOUT);
+
+        let received = collector.await.unwrap();
+        let release_at = received.iter().position(|m| m == "pane.release_agent");
+        let release_at = release_at.unwrap_or_else(|| {
+            panic!(
+                "terminal release must be delivered despite backpressure; got {} messages: {:?}",
+                received.len(),
+                received
+            )
+        });
+        assert!(
+            release_at > 0 && received[release_at - 1] == "pane.report_agent",
+            "release must be immediately preceded by the terminal idle: {:?}",
+            &received[release_at.saturating_sub(2)..=release_at]
+        );
+    }
+
+    /// Bounded wait against a peer that genuinely accepts but never reads, so
+    /// writes block on the socket rather than failing fast. The drain must
+    /// still return within the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn herdr_shutdown_drain_bounded_wait() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("herdr-test-slow.sock");
         let sock_str = sock_path.to_str().unwrap().to_string();
 
-        // Bind a listener that accepts but never reads (slow peer)
         let listener = UnixListener::bind(&sock_path).unwrap();
+        // Accept every connection and then sit on it without reading, holding
+        // the streams open for the life of the test.
+        let acceptor = zeroclaw_spawn::spawn!(async move {
+            let mut held = Vec::new();
+            loop {
+                match tokio::time::timeout(Duration::from_millis(50), listener.accept()).await {
+                    Ok(Ok((stream, _))) => held.push(stream),
+                    Ok(Err(_)) => break,
+                    Err(_) => {}
+                }
+            }
+        });
 
-        // Create client and send a message
         let client = HerdrClient::new(sock_str.clone(), "test-pane".into());
-        client.report_state("idle");
-        client.report_released();
+        for _ in 0..WRITER_QUEUE_CAPACITY {
+            client.report_state("working");
+        }
+        assert!(client.report_terminal(), "terminal pair must enqueue");
 
-        // Flush should complete within timeout even with slow peer
         let start = Instant::now();
         client.shutdown_drain(SHUTDOWN_TIMEOUT);
         let elapsed = start.elapsed();
 
-        // Must complete within SHUTDOWN_TIMEOUT (2s) + some slack
         assert!(
-            elapsed < Duration::from_secs(3),
+            elapsed < SHUTDOWN_TIMEOUT + Duration::from_secs(1),
             "shutdown drain must be bounded, took {:?}",
             elapsed
         );
 
-        // Clean up: drop listener to unblock any pending accept
-        drop(listener);
+        acceptor.abort();
+    }
+
+    /// `TurnComplete` carries no turn identity, so it cannot prove which run it
+    /// belongs to. While a nested run is in flight it must not idle the parent's
+    /// pane: before this scoping, a subagent completing marked the parent idle
+    /// even though the parent was still working or waiting on an approval.
+    #[tokio::test]
+    async fn nested_turn_complete_does_not_idle_parent() {
+        let parent_turn = "parent-turn-abc";
+        let child_turn = "child-turn-xyz";
+
+        let (client, calls) = make_spy_reporter(HerdrSpy::new());
+        let observer = HerdrObserver::new(client, Some(parent_turn));
+
+        let agent_start = |turn: &str| ObserverEvent::AgentStart {
+            model_provider: "test".into(),
+            model: "test".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(turn.to_string()),
+        };
+        let agent_end = |turn: &str| ObserverEvent::AgentEnd {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::from_millis(1),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(turn.to_string()),
+        };
+        let llm_request = |turn: &str| ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some(turn.to_string()),
+        };
+
+        // Parent is working, then spawns a subagent.
+        observer.record_event(&agent_start(parent_turn));
+        observer.record_event(&llm_request(parent_turn));
+        observer.record_event(&agent_start(child_turn));
+
+        let states = |calls: &Arc<Mutex<Vec<HerdrSpyCall>>>| -> Vec<String> {
+            calls
+                .lock()
+                .iter()
+                .filter(|c| c.method == "pane.report_agent")
+                .filter_map(|c| {
+                    c.params
+                        .get("state")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            states(&calls).last().map(String::as_str),
+            Some("working"),
+            "parent should be working before the child completes"
+        );
+
+        // The child's completion arrives unscoped. The parent must stay working.
+        observer.record_event(&ObserverEvent::TurnComplete);
+        assert_eq!(
+            states(&calls).last().map(String::as_str),
+            Some("working"),
+            "a nested run's TurnComplete must not idle the parent pane"
+        );
+
+        // Once the child ends, the parent's own completion idles the pane.
+        observer.record_event(&agent_end(child_turn));
+        observer.record_event(&ObserverEvent::TurnComplete);
+        assert_eq!(
+            states(&calls).last().map(String::as_str),
+            Some("idle"),
+            "the owning run's TurnComplete must still idle the pane"
+        );
+    }
+
+    /// A blocked parent is the case that matters most: an approval prompt is
+    /// operator-visible, and a subagent completing must not clear it.
+    #[tokio::test]
+    async fn nested_turn_complete_does_not_clear_parent_block() {
+        let parent_turn = "parent-turn-blocked";
+        let child_turn = "child-turn-inner";
+
+        let (client, calls) = make_spy_reporter(HerdrSpy::new());
+        let observer = HerdrObserver::new(client, Some(parent_turn));
+
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: "test".into(),
+            model: "test".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(parent_turn.to_string()),
+        });
+        observer.record_event(&ObserverEvent::AuthorizationRequested {
+            tool_name: "shell".into(),
+            arguments_summary: "sleep 3".into(),
+            channel: None,
+            turn_id: Some(parent_turn.to_string()),
+        });
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: "test".into(),
+            model: "test".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: Some(child_turn.to_string()),
+        });
+        observer.record_event(&ObserverEvent::TurnComplete);
+
+        let last_state = calls
+            .lock()
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| {
+                c.params
+                    .get("state")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .next_back();
+        assert_eq!(
+            last_state.as_deref(),
+            Some("blocked"),
+            "a nested completion must not clear the parent's approval block"
+        );
     }
 
     /// Nested run isolation test: parent interactive run + child subagent

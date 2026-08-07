@@ -16,24 +16,27 @@ impl Observer for CountingObserver {
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
+// The broadcast registry is process-wide and holds every installed entry, so a
+// test must only ever add and remove its own. `clear_broadcast_hook()` and
+// `set_broadcast_hook()` both wipe *all* entries, which silently detaches
+// observers belonging to tests running concurrently on other threads — they
+// then miss the events they are asserting on. Scoped installs are removed by
+// their guard and leave other entries alone.
 #[test]
 fn tee_observer_flush_drives_broadcast_hook() {
     let _guard = HOOK_TEST_LOCK.lock();
-    clear_broadcast_hook();
     let hook = Arc::new(CountingObserver::default());
-    set_broadcast_hook(hook.clone());
+    let _hook_guard = set_scoped_broadcast_hook(hook.clone());
     let cfg = ObservabilityConfig { backend: ObservabilityBackend::None, ..Default::default() };
     let observer = create_observer(&cfg);
     assert_eq!(hook.flushes.load(Ordering::SeqCst), 0);
     observer.flush();
     assert_eq!(hook.flushes.load(Ordering::SeqCst), 1);
-    clear_broadcast_hook();
 }
 
 #[test]
 fn flush_guard_drains_broadcast_hook_on_drop() {
     let _guard = HOOK_TEST_LOCK.lock();
-    clear_broadcast_hook();
     let hook = Arc::new(CountingObserver::default());
     let _hook_guard = set_scoped_broadcast_hook(hook.clone());
     let cfg = ObservabilityConfig { backend: ObservabilityBackend::None, ..Default::default() };
@@ -44,5 +47,4 @@ fn flush_guard_drains_broadcast_hook_on_drop() {
     drop(_hook_guard);
     observer.flush();
     assert_eq!(hook.flushes.load(Ordering::SeqCst), 1);
-    clear_broadcast_hook();
 }

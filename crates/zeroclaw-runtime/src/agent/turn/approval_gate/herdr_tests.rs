@@ -13,7 +13,7 @@ use crate::agent::turn::events::DraftEvent;
 use crate::approval::ApprovalManager;
 use crate::integrations::herdr::HerdrObserver;
 use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+use crate::observability::set_scoped_broadcast_hook;
 
 struct TestChannel {
     response: ChannelApprovalResponse,
@@ -118,7 +118,6 @@ macro_rules! assert_state_sequence {
 
 #[tokio::test]
 async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
-    clear_broadcast_hook();
     let spy = HerdrSpy::new();
     let (client, calls) = make_spy_reporter(spy);
     let herdr = Arc::new(HerdrObserver::new(client, None));
@@ -144,7 +143,6 @@ async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
 
 #[tokio::test]
 async fn approval_gate_herdr_deny_transitions_blocked_to_idle() {
-    clear_broadcast_hook();
     let spy = HerdrSpy::new();
     let (client, calls) = make_spy_reporter(spy);
     let herdr = Arc::new(HerdrObserver::new(client, None));

@@ -1178,9 +1178,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn herdr_nested_run_isolation() {
         use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
-
-        clear_broadcast_hook();
+        use crate::observability::set_scoped_broadcast_hook;
 
         // Parent installs hook with owning turn_id
         let parent_turn_id = "parent-turn-123";

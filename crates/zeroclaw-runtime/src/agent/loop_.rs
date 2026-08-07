@@ -1694,9 +1694,9 @@ pub async fn run(
         });
 
         // Herdr session_id reporting is deferred until Herdr accepts the
-        // ("herdr:zeroclaw", "zeroclaw") (source, agent) pair contract (see
-        // discussion #811). `memory_session_id` is still used below for
-        // internal memory operations and local correlation.
+        // ("herdr:zeroclaw", "zeroclaw") (source, agent) pair contract upstream.
+        // `memory_session_id` is still used below for internal memory
+        // operations and local correlation.
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =

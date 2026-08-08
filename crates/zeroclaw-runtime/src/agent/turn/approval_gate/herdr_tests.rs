@@ -1,7 +1,6 @@
 //! Integration tests for approval gate + Herdr observer interaction.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResponse};
 use zeroclaw_config::policy::AutonomyLevel;
@@ -12,20 +11,16 @@ use crate::agent::turn::context::TurnCtx;
 use crate::agent::turn::events::DraftEvent;
 use crate::approval::ApprovalManager;
 use crate::integrations::herdr::HerdrObserver;
-use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-use crate::observability::set_scoped_broadcast_hook;
+use crate::integrations::herdr::tests::make_spy_reporter;
+use crate::observability::{HOOK_TEST_LOCK, clear_broadcast_hook, set_scoped_broadcast_hook};
 
 struct TestChannel {
     response: ChannelApprovalResponse,
-    approval_requests: Arc<AtomicUsize>,
 }
 
 impl TestChannel {
-    fn new(response: ChannelApprovalResponse, approval_requests: Arc<AtomicUsize>) -> Self {
-        Self {
-            response,
-            approval_requests,
-        }
+    fn new(response: ChannelApprovalResponse) -> Self {
+        Self { response }
     }
 }
 
@@ -62,7 +57,6 @@ impl Channel for TestChannel {
         _recipient: &str,
         _request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-        self.approval_requests.fetch_add(1, Ordering::SeqCst);
         Ok(Some(self.response.clone()))
     }
 }
@@ -118,16 +112,14 @@ macro_rules! assert_state_sequence {
 
 #[tokio::test]
 async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
-    let spy = HerdrSpy::new();
-    let (client, calls) = make_spy_reporter(spy);
+    let _hook_lock = HOOK_TEST_LOCK.lock().await;
+    clear_broadcast_hook();
+    let (client, calls) = make_spy_reporter();
     let herdr = Arc::new(HerdrObserver::new(client, None));
     let _guard = set_scoped_broadcast_hook(herdr.clone());
 
     let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
-    let channel = Arc::new(TestChannel::new(
-        ChannelApprovalResponse::Approve,
-        Arc::new(AtomicUsize::new(0)),
-    )) as Arc<dyn Channel>;
+    let channel = Arc::new(TestChannel::new(ChannelApprovalResponse::Approve)) as Arc<dyn Channel>;
     let (tx, _rx) = mpsc::channel(8);
     let pacing = PacingConfig::default();
     let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);
@@ -143,16 +135,14 @@ async fn approval_gate_herdr_approve_transitions_blocked_to_working() {
 
 #[tokio::test]
 async fn approval_gate_herdr_deny_transitions_blocked_to_idle() {
-    let spy = HerdrSpy::new();
-    let (client, calls) = make_spy_reporter(spy);
+    let _hook_lock = HOOK_TEST_LOCK.lock().await;
+    clear_broadcast_hook();
+    let (client, calls) = make_spy_reporter();
     let herdr = Arc::new(HerdrObserver::new(client, None));
     let _guard = set_scoped_broadcast_hook(herdr.clone());
 
     let approval = ApprovalManager::for_non_interactive_backchannel(&make_risk());
-    let channel = Arc::new(TestChannel::new(
-        ChannelApprovalResponse::Deny,
-        Arc::new(AtomicUsize::new(0)),
-    )) as Arc<dyn Channel>;
+    let channel = Arc::new(TestChannel::new(ChannelApprovalResponse::Deny)) as Arc<dyn Channel>;
     let (tx, _rx) = mpsc::channel(8);
     let pacing = PacingConfig::default();
     let ctx = build_ctx(&herdr, &approval, &channel, &tx, &pacing);

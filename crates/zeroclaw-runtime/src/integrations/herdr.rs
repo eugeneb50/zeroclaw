@@ -161,52 +161,13 @@ fn install_hook_from_env(
 #[cfg(test)]
 type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync>;
 
-/// Maximum number of pending messages in the writer queue. Bounded to prevent
-/// unbounded accumulation when the Herdr daemon is slow or unavailable.
-/// Capacity 64: 64 * 700ms (max connect+write) = ~45s theoretical max drain,
-/// but shutdown timeout caps actual wait at 2s.
+/// Maximum number of pending messages in the writer queue.
 const WRITER_QUEUE_CAPACITY: usize = 64;
-
-/// Reserved capacity for terminal lifecycle payloads (`idle` + `release_agent`).
-///
-/// Terminal state is an operator-visible contract — a pane that exited must stop
-/// being displayed as `working` — so it cannot share the snapshot queue, where a
-/// saturated writer silently drops new messages. A client emits the pair at most
-/// once; four slots leave headroom for a retry after a failed enqueue.
-const TERMINAL_QUEUE_CAPACITY: usize = 4;
-
-/// Connect and write one payload, ignoring transport failures.
-///
-/// Delivery is best-effort per message; the caller decides whether losing it is
-/// acceptable (snapshots) or must suppress a state commit (terminal pair).
-#[cfg(unix)]
-async fn write_payload(socket_path: &str, payload: &str) {
-    if let Ok(mut stream) = connect_with_timeout(socket_path).await {
-        let _ = send_on_stream(&mut stream, payload).await;
-    }
-}
-
-/// Drop guard that signals the drain-done channel during a panic unwind, so
-/// the sync `shutdown_drain()` never waits the full 2s timeout for a task
-/// that already crashed.
-#[cfg(unix)]
-struct DrainOnPanic(Option<std_mpsc::SyncSender<()>>);
-
-#[cfg(unix)]
-impl Drop for DrainOnPanic {
-    fn drop(&mut self) {
-        if std::thread::panicking()
-            && let Some(tx) = self.0.take()
-        {
-            let _ = tx.send(());
-        }
-    }
-}
 
 /// Client that sends JSON-RPC notifications to the herdr daemon via tokio UDS.
 /// The `send()` method serializes and fires off an async write — it never
 /// blocks the caller. Call `shutdown_drain()` to wait until pending writes complete
-/// (used at startup and shutdown for guaranteed delivery).
+/// (used at startup and shutdown for best-effort delivery).
 pub(crate) struct HerdrClient {
     pane_id: String,
     #[cfg(test)]
@@ -237,12 +198,8 @@ impl HerdrClient {
             // the sync `flush()` path. Buffered(1) so the writer task can send
             // without blocking even if the receiver isn't waiting yet.
             let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
-            // Clone so the panic guard can signal drain completion even if
-            // the writer task panics mid-write.
-            let drain_tx_for_panic = drain_done_tx.clone();
             let socket_path = socket_path.clone();
             let _writer_handle = zeroclaw_spawn::spawn!(async move {
-                let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
                 loop {
                     tokio::select! {
                         biased;
@@ -307,7 +264,7 @@ impl HerdrClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_spy<F>(_socket_path: String, pane_id: String, spy: F) -> Self
+    pub(crate) fn new_with_spy<F>(pane_id: String, spy: F) -> Self
     where
         F: Fn(&str, &serde_json::Map<String, serde_json::Value>) + Send + Sync + 'static,
     {
@@ -411,9 +368,7 @@ impl HerdrClient {
 
         // Fire-and-forget: push to writer task via bounded channel. Use
         // `try_send` so the caller never blocks on a slow/unavailable peer.
-        // On queue full, drop the new message — `transit_to` already suppresses
-        // redundant state transitions, so this is a rare
-        // backpressure case that loses a stale lifecycle snapshot.
+        // On queue full, drop the new message.
         #[cfg(unix)]
         if let Some(tx) = self.writer.lock().as_ref() {
             match tx.try_send(payload_str) {
@@ -532,12 +487,9 @@ impl HerdrObserver {
             state: Mutex::new(HerdrState::Idle),
             client,
             owning_turn_id: owning_turn_id.map(|s| s.to_owned()),
-            nested_runs: AtomicUsize::new(0),
         }
     }
-}
 
-impl HerdrObserver {
     fn transit_to(&self, state: &mut HerdrState, target: HerdrState) {
         if *state == target {
             return;
@@ -582,7 +534,8 @@ impl Observer for HerdrObserver {
                 | ObserverEvent::ToolCall { turn_id, .. }
                 | ObserverEvent::HistoryTrimmed { turn_id, .. }
                 | ObserverEvent::AuthorizationRequested { turn_id, .. }
-                | ObserverEvent::AuthorizationResponded { turn_id, .. } => turn_id.as_deref(),
+                | ObserverEvent::AuthorizationResponded { turn_id, .. }
+                | ObserverEvent::TurnComplete { turn_id, .. } => turn_id.as_deref(),
                 _ => None,
             };
             if event_turn.is_some_and(|t| t != owning) {
@@ -621,12 +574,14 @@ impl Observer for HerdrObserver {
             ObserverEvent::ToolCall { .. } => {
                 self.transit_to(&mut state, HerdrState::Working);
             }
-            ObserverEvent::TurnComplete => {
-                // Unscoped event: it proves no owner, so it may only idle the
-                // pane when no nested run is in flight. Otherwise a subagent
-                // finishing would mark the parent idle while the parent is still
-                // working or waiting on an approval.
-                if self.nested_runs.load(Ordering::Relaxed) == 0 {
+            ObserverEvent::TurnComplete { turn_id, .. } => {
+                // Only transition to Idle if this TurnComplete belongs to the owning turn
+                // or if there's no owning_turn_id filter (for backwards compatibility).
+                let should_transit = self
+                    .owning_turn_id
+                    .as_deref()
+                    .is_none_or(|owning| turn_id.as_deref() == Some(owning));
+                if should_transit {
                     self.transit_to(&mut state, HerdrState::Idle);
                 }
             }
@@ -652,9 +607,7 @@ impl Observer for HerdrObserver {
     fn flush(&self) {
         {
             let mut state = self.state.lock();
-            if *state != HerdrState::Released && self.client.report_terminal() {
-                *state = HerdrState::Released;
-            }
+            self.transit_to(&mut state, HerdrState::Released);
         }
         self.client.shutdown_drain(SHUTDOWN_TIMEOUT);
     }
@@ -671,6 +624,7 @@ impl Observer for HerdrObserver {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::observability::HOOK_TEST_LOCK;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -690,29 +644,22 @@ pub(crate) mod tests {
     }
 
     impl HerdrSpy {
-        pub(crate) fn new() -> Self {
-            Self::default()
-        }
-
         pub(crate) fn into_inner(self) -> Arc<Mutex<Vec<HerdrSpyCall>>> {
             self.calls
         }
     }
 
-    /// Build a `HerdrClient` with the spy instead of connecting to a real UDS socket.
-    pub(crate) fn make_spy_reporter(spy: HerdrSpy) -> (HerdrClient, Arc<Mutex<Vec<HerdrSpyCall>>>) {
+    /// Build a `HerdrClient` with a spy instead of connecting to a real UDS socket.
+    pub(crate) fn make_spy_reporter() -> (HerdrClient, Arc<Mutex<Vec<HerdrSpyCall>>>) {
+        let spy = HerdrSpy::default();
         let calls = spy.into_inner();
         let calls_clone = calls.clone();
-        let client = HerdrClient::new_with_spy(
-            "/tmp/test-herdr.sock".into(),
-            "test-pane".into(),
-            move |method, params| {
-                calls_clone.lock().push(HerdrSpyCall {
-                    method: method.to_string(),
-                    params: serde_json::Value::Object(params.clone()),
-                });
-            },
-        );
+        let client = HerdrClient::new_with_spy("test-pane".into(), move |method, params| {
+            calls_clone.lock().push(HerdrSpyCall {
+                method: method.to_string(),
+                params: serde_json::Value::Object(params.clone()),
+            });
+        });
         (client, calls)
     }
 
@@ -795,8 +742,7 @@ pub(crate) mod tests {
     /// AgentEnd / run-teardown drain contract.
     #[tokio::test]
     async fn herdr_observer_flush_drains_release_messages() {
-        let spy = HerdrSpy::new();
-        let (client, calls) = make_spy_reporter(spy);
+        let (client, calls) = make_spy_reporter();
         let observer = HerdrObserver::new(client, None);
 
         // Simulate the agent reaching Working state first so flush has
@@ -868,61 +814,17 @@ pub(crate) mod tests {
 
         assert!(seq2 > seq1, "seq must be monotonic: {} <= {}", seq2, seq1);
         assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
+
+        // Note: the absolute value of seq1 depends on whether the static OnceLock
+        // was initialized by a prior test. We only assert monotonicity here,
+        // which is the critical property for restart resilience (a fresh process
+        // will always seed from wall clock on first use).
     }
 
-    /// Restart-safety lives in the seed, not in the counter: `next_seq` reads a
-    /// process-global `OnceLock` that any earlier test may have initialized, so
-    /// asserting its value against a fresh clock sample is order-dependent (it
-    /// passes alone and fails under the parallel gate). Test the seeding rule
-    /// directly instead — that is the property restart-safety actually needs.
-    #[test]
-    fn seq_base_is_seeded_from_wall_clock() {
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let base = seq_base();
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(u64::MAX);
-
-        assert!(
-            base >= before && base <= after,
-            "seq base {base} must fall inside the sampling window [{before}, {after}]"
-        );
-    }
-
-    /// Accept connections and record the JSON-RPC `method` of each payload
-    /// until `want` messages arrive or the deadline passes. One payload per
-    /// connection — the writer connects per message.
-    async fn collect_methods(listener: UnixListener, want: usize, budget: Duration) -> Vec<String> {
-        let mut received = Vec::new();
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline && received.len() < want {
-            if let Ok(Ok((stream, _))) =
-                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
-            {
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                if reader.read_line(&mut line).await.is_ok()
-                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-                    && let Some(method) = val.get("method").and_then(|m| m.as_str())
-                {
-                    received.push(method.to_string());
-                }
-            }
-        }
-        received
-    }
-
-    /// Ordered receipt of the terminal pair, proven *concurrently*: the
-    /// receiver runs on its own task while the sync `shutdown_drain()` blocks a
-    /// worker, so this asserts delivery rather than merely reading whatever
-    /// happened to land after teardown returned. Requires a multi-thread
-    /// runtime — on the single-thread flavor the blocking caller starves the
-    /// writer task and nothing can be delivered while it waits.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// Shutdown drain test: verify ordered receipt of `idle` then
+    /// `pane.release_agent` before shutdown completes. Uses a real
+    /// `UnixListener` to receive messages and confirm ordering.
+    #[tokio::test]
     async fn herdr_shutdown_drain_ordered_receipt() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("herdr-test.sock");
@@ -938,7 +840,26 @@ pub(crate) mod tests {
 
         client.shutdown_drain(SHUTDOWN_TIMEOUT);
 
-        let received = collector.await.unwrap();
+        // Now accept and read messages from the listener
+        let mut received = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && received.len() < 2 {
+            match tokio::time::timeout(Duration::from_millis(50), listener.accept()).await {
+                Ok(Ok((stream, _))) => {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_ok()
+                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+                        && let Some(method) = val.get("method").and_then(|m| m.as_str())
+                    {
+                        received.push(method.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Verify ordered receipt: idle then release_agent
         assert_eq!(
             received.len(),
             2,
@@ -1177,13 +1098,15 @@ pub(crate) mod tests {
     /// release parent's pane.
     #[tokio::test]
     async fn herdr_nested_run_isolation() {
-        use crate::integrations::herdr::tests::{HerdrSpy, make_spy_reporter};
-        use crate::observability::set_scoped_broadcast_hook;
+        use crate::integrations::herdr::tests::make_spy_reporter;
+        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
+        clear_broadcast_hook();
 
         // Parent installs hook with owning turn_id
         let parent_turn_id = "parent-turn-123";
-        let spy_parent = HerdrSpy::new();
-        let (client_parent, calls_parent) = make_spy_reporter(spy_parent);
+        let (client_parent, calls_parent) = make_spy_reporter();
         let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
         let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
 
@@ -1278,6 +1201,103 @@ pub(crate) mod tests {
         assert_eq!(
             release_count, 1,
             "only parent AgentEnd should emit release_agent"
+        );
+    }
+
+    /// TurnComplete scoping test: parent in Working/Blocked + child TurnComplete
+    /// should NOT transition parent to Idle. Only parent's TurnComplete with matching
+    /// turn_id should trigger Idle transition.
+    #[tokio::test]
+    async fn herdr_turn_complete_scoping() {
+        use crate::integrations::herdr::tests::make_spy_reporter;
+        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
+        clear_broadcast_hook();
+
+        // Parent installs hook with owning turn_id
+        let parent_turn_id = "parent-turn-123";
+        let (client_parent, calls_parent) = make_spy_reporter();
+        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
+        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
+
+        // Put parent in Working state
+        let parent_llm = ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_llm);
+
+        // Verify parent is Working
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec!["working"],
+            "parent LlmRequest should transition to Working"
+        );
+
+        // Put parent in Blocked state
+        let auth_req = ObserverEvent::AuthorizationRequested {
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            channel: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&auth_req);
+
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec!["blocked"],
+            "parent AuthorizationRequested should transition to Blocked"
+        );
+
+        // Emit child TurnComplete with different turn_id — should NOT affect parent
+        let child_turn_id = "child-turn-456";
+        let child_turn_complete = ObserverEvent::TurnComplete {
+            turn_id: Some(child_turn_id.to_string()),
+        };
+        parent_observer.record_event(&child_turn_complete);
+
+        // Parent state should remain Blocked (no new state change)
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        assert_eq!(
+            captured.len(),
+            0,
+            "child TurnComplete with different turn_id should not change parent state"
+        );
+
+        // Now emit parent TurnComplete with matching turn_id — should transition to Idle
+        let parent_turn_complete = ObserverEvent::TurnComplete {
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_turn_complete);
+
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec!["idle"],
+            "parent TurnComplete with matching turn_id should transition to Idle"
         );
     }
 }

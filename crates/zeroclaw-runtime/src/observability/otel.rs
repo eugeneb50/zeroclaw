@@ -392,7 +392,7 @@ impl Observer for OtelObserver {
                 );
                 span.end();
             }
-            ObserverEvent::TurnComplete
+            ObserverEvent::TurnComplete { .. }
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::MemoryRecall {
@@ -1387,7 +1387,7 @@ mod tests {
             agent_alias: None,
             turn_id: None,
         });
-        obs.record_event(&ObserverEvent::TurnComplete);
+        obs.record_event(&ObserverEvent::TurnComplete { turn_id: None });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "inbound".into(),

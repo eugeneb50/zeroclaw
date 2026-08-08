@@ -769,6 +769,45 @@ mod tests {
     }
 
     #[test]
+    fn tee_observer_flush_drives_broadcast_hook() {
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
+        clear_broadcast_hook();
+        let hook = Arc::new(CountingObserver::default());
+        set_broadcast_hook(hook.clone());
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..Default::default()
+        };
+        let observer = create_observer(&cfg);
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 0);
+        observer.flush();
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 1);
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn flush_guard_drains_broadcast_hook_on_drop() {
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
+        clear_broadcast_hook();
+        let hook = Arc::new(CountingObserver::default());
+        let _hook_guard = set_scoped_broadcast_hook(hook.clone());
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..Default::default()
+        };
+        let observer: Arc<dyn Observer> = Arc::from(create_observer(&cfg));
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 0);
+        {
+            let _fg = FlushGuard::new(observer.clone());
+        }
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 1);
+        drop(_hook_guard);
+        observer.flush();
+        assert_eq!(hook.flushes.load(Ordering::SeqCst), 1);
+        clear_broadcast_hook();
+    }
+
+    #[test]
     fn agent_turn_guard_closes_once_during_panic_unwind() {
         let observer = CountingObserver::default();
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

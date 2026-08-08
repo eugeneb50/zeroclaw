@@ -511,6 +511,7 @@ impl Observer for HerdrObserver {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::observability::HOOK_TEST_LOCK;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -800,6 +801,7 @@ pub(crate) mod tests {
         use crate::integrations::herdr::tests::make_spy_reporter;
         use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
 
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
         clear_broadcast_hook();
 
         // Parent installs hook with owning turn_id
@@ -910,6 +912,7 @@ pub(crate) mod tests {
         use crate::integrations::herdr::tests::make_spy_reporter;
         use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
 
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
         clear_broadcast_hook();
 
         // Parent installs hook with owning turn_id

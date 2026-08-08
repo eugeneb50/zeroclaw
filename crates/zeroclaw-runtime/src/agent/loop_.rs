@@ -1694,9 +1694,8 @@ pub async fn run(
         });
 
         // Herdr session_id reporting is deferred until Herdr accepts the
-        // ("herdr:zeroclaw", "zeroclaw") (source, agent) pair contract (see
-        // discussion #811). `memory_session_id` is still used below for
-        // internal memory operations and local correlation.
+        // ("herdr:zeroclaw", "zeroclaw") (source, agent) pair contract. `memory_session_id`
+        // is still used below for internal memory operations and local correlation.
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
         let cost_tracking_context =
@@ -1793,7 +1792,9 @@ pub async fn run(
                 if interactive {
                     println!("{final_output}");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete);
+                observer.record_event(&ObserverEvent::TurnComplete {
+                    turn_id: Some(turn_id.clone()),
+                });
                 return Ok(final_output);
             }
 
@@ -2101,7 +2102,9 @@ pub async fn run(
             if interactive {
                 println!("{final_output}");
             }
-            observer.record_event(&ObserverEvent::TurnComplete);
+            observer.record_event(&ObserverEvent::TurnComplete {
+                turn_id: Some(turn_id.clone()),
+            });
 
             if config.skills.skill_improvement.enabled {
                 let review_workspace = config.agent_workspace_dir(agent_alias);
@@ -2306,7 +2309,9 @@ pub async fn run(
                     {
                         eprintln!("\nError sending CLI response: {e}\n");
                     }
-                    observer.record_event(&ObserverEvent::TurnComplete);
+                    observer.record_event(&ObserverEvent::TurnComplete {
+                        turn_id: Some(turn_id.clone()),
+                    });
                     if let Some(sys_msg) = history.first_mut()
                         && sys_msg.role == "system"
                     {
@@ -2708,7 +2713,9 @@ pub async fn run(
                 {
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete);
+                observer.record_event(&ObserverEvent::TurnComplete {
+                    turn_id: Some(turn_id.clone()),
+                });
 
                 // Display context usage for this turn.
                 if let Some(ref ctx) = cost_tracking_context {

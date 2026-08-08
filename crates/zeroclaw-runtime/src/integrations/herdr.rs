@@ -439,7 +439,8 @@ impl Observer for HerdrObserver {
                 | ObserverEvent::ToolCall { turn_id, .. }
                 | ObserverEvent::HistoryTrimmed { turn_id, .. }
                 | ObserverEvent::AuthorizationRequested { turn_id, .. }
-                | ObserverEvent::AuthorizationResponded { turn_id, .. } => turn_id.as_deref(),
+                | ObserverEvent::AuthorizationResponded { turn_id, .. }
+                | ObserverEvent::TurnComplete { turn_id, .. } => turn_id.as_deref(),
                 _ => None,
             };
             if event_turn.is_some_and(|t| t != owning) {
@@ -460,8 +461,16 @@ impl Observer for HerdrObserver {
             ObserverEvent::ToolCall { .. } => {
                 self.transit_to(&mut state, HerdrState::Working);
             }
-            ObserverEvent::TurnComplete => {
-                self.transit_to(&mut state, HerdrState::Idle);
+            ObserverEvent::TurnComplete { turn_id, .. } => {
+                // Only transition to Idle if this TurnComplete belongs to the owning turn
+                // or if there's no owning_turn_id filter (for backwards compatibility).
+                let should_transit = self
+                    .owning_turn_id
+                    .as_deref()
+                    .is_none_or(|owning| turn_id.as_deref() == Some(owning));
+                if should_transit {
+                    self.transit_to(&mut state, HerdrState::Idle);
+                }
             }
             ObserverEvent::AgentEnd { .. } => {
                 self.transit_to(&mut state, HerdrState::Released);
@@ -531,15 +540,12 @@ pub(crate) mod tests {
         let spy = HerdrSpy::default();
         let calls = spy.into_inner();
         let calls_clone = calls.clone();
-        let client = HerdrClient::new_with_spy(
-            "test-pane".into(),
-            move |method, params| {
-                calls_clone.lock().push(HerdrSpyCall {
-                    method: method.to_string(),
-                    params: serde_json::Value::Object(params.clone()),
-                });
-            },
-        );
+        let client = HerdrClient::new_with_spy("test-pane".into(), move |method, params| {
+            calls_clone.lock().push(HerdrSpyCall {
+                method: method.to_string(),
+                params: serde_json::Value::Object(params.clone()),
+            });
+        });
         (client, calls)
     }
 
@@ -688,14 +694,6 @@ pub(crate) mod tests {
             "test-pane".into(),
         );
 
-        // Capture `now_micros` BEFORE generating seq. The seq counter is
-        // seeded from wall clock on first use, so seq1 should be >= the
-        // clock value captured here (within the resolution of SystemTime).
-        let now_micros = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-
         let seq1 = client.next_seq();
         let seq2 = client.next_seq();
         let seq3 = client.next_seq();
@@ -703,14 +701,10 @@ pub(crate) mod tests {
         assert!(seq2 > seq1, "seq must be monotonic: {} <= {}", seq2, seq1);
         assert!(seq3 > seq2, "seq must be monotonic: {} <= {}", seq3, seq2);
 
-        // seq1 was captured AFTER now_micros, so seq1 >= now_micros. We allow
-        // 10ms slack to absorb scheduler latency and SystemTime granularity.
-        assert!(
-            seq1 >= now_micros.saturating_sub(10_000),
-            "seq {} should be seeded from wall clock (now ~{})",
-            seq1,
-            now_micros
-        );
+        // Note: the absolute value of seq1 depends on whether the static OnceLock
+        // was initialized by a prior test. We only assert monotonicity here,
+        // which is the critical property for restart resilience (a fresh process
+        // will always seed from wall clock on first use).
     }
 
     /// Shutdown drain test: verify ordered receipt of `idle` then
@@ -741,12 +735,11 @@ pub(crate) mod tests {
                 Ok(Ok((stream, _))) => {
                     let mut reader = BufReader::new(stream);
                     let mut line = String::new();
-                    if reader.read_line(&mut line).await.is_ok() {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-                            if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
-                                received.push(method.to_string());
-                            }
-                        }
+                    if reader.read_line(&mut line).await.is_ok()
+                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+                        && let Some(method) = val.get("method").and_then(|m| m.as_str())
+                    {
+                        received.push(method.to_string());
                     }
                 }
                 _ => {}
@@ -906,6 +899,102 @@ pub(crate) mod tests {
         assert_eq!(
             release_count, 1,
             "only parent AgentEnd should emit release_agent"
+        );
+    }
+
+    /// TurnComplete scoping test: parent in Working/Blocked + child TurnComplete
+    /// should NOT transition parent to Idle. Only parent's TurnComplete with matching
+    /// turn_id should trigger Idle transition.
+    #[tokio::test]
+    async fn herdr_turn_complete_scoping() {
+        use crate::integrations::herdr::tests::make_spy_reporter;
+        use crate::observability::{clear_broadcast_hook, set_scoped_broadcast_hook};
+
+        clear_broadcast_hook();
+
+        // Parent installs hook with owning turn_id
+        let parent_turn_id = "parent-turn-123";
+        let (client_parent, calls_parent) = make_spy_reporter();
+        let parent_observer = Arc::new(HerdrObserver::new(client_parent, Some(parent_turn_id)));
+        let _parent_guard = set_scoped_broadcast_hook(parent_observer.clone());
+
+        // Put parent in Working state
+        let parent_llm = ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_llm);
+
+        // Verify parent is Working
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec!["working"],
+            "parent LlmRequest should transition to Working"
+        );
+
+        // Put parent in Blocked state
+        let auth_req = ObserverEvent::AuthorizationRequested {
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            channel: None,
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&auth_req);
+
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec!["blocked"],
+            "parent AuthorizationRequested should transition to Blocked"
+        );
+
+        // Emit child TurnComplete with different turn_id — should NOT affect parent
+        let child_turn_id = "child-turn-456";
+        let child_turn_complete = ObserverEvent::TurnComplete {
+            turn_id: Some(child_turn_id.to_string()),
+        };
+        parent_observer.record_event(&child_turn_complete);
+
+        // Parent state should remain Blocked (no new state change)
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        assert_eq!(
+            captured.len(),
+            0,
+            "child TurnComplete with different turn_id should not change parent state"
+        );
+
+        // Now emit parent TurnComplete with matching turn_id — should transition to Idle
+        let parent_turn_complete = ObserverEvent::TurnComplete {
+            turn_id: Some(parent_turn_id.to_string()),
+        };
+        parent_observer.record_event(&parent_turn_complete);
+
+        let captured: Vec<_> = calls_parent.lock().drain(..).collect();
+        let state_methods: Vec<&str> = captured
+            .iter()
+            .filter(|c| c.method == "pane.report_agent")
+            .filter_map(|c| c.params.get("state").and_then(|s| s.as_str()))
+            .collect();
+        assert_eq!(
+            state_methods,
+            vec!["idle"],
+            "parent TurnComplete with matching turn_id should transition to Idle"
         );
     }
 }

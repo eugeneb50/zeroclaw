@@ -659,7 +659,10 @@ impl Observer for HerdrObserver {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::observability::HOOK_TEST_LOCK;
+    use crate::observability::{
+        FlushGuard, HOOK_TEST_LOCK, clear_broadcast_hook, create_observer,
+        set_scoped_broadcast_hook,
+    };
     use std::future::pending;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
@@ -667,6 +670,7 @@ pub(crate) mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
     use tokio::sync::Notify;
+    use zeroclaw_config::schema::ObservabilityConfig;
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -1079,6 +1083,130 @@ pub(crate) mod tests {
             ["pane.report_agent", "pane.release_agent"],
             "terminal requests must complete in order after snapshot cancellation"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flush_guard_composes_parent_isolation_and_terminal_delivery() {
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
+        clear_broadcast_hook();
+
+        let dir = tempdir().unwrap();
+        let socket_path = Arc::<str>::from(
+            dir.path()
+                .join("herdr-composed-shutdown.sock")
+                .to_str()
+                .unwrap(),
+        );
+        let listener = UnixListener::bind(socket_path.as_ref()).unwrap();
+        let received = zeroclaw_spawn::spawn!(async move {
+            let mut payloads = Vec::new();
+            while payloads.len() < 2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap() > 0 {
+                    payloads.push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                }
+            }
+            payloads
+        });
+
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let snapshot_connected = Arc::new(Notify::new());
+        let snapshot_cancelled = Arc::new(AtomicBool::new(false));
+        let client = HerdrClient::new_with_writer("composed-pane".into(), {
+            let socket_path = Arc::clone(&socket_path);
+            let call_index = Arc::clone(&call_index);
+            let snapshot_connected = Arc::clone(&snapshot_connected);
+            let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
+            move |payload| {
+                let socket_path = Arc::clone(&socket_path);
+                let index = call_index.fetch_add(1, Ordering::SeqCst);
+                let snapshot_connected = Arc::clone(&snapshot_connected);
+                let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
+                async move {
+                    let mut stream = connect_with_timeout(&socket_path).await.unwrap();
+                    if index == 0 {
+                        let _drop_flag = DropFlag(snapshot_cancelled);
+                        snapshot_connected.notify_one();
+                        let _stream = stream;
+                        pending::<()>().await;
+                    } else {
+                        assert!(
+                            snapshot_cancelled.load(Ordering::SeqCst),
+                            "snapshot connection must close before terminal I/O starts"
+                        );
+                        send_on_stream(&mut stream, &payload).await.unwrap();
+                    }
+                }
+            }
+        });
+        let herdr = Arc::new(HerdrObserver::new(client, Some("parent-turn")));
+        let _hook_guard = set_scoped_broadcast_hook(herdr.clone());
+        let tee: Arc<dyn Observer> = Arc::from(create_observer(&ObservabilityConfig::default()));
+        let flush_guard = FlushGuard::new(tee.clone());
+
+        tee.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: Some("parent-turn".into()),
+        });
+        tokio::time::timeout(Duration::from_secs(1), snapshot_connected.notified())
+            .await
+            .expect("working snapshot must establish its UDS connection");
+
+        tee.record_event(&ObserverEvent::AuthorizationRequested {
+            tool_name: "shell".into(),
+            arguments_summary: "test approval".into(),
+            channel: None,
+            turn_id: Some("parent-turn".into()),
+        });
+        tee.record_event(&ObserverEvent::TurnComplete {
+            turn_id: Some("child-turn".into()),
+        });
+        assert_eq!(
+            *herdr.state.lock(),
+            HerdrState::Blocked,
+            "a child completion must not idle the blocked parent"
+        );
+
+        let drain_started = Instant::now();
+        drop(flush_guard);
+        let drain_elapsed = drain_started.elapsed();
+        assert!(
+            drain_elapsed < SHUTDOWN_TIMEOUT,
+            "FlushGuard teardown must complete within the drain budget: {drain_elapsed:?}"
+        );
+        assert!(
+            snapshot_cancelled.load(Ordering::SeqCst),
+            "FlushGuard teardown must cancel the stalled snapshot connection"
+        );
+        assert_eq!(
+            call_index.load(Ordering::SeqCst),
+            3,
+            "teardown must not replay stale working or blocked snapshots after the terminal pair"
+        );
+        assert_eq!(*herdr.state.lock(), HerdrState::Released);
+
+        let payloads = tokio::time::timeout(Duration::from_secs(1), received)
+            .await
+            .expect("terminal UDS payloads must arrive promptly")
+            .expect("terminal payload collector must not panic");
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["method"], "pane.report_agent");
+        assert_eq!(payloads[0]["params"]["state"], "idle");
+        assert_eq!(payloads[1]["method"], "pane.release_agent");
+        for payload in &payloads {
+            assert_eq!(payload["params"]["pane_id"], "composed-pane");
+            assert_eq!(payload["params"]["source"], SOURCE);
+            assert_eq!(payload["params"]["agent"], AGENT);
+            assert_ne!(payload["params"]["state"], "working");
+            assert_ne!(payload["params"]["state"], "blocked");
+        }
     }
 
     /// Nested run isolation test: parent interactive run + child subagent

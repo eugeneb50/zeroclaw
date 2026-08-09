@@ -10,9 +10,10 @@
 //! Uses tokio for async UDS I/O with bounded timeouts. Messages are sent
 //! fire-and-forget; flush synchronously waits for pending writes at shutdown.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -164,6 +165,32 @@ type SpyFn = Arc<dyn Fn(&str, &serde_json::Map<String, serde_json::Value>) + Sen
 /// Maximum number of pending messages in the writer queue.
 const WRITER_QUEUE_CAPACITY: usize = 64;
 
+/// Reserved capacity for terminal lifecycle payloads (`idle` + `release_agent`).
+const TERMINAL_QUEUE_CAPACITY: usize = 4;
+
+/// Connect and write one payload, ignoring transport failures.
+#[cfg(unix)]
+async fn write_payload(socket_path: &str, payload: &str) {
+    if let Ok(mut stream) = connect_with_timeout(socket_path).await {
+        let _ = send_on_stream(&mut stream, payload).await;
+    }
+}
+
+/// Signals a blocked synchronous drain if the writer task panics.
+#[cfg(unix)]
+struct DrainOnPanic(Option<std_mpsc::SyncSender<()>>);
+
+#[cfg(unix)]
+impl Drop for DrainOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(tx) = self.0.take()
+        {
+            let _ = tx.send(());
+        }
+    }
+}
+
 /// Client that sends JSON-RPC notifications to the herdr daemon via tokio UDS.
 /// The `send()` method serializes and fires off an async write — it never
 /// blocks the caller. Call `shutdown_drain()` to wait until pending writes complete
@@ -191,66 +218,13 @@ impl HerdrClient {
     pub(crate) fn new(socket_path: String, pane_id: String) -> Self {
         #[cfg(unix)]
         {
-            let (tx, mut rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
-            let (terminal_tx, mut terminal_rx) = mpsc::channel::<String>(TERMINAL_QUEUE_CAPACITY);
-            let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-            // Sync channel for the writer task to signal drain completion to
-            // the sync `flush()` path. Buffered(1) so the writer task can send
-            // without blocking even if the receiver isn't waiting yet.
-            let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
-            let socket_path = socket_path.clone();
-            let _writer_handle = zeroclaw_spawn::spawn!(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        // Terminal payloads outrank queued snapshots: the pane's
-                        // final state is a lifecycle contract, a snapshot is not.
-                        Some(payload) = terminal_rx.recv() => {
-                            write_payload(&socket_path, &payload).await;
-                        }
-                        _ = &mut shutdown_rx => {
-                            // Terminal-first drain. Pending snapshots are
-                            // superseded by the terminal `idle`, so they are
-                            // coalesced away instead of spending the shutdown
-                            // budget — 64 queued snapshots at up to 700ms each
-                            // (connect + write) would exhaust it many times over
-                            // and lose the pair that actually matters.
-                            while let Ok(payload) = terminal_rx.try_recv() {
-                                write_payload(&socket_path, &payload).await;
-                            }
-                            // Signal drain completion to the sync flush path.
-                            let _ = drain_done_tx.send(());
-                            break;
-                        }
-                        maybe_payload = rx.recv() => {
-                            match maybe_payload {
-                                Some(payload) => {
-                                    write_payload(&socket_path, &payload).await;
-                                }
-                                None => {
-                                    // Snapshot channel closed without a shutdown
-                                    // signal: still deliver any queued terminal
-                                    // payload before exiting.
-                                    while let Ok(payload) = terminal_rx.try_recv() {
-                                        write_payload(&socket_path, &payload).await;
-                                    }
-                                    let _ = drain_done_tx.send(());
-                                    break;
-                                }
-                            }
-                        }
-                    }
+            let socket_path: Arc<str> = Arc::from(socket_path);
+            Self::new_with_writer(pane_id, move |payload| {
+                let socket_path = Arc::clone(&socket_path);
+                async move {
+                    write_payload(&socket_path, &payload).await;
                 }
-            });
-            Self {
-                pane_id,
-                #[cfg(test)]
-                spy: None,
-                writer: Mutex::new(Some(tx)),
-                terminal: Mutex::new(Some(terminal_tx)),
-                shutdown_tx: Mutex::new(Some(shutdown_tx)),
-                drain_done_rx: Mutex::new(Some(drain_done_rx)),
-            }
+            })
         }
         #[cfg(not(unix))]
         {
@@ -260,6 +234,92 @@ impl HerdrClient {
                 #[cfg(test)]
                 spy: None,
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn new_with_writer<F, Fut>(pane_id: String, write: F) -> Self
+    where
+        F: Fn(String) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (tx, mut rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<String>(TERMINAL_QUEUE_CAPACITY);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
+        let drain_tx_for_panic = drain_done_tx.clone();
+        let _writer_handle = zeroclaw_spawn::spawn!(async move {
+            let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(payload) = terminal_rx.recv() => {
+                        write(payload).await;
+                    }
+                    _ = &mut shutdown_rx => {
+                        while let Ok(payload) = terminal_rx.try_recv() {
+                            write(payload).await;
+                        }
+                        let _ = drain_done_tx.send(());
+                        break;
+                    }
+                    maybe_payload = rx.recv() => {
+                        match maybe_payload {
+                            Some(payload) => {
+                                enum SnapshotOutcome {
+                                    Completed,
+                                    Terminal(String),
+                                    Shutdown,
+                                }
+
+                                let outcome = {
+                                    let snapshot_write = write(payload);
+                                    tokio::pin!(snapshot_write);
+                                    tokio::select! {
+                                        biased;
+                                        Some(payload) = terminal_rx.recv() => {
+                                            SnapshotOutcome::Terminal(payload)
+                                        }
+                                        _ = &mut shutdown_rx => SnapshotOutcome::Shutdown,
+                                        _ = &mut snapshot_write => SnapshotOutcome::Completed,
+                                    }
+                                };
+
+                                match outcome {
+                                    SnapshotOutcome::Completed => {}
+                                    SnapshotOutcome::Terminal(payload) => {
+                                        // Drop the snapshot connection before terminal I/O.
+                                        write(payload).await;
+                                    }
+                                    SnapshotOutcome::Shutdown => {
+                                        while let Ok(payload) = terminal_rx.try_recv() {
+                                            write(payload).await;
+                                        }
+                                        let _ = drain_done_tx.send(());
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                while let Ok(payload) = terminal_rx.try_recv() {
+                                    write(payload).await;
+                                }
+                                let _ = drain_done_tx.send(());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            pane_id,
+            #[cfg(test)]
+            spy: None,
+            writer: Mutex::new(Some(tx)),
+            terminal: Mutex::new(Some(terminal_tx)),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            drain_done_rx: Mutex::new(Some(drain_done_rx)),
         }
     }
 
@@ -472,13 +532,6 @@ pub struct HerdrObserver {
     client: HerdrClient,
     /// Owning turn identity for event filtering.
     owning_turn_id: Option<String>,
-    /// Nested non-owning runs currently in flight, bracketed by their
-    /// `AgentStart`/`AgentEnd` (both of which carry a `turn_id`).
-    ///
-    /// `ObserverEvent::TurnComplete` carries no identity, so it cannot be
-    /// attributed on its own. This counter is the attributed boundary: while it
-    /// is non-zero a completion belongs to a child, not to the pane's owner.
-    nested_runs: AtomicUsize,
 }
 
 impl HerdrObserver {
@@ -539,24 +592,6 @@ impl Observer for HerdrObserver {
                 _ => None,
             };
             if event_turn.is_some_and(|t| t != owning) {
-                // Foreign run: drop the event, but bracket its lifetime first so
-                // unscoped events arriving while it runs can be attributed.
-                match event {
-                    ObserverEvent::AgentStart { .. } => {
-                        self.nested_runs.fetch_add(1, Ordering::Relaxed);
-                    }
-                    ObserverEvent::AgentEnd { .. } => {
-                        // `fetch_update` floors at zero: an `AgentEnd` whose
-                        // `AgentStart` predates this observer must not wrap the
-                        // counter and disable owner completions forever.
-                        let _ = self.nested_runs.fetch_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |depth| Some(depth.saturating_sub(1)),
-                        );
-                    }
-                    _ => {}
-                }
                 return;
             }
         }
@@ -625,10 +660,21 @@ impl Observer for HerdrObserver {
 pub(crate) mod tests {
     use super::*;
     use crate::observability::HOOK_TEST_LOCK;
+    use std::future::pending;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
+    use tokio::sync::Notify;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     /// A spy that captures all `pane.report_agent` / `pane.release_agent`
     /// calls instead of sending them over UDS.
@@ -821,10 +867,30 @@ pub(crate) mod tests {
         // will always seed from wall clock on first use).
     }
 
+    async fn collect_methods(listener: UnixListener, want: usize, budget: Duration) -> Vec<String> {
+        let mut received = Vec::new();
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline && received.len() < want {
+            if let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(50), listener.accept()).await
+            {
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.is_ok()
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
+                    && let Some(method) = val.get("method").and_then(|m| m.as_str())
+                {
+                    received.push(method.to_string());
+                }
+            }
+        }
+        received
+    }
+
     /// Shutdown drain test: verify ordered receipt of `idle` then
     /// `pane.release_agent` before shutdown completes. Uses a real
     /// `UnixListener` to receive messages and confirm ordering.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn herdr_shutdown_drain_ordered_receipt() {
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("herdr-test.sock");
@@ -839,25 +905,7 @@ pub(crate) mod tests {
         assert!(client.report_terminal(), "terminal pair must enqueue");
 
         client.shutdown_drain(SHUTDOWN_TIMEOUT);
-
-        // Now accept and read messages from the listener
-        let mut received = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline && received.len() < 2 {
-            match tokio::time::timeout(Duration::from_millis(50), listener.accept()).await {
-                Ok(Ok((stream, _))) => {
-                    let mut reader = BufReader::new(stream);
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).await.is_ok()
-                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&line)
-                        && let Some(method) = val.get("method").and_then(|m| m.as_str())
-                    {
-                        received.push(method.to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
+        let received = collector.await.unwrap();
 
         // Verify ordered receipt: idle then release_agent
         assert_eq!(
@@ -960,135 +1008,76 @@ pub(crate) mod tests {
         acceptor.abort();
     }
 
-    /// `TurnComplete` carries no turn identity, so it cannot prove which run it
-    /// belongs to. While a nested run is in flight it must not idle the parent's
-    /// pane: before this scoping, a subagent completing marked the parent idle
-    /// even though the parent was still working or waiting on an approval.
-    #[tokio::test]
-    async fn nested_turn_complete_does_not_idle_parent() {
-        let parent_turn = "parent-turn-abc";
-        let child_turn = "child-turn-xyz";
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn herdr_shutdown_preempts_in_flight_snapshot_for_terminal_pair() {
+        let call_index = Arc::new(AtomicUsize::new(0));
+        let snapshot_started = Arc::new(Notify::new());
+        let snapshot_cancelled = Arc::new(AtomicBool::new(false));
+        let completed_payloads = Arc::new(Mutex::new(Vec::new()));
 
-        let (client, calls) = make_spy_reporter(HerdrSpy::new());
-        let observer = HerdrObserver::new(client, Some(parent_turn));
+        let client = Arc::new(HerdrClient::new_with_writer("test-pane".into(), {
+            let call_index = Arc::clone(&call_index);
+            let snapshot_started = Arc::clone(&snapshot_started);
+            let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
+            let completed_payloads = Arc::clone(&completed_payloads);
+            move |payload| {
+                let index = call_index.fetch_add(1, Ordering::SeqCst);
+                let snapshot_started = Arc::clone(&snapshot_started);
+                let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
+                let completed_payloads = Arc::clone(&completed_payloads);
+                async move {
+                    if index == 0 {
+                        let _drop_flag = DropFlag(snapshot_cancelled);
+                        snapshot_started.notify_one();
+                        pending::<()>().await;
+                    } else {
+                        assert!(
+                            snapshot_cancelled.load(Ordering::SeqCst),
+                            "snapshot must be dropped before terminal I/O starts"
+                        );
+                        completed_payloads.lock().push(payload);
+                    }
+                }
+            }
+        }));
 
-        let agent_start = |turn: &str| ObserverEvent::AgentStart {
-            model_provider: "test".into(),
-            model: "test".into(),
-            channel: None,
-            agent_alias: None,
-            turn_id: Some(turn.to_string()),
-        };
-        let agent_end = |turn: &str| ObserverEvent::AgentEnd {
-            model_provider: "test".into(),
-            model: "test".into(),
-            duration: Duration::from_millis(1),
-            tokens_used: None,
-            cost_usd: None,
-            channel: None,
-            agent_alias: None,
-            turn_id: Some(turn.to_string()),
-        };
-        let llm_request = |turn: &str| ObserverEvent::LlmRequest {
-            model_provider: "test".into(),
-            model: "test".into(),
-            messages_count: 1,
-            channel: None,
-            agent_alias: None,
-            parent_agent_alias: None,
-            turn_id: Some(turn.to_string()),
-        };
+        client.report_state("working");
+        tokio::time::timeout(Duration::from_secs(1), snapshot_started.notified())
+            .await
+            .expect("scripted snapshot write must start");
+        assert!(client.report_terminal(), "terminal pair must enqueue");
 
-        // Parent is working, then spawns a subagent.
-        observer.record_event(&agent_start(parent_turn));
-        observer.record_event(&llm_request(parent_turn));
-        observer.record_event(&agent_start(child_turn));
+        let drain_client = Arc::clone(&client);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || {
+                drain_client.shutdown_drain(SHUTDOWN_TIMEOUT);
+            }),
+        )
+        .await
+        .expect("terminal drain must not wait for the stalled snapshot")
+        .expect("drain worker must not panic");
 
-        let states = |calls: &Arc<Mutex<Vec<HerdrSpyCall>>>| -> Vec<String> {
-            calls
-                .lock()
-                .iter()
-                .filter(|c| c.method == "pane.report_agent")
-                .filter_map(|c| {
-                    c.params
-                        .get("state")
-                        .and_then(|s| s.as_str())
-                        .map(str::to_string)
-                })
-                .collect()
-        };
-
-        assert_eq!(
-            states(&calls).last().map(String::as_str),
-            Some("working"),
-            "parent should be working before the child completes"
+        assert!(
+            snapshot_cancelled.load(Ordering::SeqCst),
+            "terminal shutdown must cancel the in-flight snapshot"
         );
-
-        // The child's completion arrives unscoped. The parent must stay working.
-        observer.record_event(&ObserverEvent::TurnComplete);
-        assert_eq!(
-            states(&calls).last().map(String::as_str),
-            Some("working"),
-            "a nested run's TurnComplete must not idle the parent pane"
-        );
-
-        // Once the child ends, the parent's own completion idles the pane.
-        observer.record_event(&agent_end(child_turn));
-        observer.record_event(&ObserverEvent::TurnComplete);
-        assert_eq!(
-            states(&calls).last().map(String::as_str),
-            Some("idle"),
-            "the owning run's TurnComplete must still idle the pane"
-        );
-    }
-
-    /// A blocked parent is the case that matters most: an approval prompt is
-    /// operator-visible, and a subagent completing must not clear it.
-    #[tokio::test]
-    async fn nested_turn_complete_does_not_clear_parent_block() {
-        let parent_turn = "parent-turn-blocked";
-        let child_turn = "child-turn-inner";
-
-        let (client, calls) = make_spy_reporter(HerdrSpy::new());
-        let observer = HerdrObserver::new(client, Some(parent_turn));
-
-        observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: "test".into(),
-            model: "test".into(),
-            channel: None,
-            agent_alias: None,
-            turn_id: Some(parent_turn.to_string()),
-        });
-        observer.record_event(&ObserverEvent::AuthorizationRequested {
-            tool_name: "shell".into(),
-            arguments_summary: "sleep 3".into(),
-            channel: None,
-            turn_id: Some(parent_turn.to_string()),
-        });
-        observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: "test".into(),
-            model: "test".into(),
-            channel: None,
-            agent_alias: None,
-            turn_id: Some(child_turn.to_string()),
-        });
-        observer.record_event(&ObserverEvent::TurnComplete);
-
-        let last_state = calls
+        let methods: Vec<String> = completed_payloads
             .lock()
             .iter()
-            .filter(|c| c.method == "pane.report_agent")
-            .filter_map(|c| {
-                c.params
-                    .get("state")
-                    .and_then(|s| s.as_str())
-                    .map(str::to_string)
+            .map(|payload| {
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .unwrap()
+                    .get("method")
+                    .and_then(|method| method.as_str())
+                    .unwrap()
+                    .to_string()
             })
-            .next_back();
+            .collect();
         assert_eq!(
-            last_state.as_deref(),
-            Some("blocked"),
-            "a nested completion must not clear the parent's approval block"
+            methods,
+            ["pane.report_agent", "pane.release_agent"],
+            "terminal requests must complete in order after snapshot cancellation"
         );
     }
 

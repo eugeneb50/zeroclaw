@@ -578,7 +578,7 @@ impl Observer for HerdrObserver {
         // run are forwarded. This prevents child agents (subagents) from
         // mutating the parent's herdr pane state.
         if let Some(owning) = self.owning_turn_id.as_deref() {
-            let event_turn: Option<&str> = match event {
+            let event_turn: Option<Option<&str>> = match event {
                 ObserverEvent::AgentStart { turn_id, .. }
                 | ObserverEvent::LlmRequest { turn_id, .. }
                 | ObserverEvent::LlmResponse { turn_id, .. }
@@ -587,11 +587,12 @@ impl Observer for HerdrObserver {
                 | ObserverEvent::ToolCall { turn_id, .. }
                 | ObserverEvent::HistoryTrimmed { turn_id, .. }
                 | ObserverEvent::AuthorizationRequested { turn_id, .. }
-                | ObserverEvent::AuthorizationResponded { turn_id, .. }
-                | ObserverEvent::TurnComplete { turn_id, .. } => turn_id.as_deref(),
+                | ObserverEvent::AuthorizationResponded { turn_id, .. } => Some(turn_id.as_deref()),
+                ObserverEvent::TurnComplete => Some(None),
+                ObserverEvent::TurnCompleteAttributed { turn_id } => Some(Some(turn_id.as_str())),
                 _ => None,
             };
-            if event_turn.is_some_and(|t| t != owning) {
+            if event_turn.is_some_and(|turn_id| turn_id != Some(owning)) {
                 return;
             }
         }
@@ -609,16 +610,13 @@ impl Observer for HerdrObserver {
             ObserverEvent::ToolCall { .. } => {
                 self.transit_to(&mut state, HerdrState::Working);
             }
-            ObserverEvent::TurnComplete { turn_id, .. } => {
-                // Only transition to Idle if this TurnComplete belongs to the owning turn
-                // or if there's no owning_turn_id filter (for backwards compatibility).
-                let should_transit = self
-                    .owning_turn_id
-                    .as_deref()
-                    .is_none_or(|owning| turn_id.as_deref() == Some(owning));
-                if should_transit {
+            ObserverEvent::TurnComplete => {
+                if self.owning_turn_id.is_none() {
                     self.transit_to(&mut state, HerdrState::Idle);
                 }
+            }
+            ObserverEvent::TurnCompleteAttributed { .. } => {
+                self.transit_to(&mut state, HerdrState::Idle);
             }
             ObserverEvent::AgentEnd { .. } => {
                 self.transit_to(&mut state, HerdrState::Released);
@@ -738,6 +736,9 @@ pub(crate) mod tests {
     /// We allow some slack for task spawn overhead.
     #[tokio::test]
     async fn startup_with_stale_socket_returns_quickly() {
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
+        clear_broadcast_hook();
+
         let start = std::time::Instant::now();
         let _guard = install_hook_from_env(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
@@ -779,6 +780,9 @@ pub(crate) mod tests {
     /// instead of byte indexing, which would panic on multi-byte chars like 🦀.
     #[tokio::test]
     async fn non_ascii_pane_id_does_not_panic() {
+        let _hook_lock = HOOK_TEST_LOCK.lock().await;
+        clear_broadcast_hook();
+
         let _guard = install_hook_from_env(
             "/tmp/nonexistent-herdr-test-socket.sock".into(),
             "test-🦀".into(),
@@ -1111,22 +1115,29 @@ pub(crate) mod tests {
             payloads
         });
 
-        let call_index = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let snapshot_started = Arc::new(AtomicBool::new(false));
         let snapshot_connected = Arc::new(Notify::new());
         let snapshot_cancelled = Arc::new(AtomicBool::new(false));
         let client = HerdrClient::new_with_writer("composed-pane".into(), {
             let socket_path = Arc::clone(&socket_path);
-            let call_index = Arc::clone(&call_index);
+            let write_calls = Arc::clone(&write_calls);
+            let snapshot_started = Arc::clone(&snapshot_started);
             let snapshot_connected = Arc::clone(&snapshot_connected);
             let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
             move |payload| {
                 let socket_path = Arc::clone(&socket_path);
-                let index = call_index.fetch_add(1, Ordering::SeqCst);
+                let write_calls = Arc::clone(&write_calls);
+                let snapshot_started = Arc::clone(&snapshot_started);
                 let snapshot_connected = Arc::clone(&snapshot_connected);
                 let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
                 async move {
+                    write_calls.fetch_add(1, Ordering::SeqCst);
                     let mut stream = connect_with_timeout(&socket_path).await.unwrap();
-                    if index == 0 {
+                    let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                    let is_working_snapshot = value["method"] == "pane.report_agent"
+                        && value["params"]["state"] == "working";
+                    if is_working_snapshot && !snapshot_started.swap(true, Ordering::SeqCst) {
                         let _drop_flag = DropFlag(snapshot_cancelled);
                         snapshot_connected.notify_one();
                         let _stream = stream;
@@ -1165,8 +1176,8 @@ pub(crate) mod tests {
             channel: None,
             turn_id: Some("parent-turn".into()),
         });
-        tee.record_event(&ObserverEvent::TurnComplete {
-            turn_id: Some("child-turn".into()),
+        tee.record_event(&ObserverEvent::TurnCompleteAttributed {
+            turn_id: "child-turn".into(),
         });
         assert_eq!(
             *herdr.state.lock(),
@@ -1186,9 +1197,9 @@ pub(crate) mod tests {
             "FlushGuard teardown must cancel the stalled snapshot connection"
         );
         assert_eq!(
-            call_index.load(Ordering::SeqCst),
+            write_calls.load(Ordering::SeqCst),
             3,
-            "teardown must not replay stale working or blocked snapshots after the terminal pair"
+            "teardown must not write stale snapshots after the terminal pair"
         );
         assert_eq!(*herdr.state.lock(), HerdrState::Released);
 
@@ -1386,8 +1397,8 @@ pub(crate) mod tests {
 
         // Emit child TurnComplete with different turn_id — should NOT affect parent
         let child_turn_id = "child-turn-456";
-        let child_turn_complete = ObserverEvent::TurnComplete {
-            turn_id: Some(child_turn_id.to_string()),
+        let child_turn_complete = ObserverEvent::TurnCompleteAttributed {
+            turn_id: child_turn_id.to_string(),
         };
         parent_observer.record_event(&child_turn_complete);
 
@@ -1399,9 +1410,41 @@ pub(crate) mod tests {
             "child TurnComplete with different turn_id should not change parent state"
         );
 
-        // Now emit parent TurnComplete with matching turn_id — should transition to Idle
-        let parent_turn_complete = ObserverEvent::TurnComplete {
-            turn_id: Some(parent_turn_id.to_string()),
+        parent_observer.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "test".into(),
+            model: "test".into(),
+            messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        });
+        parent_observer.record_event(&ObserverEvent::AuthorizationRequested {
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            channel: None,
+            turn_id: None,
+        });
+        parent_observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "test".into(),
+            model: "test".into(),
+            duration: Duration::ZERO,
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+        parent_observer.record_event(&ObserverEvent::TurnComplete);
+        assert!(
+            calls_parent.lock().is_empty(),
+            "unattributed lifecycle events must not change an owned pane"
+        );
+        assert_eq!(*parent_observer.state.lock(), HerdrState::Blocked);
+
+        // A matching attributed completion should transition the parent to Idle.
+        let parent_turn_complete = ObserverEvent::TurnCompleteAttributed {
+            turn_id: parent_turn_id.to_string(),
         };
         parent_observer.record_event(&parent_turn_complete);
 

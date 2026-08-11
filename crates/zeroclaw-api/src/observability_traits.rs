@@ -254,7 +254,9 @@ pub enum ObserverEvent {
         turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
-    TurnComplete { turn_id: Option<String> },
+    TurnComplete,
+    /// The agent produced a final answer for the identified turn.
+    TurnCompleteAttributed { turn_id: String },
     /// A message was sent or received through a channel.
     ChannelMessage {
         /// Channel name (e.g., `"telegram"`, `"discord"`).

@@ -1792,8 +1792,8 @@ pub async fn run(
                 if interactive {
                     println!("{final_output}");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete {
-                    turn_id: Some(turn_id.clone()),
+                observer.record_event(&ObserverEvent::TurnCompleteAttributed {
+                    turn_id: turn_id.clone(),
                 });
                 return Ok(final_output);
             }
@@ -2102,8 +2102,8 @@ pub async fn run(
             if interactive {
                 println!("{final_output}");
             }
-            observer.record_event(&ObserverEvent::TurnComplete {
-                turn_id: Some(turn_id.clone()),
+            observer.record_event(&ObserverEvent::TurnCompleteAttributed {
+                turn_id: turn_id.clone(),
             });
 
             if config.skills.skill_improvement.enabled {
@@ -2309,8 +2309,8 @@ pub async fn run(
                     {
                         eprintln!("\nError sending CLI response: {e}\n");
                     }
-                    observer.record_event(&ObserverEvent::TurnComplete {
-                        turn_id: Some(turn_id.clone()),
+                    observer.record_event(&ObserverEvent::TurnCompleteAttributed {
+                        turn_id: turn_id.clone(),
                     });
                     if let Some(sys_msg) = history.first_mut()
                         && sys_msg.role == "system"
@@ -2713,8 +2713,8 @@ pub async fn run(
                 {
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
-                observer.record_event(&ObserverEvent::TurnComplete {
-                    turn_id: Some(turn_id.clone()),
+                observer.record_event(&ObserverEvent::TurnCompleteAttributed {
+                    turn_id: turn_id.clone(),
                 });
 
                 // Display context usage for this turn.

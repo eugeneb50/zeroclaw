@@ -250,11 +250,13 @@ impl HerdrClient {
         let drain_tx_for_panic = drain_done_tx.clone();
         let _writer_handle = zeroclaw_spawn::spawn!(async move {
             let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
+            let mut terminal_only = false;
             loop {
                 tokio::select! {
                     biased;
                     Some(payload) = terminal_rx.recv() => {
                         write(payload).await;
+                        terminal_only = true;
                     }
                     _ = &mut shutdown_rx => {
                         while let Ok(payload) = terminal_rx.try_recv() {
@@ -263,7 +265,7 @@ impl HerdrClient {
                         let _ = drain_done_tx.send(());
                         break;
                     }
-                    maybe_payload = rx.recv() => {
+                    maybe_payload = rx.recv(), if !terminal_only => {
                         match maybe_payload {
                             Some(payload) => {
                                 enum SnapshotOutcome {
@@ -290,6 +292,7 @@ impl HerdrClient {
                                     SnapshotOutcome::Terminal(payload) => {
                                         // Drop the snapshot connection before terminal I/O.
                                         write(payload).await;
+                                        terminal_only = true;
                                     }
                                     SnapshotOutcome::Shutdown => {
                                         while let Ok(payload) = terminal_rx.try_recv() {
@@ -1021,17 +1024,23 @@ pub(crate) mod tests {
         let call_index = Arc::new(AtomicUsize::new(0));
         let snapshot_started = Arc::new(Notify::new());
         let snapshot_cancelled = Arc::new(AtomicBool::new(false));
+        let terminal_pair_completed = Arc::new(Notify::new());
+        let stale_snapshot_started = Arc::new(Notify::new());
         let completed_payloads = Arc::new(Mutex::new(Vec::new()));
 
         let client = Arc::new(HerdrClient::new_with_writer("test-pane".into(), {
             let call_index = Arc::clone(&call_index);
             let snapshot_started = Arc::clone(&snapshot_started);
             let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
+            let terminal_pair_completed = Arc::clone(&terminal_pair_completed);
+            let stale_snapshot_started = Arc::clone(&stale_snapshot_started);
             let completed_payloads = Arc::clone(&completed_payloads);
             move |payload| {
                 let index = call_index.fetch_add(1, Ordering::SeqCst);
                 let snapshot_started = Arc::clone(&snapshot_started);
                 let snapshot_cancelled = Arc::clone(&snapshot_cancelled);
+                let terminal_pair_completed = Arc::clone(&terminal_pair_completed);
+                let stale_snapshot_started = Arc::clone(&stale_snapshot_started);
                 let completed_payloads = Arc::clone(&completed_payloads);
                 async move {
                     if index == 0 {
@@ -1044,6 +1053,11 @@ pub(crate) mod tests {
                             "snapshot must be dropped before terminal I/O starts"
                         );
                         completed_payloads.lock().push(payload);
+                        if index == 2 {
+                            terminal_pair_completed.notify_one();
+                        } else if index > 2 {
+                            stale_snapshot_started.notify_one();
+                        }
                     }
                 }
             }
@@ -1053,7 +1067,25 @@ pub(crate) mod tests {
         tokio::time::timeout(Duration::from_secs(1), snapshot_started.notified())
             .await
             .expect("scripted snapshot write must start");
+        client.report_state("blocked");
         assert!(client.report_terminal(), "terminal pair must enqueue");
+        tokio::time::timeout(Duration::from_secs(1), terminal_pair_completed.notified())
+            .await
+            .expect("terminal pair must complete before shutdown is signaled");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                stale_snapshot_started.notified()
+            )
+            .await
+            .is_err(),
+            "writer must not start the queued snapshot after terminal delivery begins"
+        );
+        assert_eq!(
+            call_index.load(Ordering::SeqCst),
+            3,
+            "only the cancelled snapshot and terminal pair may start"
+        );
 
         let drain_client = Arc::clone(&client);
         tokio::time::timeout(

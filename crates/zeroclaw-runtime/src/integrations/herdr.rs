@@ -176,7 +176,7 @@ async fn write_payload(socket_path: &str, payload: &str) {
     }
 }
 
-/// Signals a blocked synchronous drain if the writer task panics.
+/// Signals a blocked synchronous drain if the writer thread panics.
 #[cfg(unix)]
 struct DrainOnPanic(Option<std_mpsc::SyncSender<()>>);
 
@@ -187,6 +187,83 @@ impl Drop for DrainOnPanic {
             && let Some(tx) = self.0.take()
         {
             let _ = tx.send(());
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn run_writer<F, Fut>(
+    mut rx: mpsc::Receiver<String>,
+    mut terminal_rx: mpsc::Receiver<String>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+    drain_done_tx: std_mpsc::SyncSender<()>,
+    write: F,
+) where
+    F: Fn(String) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let mut terminal_only = false;
+    loop {
+        tokio::select! {
+            biased;
+            Some(payload) = terminal_rx.recv() => {
+                write(payload).await;
+                terminal_only = true;
+            }
+            _ = &mut shutdown_rx => {
+                while let Ok(payload) = terminal_rx.try_recv() {
+                    write(payload).await;
+                }
+                let _ = drain_done_tx.send(());
+                break;
+            }
+            maybe_payload = rx.recv(), if !terminal_only => {
+                match maybe_payload {
+                    Some(payload) => {
+                        enum SnapshotOutcome {
+                            Completed,
+                            Terminal(String),
+                            Shutdown,
+                        }
+
+                        let outcome = {
+                            let snapshot_write = write(payload);
+                            tokio::pin!(snapshot_write);
+                            tokio::select! {
+                                biased;
+                                Some(payload) = terminal_rx.recv() => {
+                                    SnapshotOutcome::Terminal(payload)
+                                }
+                                _ = &mut shutdown_rx => SnapshotOutcome::Shutdown,
+                                _ = &mut snapshot_write => SnapshotOutcome::Completed,
+                            }
+                        };
+
+                        match outcome {
+                            SnapshotOutcome::Completed => {}
+                            SnapshotOutcome::Terminal(payload) => {
+                                // Drop the snapshot connection before terminal I/O.
+                                write(payload).await;
+                                terminal_only = true;
+                            }
+                            SnapshotOutcome::Shutdown => {
+                                while let Ok(payload) = terminal_rx.try_recv() {
+                                    write(payload).await;
+                                }
+                                let _ = drain_done_tx.send(());
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        while let Ok(payload) = terminal_rx.try_recv() {
+                            write(payload).await;
+                        }
+                        let _ = drain_done_tx.send(());
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -202,13 +279,13 @@ pub(crate) struct HerdrClient {
     #[cfg(unix)]
     writer: Mutex<Option<mpsc::Sender<String>>>,
     /// Reserved sender for the terminal pair. Kept separate from `writer` so a
-    /// saturated snapshot queue cannot drop it, and so the writer task can
+    /// saturated snapshot queue cannot drop it, and so the writer thread can
     /// service it ahead of any queued snapshot.
     #[cfg(unix)]
     terminal: Mutex<Option<mpsc::Sender<String>>>,
     #[cfg(unix)]
     shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    /// Sync channel signaled by the writer task when it has finished draining.
+    /// Sync channel signaled by the writer thread when it has finished draining.
     /// Allows the sync `flush()` path to wait without `block_in_place`.
     #[cfg(unix)]
     drain_done_rx: Mutex<Option<std_mpsc::Receiver<()>>>,
@@ -243,78 +320,30 @@ impl HerdrClient {
         F: Fn(String) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let (tx, mut rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
-        let (terminal_tx, mut terminal_rx) = mpsc::channel::<String>(TERMINAL_QUEUE_CAPACITY);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (tx, rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
+        let (terminal_tx, terminal_rx) = mpsc::channel::<String>(TERMINAL_QUEUE_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let (drain_done_tx, drain_done_rx) = std_mpsc::sync_channel::<()>(1);
         let drain_tx_for_panic = drain_done_tx.clone();
-        let _writer_handle = zeroclaw_spawn::spawn!(async move {
-            let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
-            let mut terminal_only = false;
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(payload) = terminal_rx.recv() => {
-                        write(payload).await;
-                        terminal_only = true;
-                    }
-                    _ = &mut shutdown_rx => {
-                        while let Ok(payload) = terminal_rx.try_recv() {
-                            write(payload).await;
-                        }
-                        let _ = drain_done_tx.send(());
-                        break;
-                    }
-                    maybe_payload = rx.recv(), if !terminal_only => {
-                        match maybe_payload {
-                            Some(payload) => {
-                                enum SnapshotOutcome {
-                                    Completed,
-                                    Terminal(String),
-                                    Shutdown,
-                                }
-
-                                let outcome = {
-                                    let snapshot_write = write(payload);
-                                    tokio::pin!(snapshot_write);
-                                    tokio::select! {
-                                        biased;
-                                        Some(payload) = terminal_rx.recv() => {
-                                            SnapshotOutcome::Terminal(payload)
-                                        }
-                                        _ = &mut shutdown_rx => SnapshotOutcome::Shutdown,
-                                        _ = &mut snapshot_write => SnapshotOutcome::Completed,
-                                    }
-                                };
-
-                                match outcome {
-                                    SnapshotOutcome::Completed => {}
-                                    SnapshotOutcome::Terminal(payload) => {
-                                        // Drop the snapshot connection before terminal I/O.
-                                        write(payload).await;
-                                        terminal_only = true;
-                                    }
-                                    SnapshotOutcome::Shutdown => {
-                                        while let Ok(payload) = terminal_rx.try_recv() {
-                                            write(payload).await;
-                                        }
-                                        let _ = drain_done_tx.send(());
-                                        break;
-                                    }
-                                }
-                            }
-                            None => {
-                                while let Ok(payload) = terminal_rx.try_recv() {
-                                    write(payload).await;
-                                }
-                                let _ = drain_done_tx.send(());
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        let _writer_handle = std::thread::Builder::new()
+            .name("zeroclaw-herdr-writer".into())
+            .spawn(move || {
+                let _drain_guard = DrainOnPanic(Some(drain_tx_for_panic));
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    let _ = drain_done_tx.send(());
+                    return;
+                };
+                runtime.block_on(run_writer(
+                    rx,
+                    terminal_rx,
+                    shutdown_rx,
+                    drain_done_tx,
+                    write,
+                ));
+            });
         Self {
             pane_id,
             #[cfg(test)]
@@ -354,7 +383,7 @@ impl HerdrClient {
             // Close the sender so no new messages can be queued
             self.writer.lock().take();
 
-            // Signal the writer task to enter drain mode
+            // Signal the writer thread to enter drain mode
             if let Some(shutdown_tx) = self.shutdown_tx.lock().take() {
                 let _ = shutdown_tx.send(());
             }
@@ -665,6 +694,8 @@ pub(crate) mod tests {
         set_scoped_broadcast_hook,
     };
     use std::future::pending;
+    use std::io::{BufRead as _, BufReader as StdBufReader};
+    use std::os::unix::net::UnixListener as StdUnixListener;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
@@ -896,6 +927,52 @@ pub(crate) mod tests {
             }
         }
         received
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn herdr_flush_delivers_terminal_pair_on_current_thread_runtime() {
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("herdr-test-current-thread.sock");
+        let sock_str = sock_path.to_str().unwrap().to_string();
+
+        let listener = StdUnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let receiver = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut received = Vec::new();
+            while Instant::now() < deadline && received.len() < 2 {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .unwrap();
+                        let mut reader = StdBufReader::new(stream);
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok()
+                            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                            && let Some(method) = value.get("method").and_then(|m| m.as_str())
+                        {
+                            received.push(method.to_string());
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            received
+        });
+
+        let observer = HerdrObserver::new(HerdrClient::new(sock_str, "test-pane".into()), None);
+        observer.flush();
+
+        let received = receiver.join().unwrap();
+        assert_eq!(
+            received,
+            ["pane.report_agent", "pane.release_agent"],
+            "flush must deliver the terminal pair while the caller's current-thread runtime is blocked"
+        );
     }
 
     /// Shutdown drain test: verify ordered receipt of `idle` then

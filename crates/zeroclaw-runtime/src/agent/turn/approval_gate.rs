@@ -237,5 +237,5 @@ pub(crate) async fn gate_tool_approval(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod herdr_tests;

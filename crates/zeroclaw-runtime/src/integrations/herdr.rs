@@ -686,7 +686,7 @@ impl Observer for HerdrObserver {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod tests {
     use super::*;
     use crate::observability::{

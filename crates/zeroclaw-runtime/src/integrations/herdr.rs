@@ -694,7 +694,7 @@ pub(crate) mod tests {
         set_scoped_broadcast_hook,
     };
     use std::future::pending;
-    use std::io::{BufRead as _, BufReader as StdBufReader};
+    use std::io::Read as _;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::{Duration, Instant};
@@ -942,14 +942,28 @@ pub(crate) mod tests {
             let mut received = Vec::new();
             while Instant::now() < deadline && received.len() < 2 {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(500)))
-                            .unwrap();
-                        let mut reader = StdBufReader::new(stream);
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).is_ok()
-                            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(true).unwrap();
+                        let mut payload = Vec::new();
+                        while Instant::now() < deadline {
+                            let mut chunk = [0_u8; 1024];
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(read) => {
+                                    payload.extend_from_slice(&chunk[..read]);
+                                    if payload.contains(&b'\n') {
+                                        break;
+                                    }
+                                }
+                                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(_) => break,
+                            }
+                        }
+                        if let Some(line) = payload.split(|byte| *byte == b'\n').next()
+                            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(line)
                             && let Some(method) = value.get("method").and_then(|m| m.as_str())
                         {
                             received.push(method.to_string());

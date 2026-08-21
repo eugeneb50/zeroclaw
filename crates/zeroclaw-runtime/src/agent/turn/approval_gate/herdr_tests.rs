@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelApprovalRequest, ChannelApprovalResponse};
 use zeroclaw_config::policy::AutonomyLevel;
-use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
+use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig, StreamReasoningMode};
 
 use crate::agent::turn::approval_gate::{ApprovalGateOutcome, gate_tool_approval};
 use crate::agent::turn::context::TurnCtx;
@@ -84,6 +84,7 @@ fn build_ctx<'a>(
         pacing,
         strict_tool_parsing: false,
         channel: Some(channel.as_ref()),
+        draft_reasoning: StreamReasoningMode::Status,
         turn_id: "turn-1",
         agent_alias: None,
         parent_agent_alias: None,

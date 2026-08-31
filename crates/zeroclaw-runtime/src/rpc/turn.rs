@@ -819,7 +819,9 @@ mod tests {
 
         let agent = Agent::builder()
             .model_provider(Box::new(UsageProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -985,10 +987,12 @@ mod tests {
             let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let agent = Agent::builder()
                 .model_provider(Box::new(provider))
-                .tools(vec![Box::new(CountingTool {
-                    name: "echo",
-                    calls: Arc::clone(&tool_calls),
-                })])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(CountingTool {
+                        name: "echo",
+                        calls: Arc::clone(&tool_calls),
+                    })],
+                ))
                 .memory(mem)
                 .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
                 .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -1233,10 +1237,12 @@ mod tests {
         let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let agent = Agent::builder()
             .model_provider(Box::new(provider))
-            .tools(vec![Box::new(CountingTool {
-                name: "echo",
-                calls: Arc::clone(&tool_calls),
-            })])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(CountingTool {
+                    name: "echo",
+                    calls: Arc::clone(&tool_calls),
+                })],
+            ))
             .memory(mem)
             .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))

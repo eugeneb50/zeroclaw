@@ -2219,8 +2219,10 @@ async fn usage_event_coherent_tuple_vision_route() {
         let provider = ScriptedProvider::new(vec![base_resp]);
         let mut agent = Agent::builder()
             .model_provider(Box::new(provider))
-            .tools(vec![])
-            .memory(mem_none())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem_none(std::path::Path::new("/tmp")))
             .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
@@ -2456,11 +2458,13 @@ async fn usage_event_coherent_tuple_in_turn_model_switch() {
 
         let agent = Agent::builder()
             .model_provider(Box::new(provider))
-            .tools(vec![Box::new(ModelSwitchTriggerTool {
-                target_provider: "anthropic.provider-b".into(),
-                target_model: "claude-3-opus".into(),
-            })])
-            .memory(mem_none())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(ModelSwitchTriggerTool {
+                    target_provider: "anthropic.provider-b".into(),
+                    target_model: "claude-3-opus".into(),
+                })],
+            ))
+            .memory(mem_none(std::path::Path::new("/tmp")))
             .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
@@ -2674,11 +2678,13 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
 
     let agent = Agent::builder()
         .model_provider(Box::new(provider))
-        .tools(vec![Box::new(ModelSwitchTriggerTool {
-            target_provider: "anthropic.provider-b".into(),
-            target_model: "claude-3-opus".into(),
-        })])
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![Box::new(ModelSwitchTriggerTool {
+                target_provider: "anthropic.provider-b".into(),
+                target_model: "claude-3-opus".into(),
+            })],
+        ))
+        .memory(mem_none(std::path::Path::new("/tmp")))
         .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::path::PathBuf::from("/tmp"))
@@ -2738,7 +2744,8 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     let _ = turn_result.expect("turn should succeed");
 
     // reconstruct usage_by_provider from events (mirrors process_chat_message)
-    let mut usage_map: std::collections::HashMap<String, (String, u64, u64, u64, f64)> =
+    // Keyed by (provider_ref, model) to match production aggregation.
+    let mut usage_map: std::collections::HashMap<(String, String), (u64, u64, u64, f64)> =
         std::collections::HashMap::new();
 
     for event in &events {
@@ -2751,43 +2758,44 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
             cost_usd,
         } = event
         {
-            let entry = usage_map.entry(provider_ref.clone()).or_default();
-            entry.0 = model.clone();
+            let key = (provider_ref.clone(), model.clone());
+            let entry = usage_map.entry(key).or_default();
             if let Some(it) = input_tokens {
-                entry.1 = entry.1.saturating_add(*it);
+                entry.0 = entry.0.saturating_add(*it);
             }
             if let Some(ot) = output_tokens {
-                entry.2 = entry.2.saturating_add(*ot);
+                entry.1 = entry.1.saturating_add(*ot);
             }
             if let Some(ct) = cached_input_tokens {
-                entry.3 = entry.3.saturating_add(*ct);
+                entry.2 = entry.2.saturating_add(*ct);
             }
             if let Some(cu) = cost_usd {
-                entry.4 += cu;
+                entry.3 += cu;
             }
         }
     }
 
-    // Sort by provider_ref (same as process_chat_message)
+    // Sort by (provider_ref, model) (same as process_chat_message)
     let mut sorted_entries: Vec<_> = usage_map.into_iter().collect();
-    sorted_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    sorted_entries.sort_by(|(a, _), (b, _)| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-    // ASSERTION 1: two entries — one per provider
+    // ASSERTION 1: two entries — one per provider (this test uses two providers)
     assert_eq!(
         sorted_entries.len(),
         2,
         "usage_by_provider must have 2 entries (one per provider)"
     );
 
-    // ASSERTION 2: sort order matches production (provider_ref ascending).
-    // "anthropic.provider-b" sorts before "openai.primary" alphabetically.
-    assert_eq!(sorted_entries[0].0, "anthropic.provider-b");
-    assert_eq!(sorted_entries[1].0, "openai.primary");
+    // ASSERTION 2: sort order matches production (provider_ref, then model ascending).
+    assert_eq!(sorted_entries[0].0.0, "anthropic.provider-b");
+    assert_eq!(sorted_entries[0].0.1, "claude-3-opus");
+    assert_eq!(sorted_entries[1].0.0, "openai.primary");
+    assert_eq!(sorted_entries[1].0.1, "gpt-4o-mini");
 
     // Entry 0: Provider B (anthropic.provider-b — alphabetically first)
-    let (ref_b, (model_b, input_b, output_b, cached_b, cost_b)) = &sorted_entries[0];
+    let ((ref_b, model_b), (input_b, output_b, cached_b, cost_b)) = &sorted_entries[0];
     assert_eq!(ref_b, "anthropic.provider-b");
-    assert_eq!(*model_b, "claude-3-opus");
+    assert_eq!(model_b, "claude-3-opus");
     assert_eq!(*input_b, input_tokens_b);
     assert_eq!(*output_b, output_tokens_b);
     assert_eq!(*cached_b, 0);
@@ -2800,9 +2808,9 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
     );
 
     // Entry 1: Provider A (openai.primary — alphabetically second)
-    let (ref_a, (model_a, input_a, output_a, cached_a, cost_a)) = &sorted_entries[1];
+    let ((ref_a, model_a), (input_a, output_a, cached_a, cost_a)) = &sorted_entries[1];
     assert_eq!(ref_a, "openai.primary");
-    assert_eq!(*model_a, "gpt-4o-mini");
+    assert_eq!(model_a, "gpt-4o-mini");
     assert_eq!(*input_a, input_tokens_a);
     assert_eq!(*output_a, output_tokens_a);
     assert_eq!(*cached_a, 0);
@@ -2816,9 +2824,9 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
 
     // ASSERTION 3: aggregate totals equal the sum of per-provider entries.
     // Catches double-counting or dropped entries that a per-entry-only check misses.
-    let agg_input: u64 = sorted_entries.iter().map(|(_, (_, i, _, _, _))| *i).sum();
-    let agg_output: u64 = sorted_entries.iter().map(|(_, (_, _, o, _, _))| *o).sum();
-    let agg_cost: f64 = sorted_entries.iter().map(|(_, (_, _, _, _, c))| *c).sum();
+    let agg_input: u64 = sorted_entries.iter().map(|(_, (i, _, _, _))| *i).sum();
+    let agg_output: u64 = sorted_entries.iter().map(|(_, (_, o, _, _))| *o).sum();
+    let agg_cost: f64 = sorted_entries.iter().map(|(_, (_, _, _, c))| *c).sum();
     assert_eq!(
         agg_input,
         input_tokens_a + input_tokens_b,
@@ -2882,8 +2890,10 @@ async fn usage_event_emitted_even_without_usage_data() {
 
     let agent = Agent::builder()
         .model_provider(Box::new(provider))
-        .tools(vec![])
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
+        .memory(mem_none(std::path::Path::new("/tmp")))
         .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::path::PathBuf::from("/tmp"))
@@ -2972,8 +2982,10 @@ async fn usage_identity_updates_on_subsequent_calls_without_usage() {
 
     let agent = Agent::builder()
         .model_provider(Box::new(provider))
-        .tools(vec![])
-        .memory(mem_none())
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
+        .memory(mem_none(std::path::Path::new("/tmp")))
         .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::path::PathBuf::from("/tmp"))

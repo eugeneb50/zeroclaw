@@ -1013,8 +1013,9 @@ struct DoneFrameMeta<'a> {
 }
 
 /// Build the `done`-frame JSON.
-/// `provider` is alias-only for backward compatibility;
-/// `provider_ref` carries the full `<type>.<alias>` ref.
+/// `provider` carries the full configured `<type>.<alias>` ref, matching the
+/// long-standing wire semantic; `provider_ref` carries the serving identity
+/// resolved from usage events (falling back to the turn-start provider).
 fn build_done_frame_json(
     meta: &DoneFrameMeta,
     usage_by_provider: &[ProviderUsageEntry],
@@ -1175,9 +1176,11 @@ async fn process_chat_message(
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
-    // Per-provider breakdown — preserves identity of every LLM call so the
-    // done frame can attribute tokens/cost across provider switches.
-    let mut usage_by_provider: std::collections::HashMap<String, ProviderUsageEntry> =
+    // Per-(provider, model) usage snapshot — preserves identity of every LLM
+    // call so the done frame can attribute tokens/cost across provider/model
+    // switches. Keyed by (provider_ref, model) to avoid collapsing distinct
+    // models served by the same provider reference.
+    let mut usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry> =
         std::collections::HashMap::new();
 
     let forward_fut = async {
@@ -1331,14 +1334,15 @@ async fn process_chat_message(
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
                             }
-                            // Per-provider breakdown accumulation
+                            // Per-(provider, model) breakdown accumulation
+                            let key = (provider_ref.clone(), served_model.clone());
                             let entry = usage_by_provider
-                                .entry(provider_ref.clone())
+                                .entry(key)
                                 .or_insert_with(|| ProviderUsageEntry {
                                     provider_ref: provider_ref.clone(),
+                                    model: served_model.clone(),
                                     ..Default::default()
                                 });
-                            entry.model = served_model.clone();
                             if let Some(it) = input_tokens {
                                 entry.input_tokens = entry.input_tokens.saturating_add(it);
                             }
@@ -1477,14 +1481,10 @@ async fn process_chat_message(
 
         // Broadcast agent_end event
         let cancel_model = last_model.as_deref().unwrap_or(&turn_model);
-        let cancel_provider_alias = last_provider_ref
-            .as_deref()
-            .map(|r| r.split('.').next_back().unwrap_or(r))
-            .unwrap_or(&provider_label);
         let cancel_provider_ref = last_provider_ref.as_deref().unwrap_or(&provider_label);
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
-            "model_provider": cancel_provider_alias,
+            "model_provider": &provider_label,
             "model": cancel_model,
             "provider_ref": cancel_provider_ref,
         }));
@@ -1496,7 +1496,7 @@ async fn process_chat_message(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model_provider": cancel_provider_alias,
+                    "model_provider": &provider_label,
                     "model": cancel_model,
                     "provider_ref": cancel_provider_ref,
                     "session_key": session_key,
@@ -1571,42 +1571,39 @@ async fn process_chat_message(
                 .map(|usage| usage.cost_usd);
 
             // Resolve context_window from the last-served provider's config.
-            let (model_context_window, provider_ref_label) =
-                if let Some(ref provider_ref) = last_provider_ref {
-                    let cfg = state.config.read();
-                    let window = cfg
-                        .model_provider_context_window_opt(provider_ref)
-                        .map(|v| v as u64);
-                    // Display label: use alias part of provider_ref (after the dot), or full ref if no dot
-                    let label = provider_ref.split('.').next_back().unwrap_or(provider_ref);
-                    (window, label.to_string())
+            let model_context_window = if let Some(ref provider_ref) = last_provider_ref {
+                state
+                    .config
+                    .read()
+                    .model_provider_context_window_opt(provider_ref)
+                    .map(|v| v as u64)
+            } else {
+                let (_, live_provider, _) = agent.attribution_fields();
+                if live_provider.is_empty() {
+                    None
                 } else {
-                    let (_, live_provider, _) = agent.attribution_fields();
-                    if live_provider.is_empty() {
-                        (None, provider_label.clone())
-                    } else {
-                        let cfg = state.config.read();
-                        let window = cfg
-                            .model_provider_context_window_opt(&live_provider)
-                            .map(|v| v as u64);
-                        let label = live_provider
-                            .split('.')
-                            .next_back()
-                            .unwrap_or(&live_provider);
-                        (window, label.to_string())
-                    }
-                };
+                    state
+                        .config
+                        .read()
+                        .model_provider_context_window_opt(&live_provider)
+                        .map(|v| v as u64)
+                }
+            };
             // Use the last served model from usage events when available so
             // the terminal metadata is one coherent tuple with the provider.
             let effective_model = last_model.as_deref().unwrap_or(&turn_model);
             // Full provider_ref for the done frame: last served ref when
             // available, otherwise fall back to the turn-start provider label.
             let provider_ref_full = last_provider_ref.as_deref().unwrap_or(&provider_label);
-            // Deterministic ordering: sort by provider_ref so the wire
+            // Deterministic ordering: sort by (provider_ref, model) so the wire
             // format is stable (avoids flaky assertions in tests).
             let usage_by_provider_vec: Vec<ProviderUsageEntry> = {
                 let mut entries: Vec<_> = usage_by_provider.into_values().collect();
-                entries.sort_by(|a, b| a.provider_ref.cmp(&b.provider_ref));
+                entries.sort_by(|a, b| {
+                    a.provider_ref
+                        .cmp(&b.provider_ref)
+                        .then(a.model.cmp(&b.model))
+                });
                 entries
             };
             let meta = DoneFrameMeta {
@@ -1616,7 +1613,7 @@ async fn process_chat_message(
                 tokens_used: total_tokens,
                 cost_usd,
                 model: effective_model,
-                provider: &provider_ref_label,
+                provider: &provider_label,
                 provider_ref: provider_ref_full,
                 max_context_tokens,
                 model_context_window,
@@ -1635,7 +1632,7 @@ async fn process_chat_message(
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
-                "model_provider": provider_ref_label,
+                "model_provider": &provider_label,
                 "model": effective_model,
                 "provider_ref": provider_ref_full,
             }));
@@ -1648,7 +1645,7 @@ async fn process_chat_message(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model_provider": provider_ref_label,
+                        "model_provider": &provider_label,
                         "model": effective_model,
                         "provider_ref": provider_ref_full,
                         "session_key": session_key,
@@ -2830,7 +2827,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 tokens_used: Some(150),
                 cost_usd: Some(0.001),
                 model: "glm-5.2",
-                provider: vendor,
+                provider: provider_alias,
                 provider_ref: provider_alias,
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
@@ -2846,7 +2843,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                 v["max_context_tokens"], expected_max_ctx,
                 "profile budget must be emitted"
             );
-            // REQ-B2: full provider_ref present, alias-only provider unchanged
+            // Provider field carries the full configured reference (e.g., "openai.vendor"),
+            // matching pre-change gateway behavior. provider_ref carries the serving identity.
+            assert_eq!(v["provider"], provider_alias);
             assert_eq!(v["provider_ref"], provider_alias);
             assert_eq!(v["last_serving_provider_ref"], provider_alias);
             assert_eq!(v["last_serving_model"], "glm-5.2");
@@ -2941,7 +2940,7 @@ data: {\"type\":\"message_stop\"}\n\n",
                 tokens_used: Some(150),
                 cost_usd: Some(0.001),
                 model: "glm-5.2",
-                provider: "openrouter",
+                provider: live_provider_ref,
                 provider_ref: live_provider_ref,
                 max_context_tokens: max_ctx,
                 model_context_window: model_ctx_window,
@@ -2957,7 +2956,9 @@ data: {\"type\":\"message_stop\"}\n\n",
                 v["model_context_window"], 1_000_000,
                 "done-frame must carry B's live window after {label}, not A's static alias window"
             );
-            // REQ-B2: full provider_ref present, alias-only provider unchanged
+            // Provider field carries the full configured reference (e.g., "openrouter.b"),
+            // matching pre-change gateway behavior. provider_ref carries the serving identity.
+            assert_eq!(v["provider"], live_provider_ref);
             assert_eq!(v["provider_ref"], live_provider_ref);
             assert_eq!(v["last_serving_provider_ref"], live_provider_ref);
             assert_eq!(v["last_serving_model"], "glm-5.2");

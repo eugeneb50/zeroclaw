@@ -2653,6 +2653,8 @@ mod tests {
             cached_input_tokens: Some(2),
             output_tokens: Some(3),
             cost_usd: Some(0.01),
+            provider_ref: "stub".into(),
+            model: "stub-model".into(),
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());

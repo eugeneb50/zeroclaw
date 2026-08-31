@@ -134,70 +134,7 @@ pub(crate) async fn interpret_chat_response(
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let (resp_input_tokens, resp_output_tokens) = resp
-        .usage
-        .as_ref()
-        .map(|u| (u.input_tokens, u.output_tokens))
-        .unwrap_or((None, None));
-
-    // Per-iteration provider identity: vision routing or a mid-turn
-    // override may have changed which provider served this call.
-    let effective_provider_name = ctx
-        .serving_provider_name
-        .as_deref()
-        .unwrap_or(ctx.provider_name);
-
-    // Per-iteration served model: vision routing or reliable fallback
-    // may have changed which model served this call.
-    let effective_model = ctx.serving_model.as_deref().unwrap_or(ctx.model);
-
-    ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: effective_provider_name.to_string(),
-        model: effective_model.to_string(),
-        duration: llm_started_at.elapsed(),
-        success: true,
-        error_message: None,
-        input_tokens: resp_input_tokens,
-        output_tokens: resp_output_tokens,
-        channel: Some(ctx.channel_name.to_string()),
-        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
-        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
-        turn_id: Some(ctx.turn_id.to_string()),
-        // Credential-scrubbed prompt/completion content for OTel GenAI export;
-        // `None` unless the `observability-otel` feature is active.
-        messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
-    });
-
-    let call_cost_usd = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| {
-            record_tool_loop_cost_usage(effective_provider_name, effective_model, usage)
-        })
-        .map(|(_total_tokens, cost_usd)| cost_usd);
-
-    let (input_tokens, cached_input_tokens, output_tokens) = resp
-        .usage
-        .as_ref()
-        .map(|u| (u.input_tokens, u.cached_input_tokens, u.output_tokens))
-        .unwrap_or((None, None, None));
-
-    // Per-LLM-call usage event, right after the observer success event
-    // (upstream E2 parity, agent.rs Usage emission).
-    // Emitted unconditionally so terminal identity reflects the serving
-    // provider/model even when the provider returns no usage data.
-    if let Some(tx) = ctx.event_tx {
-        let _ = tx
-            .send(TurnEvent::Usage {
-                input_tokens,
-                cached_input_tokens,
-                output_tokens,
-                cost_usd: call_cost_usd,
-                provider_ref: effective_provider_name.to_string(),
-                model: effective_model.to_string(),
-            })
-            .await;
-    }
+    let resp_input_tokens = resp.usage.as_ref().and_then(|u| u.input_tokens);
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
@@ -339,11 +276,21 @@ pub(crate) async fn record_accepted_chat_response(
     llm_started_at: Instant,
     iteration: usize,
 ) {
+    // Resolve the actual serving identity: vision routing sets
+    // ctx.serving_provider_name/ctx.serving_model per-iteration; Reliable
+    // fallback and direct providers use the accepted_route tuple passed by
+    // the caller.
+    let effective_provider = ctx
+        .serving_provider_name
+        .as_deref()
+        .unwrap_or(served_provider);
+    let effective_model = ctx.serving_model.as_deref().unwrap_or(model);
+
     let input_tokens = usage.and_then(|usage| usage.input_tokens);
     let output_tokens = usage.and_then(|usage| usage.output_tokens);
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: served_provider.to_string(),
-        model: model.to_string(),
+        model_provider: effective_provider.to_string(),
+        model: effective_model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -356,17 +303,21 @@ pub(crate) async fn record_accepted_chat_response(
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
     let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
-    if let Some(tx) = ctx.event_tx
-        && let Some(usage) = usage
-    {
+    // Exactly-one per accepted response, even when the provider returned no
+    // usage data, so terminal identity and context-window accounting always
+    // describe the accepted serving provider/model. The caller settles
+    // rejected physical attempts separately and never reaches this point.
+    if let Some(tx) = ctx.event_tx {
         let _ = tx
             .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
+                input_tokens,
+                cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
+                output_tokens,
                 cost_usd,
+                provider_ref: effective_provider.to_string(),
+                model: effective_model.to_string(),
             })
             .await;
     }
@@ -589,7 +540,7 @@ mod cost_usd_regression_tests {
         let mut log_rx = zeroclaw_log::subscribe_or_install();
         while log_rx.try_recv().is_ok() {}
 
-        // Run interpret_chat_response inside the cost scope so
+        // Parse, then record the accepted response inside the cost scope so
         // record_tool_loop_cost_usage sees the pricing map.
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
@@ -625,7 +576,7 @@ mod cost_usd_regression_tests {
         // (a) The Usage event must carry the cost.
         let event = rx
             .try_recv()
-            .expect("interpret_chat_response should emit a TurnEvent::Usage");
+            .expect("record_accepted_chat_response should emit a TurnEvent::Usage");
         match event {
             TurnEvent::Usage { cost_usd, .. } => {
                 let c = cost_usd.expect("Usage event must carry cost_usd, got None");
@@ -701,6 +652,8 @@ mod cost_usd_regression_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
+            serving_provider_name: None,
+            serving_model: None,
         };
         let specs = IterationToolSpecs {
             tool_specs: vec![crate::tools::ToolSpec::new(

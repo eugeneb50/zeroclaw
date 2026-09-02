@@ -328,7 +328,7 @@ pub(crate) async fn record_accepted_chat_response(
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": model,
+                "model": effective_model,
                 "iteration": iteration + 1,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,

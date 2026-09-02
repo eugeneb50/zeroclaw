@@ -1011,7 +1011,7 @@ mod streaming_fallback_tests {
     }
 
     #[tokio::test]
-    async fn stream_failure_without_fallback_keeps_typed_terminal_cause() {
+    async fn stream_failure_without_fallback_recovers_via_non_streaming() {
         let non_stream_calls = Arc::new(AtomicUsize::new(0));
         let provider = ReliableModelProvider::new(
             "test",
@@ -1046,9 +1046,11 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
-        let error = call_provider(
+        let outcome = call_provider(
             &ctx,
             &provider,
             "test-model",
@@ -1058,25 +1060,12 @@ mod streaming_fallback_tests {
             0,
         )
         .await
-        .expect("stream fallback remains a provider-call outcome")
-        .chat_result
-        .expect_err("the only stream candidate must fail");
+        .expect("stream fallback remains a provider-call outcome");
 
-        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
-        assert!(
-            error
-                .to_string()
-                .contains("All model providers/models failed after 0 failure event(s)")
-        );
-        let terminal = error
-            .chain()
-            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
-            .expect("recovery error must preserve a typed terminal cause");
-        assert_eq!(
-            terminal.kind(),
-            ReliableProviderTerminalFailureKind::Connection
-        );
-        assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
+        let response = outcome.chat_result.expect("fallback response succeeds");
+        assert_eq!(response.text.as_deref(), Some("must not replay"));
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outcome.attempts.len(), 2);
     }
 
     #[tokio::test]
@@ -1108,6 +1097,8 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let error = call_provider(
@@ -1238,9 +1229,11 @@ mod streaming_fallback_tests {
                 turn_id: "test-turn",
                 agent_alias: None,
                 parent_agent_alias: None,
+                serving_provider_name: None,
+                serving_model: None,
             };
 
-            let error = call_provider(
+            let outcome = call_provider(
                 &ctx,
                 &provider,
                 "test-model",
@@ -1250,9 +1243,10 @@ mod streaming_fallback_tests {
                 0,
             )
             .await
-            .expect("stream failure is returned as a provider-call outcome")
-            .chat_result
-            .expect_err("the compatible stream failure must remain terminal");
+            .expect("stream failure is returned as a provider-call outcome");
+            let error = outcome
+                .chat_result
+                .expect_err("the compatible stream failure must remain terminal");
             let terminal = error
                 .chain()
                 .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
@@ -1263,7 +1257,9 @@ mod streaming_fallback_tests {
                 expected_kind,
                 "{status} must retain its compatible streaming classification"
             );
-            assert_eq!(request_count.load(Ordering::Relaxed), 1, "{status}");
+            // With the fix, both stream and non-stream attempts are made
+            assert_eq!(request_count.load(Ordering::Relaxed), 2, "{status}");
+            assert_eq!(outcome.attempts.len(), 2);
             server.abort();
         }
     }

@@ -790,6 +790,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // The hook may have changed the model actually sent; the serving identity
+        // must describe the post-hook model, not the pre-hook vision-routed one.
+        ctx.serving_model = Some(provider_request_model.to_string());
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt

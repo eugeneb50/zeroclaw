@@ -574,6 +574,95 @@ mod tests {
         assert!((records[1].usage.cost_usd - 3.0).abs() < 1e-12);
     }
 
+    #[tokio::test]
+    async fn reliable_rejected_with_usage_then_accepted_without_usage() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([
+            (
+                "provider.first".to_string(),
+                HashMap::from([("model-a.input".to_string(), 1.0)]),
+            ),
+            (
+                "provider.second".to_string(),
+                HashMap::from([("model-b.input".to_string(), 3.0)]),
+            ),
+        ]));
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let turn_usage_arc = Arc::clone(&context.turn_usage);
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                scope
+                    .scope(async {
+                        let first = FailingWithUsageLeaf {
+                            alias: "wrapper.first",
+                        };
+                        let _ = with_exact_dispatch_route(
+                            "provider.first".to_string(),
+                            "model-a".to_string(),
+                            ProviderDispatch::from_ref(&first).chat(
+                                ChatRequest {
+                                    messages: &messages,
+                                    tools: None,
+                                    thinking: None,
+                                },
+                                "ignored",
+                                None,
+                            ),
+                        )
+                        .await;
+                        let second = NoUsageLeaf {
+                            alias: "wrapper.second",
+                        };
+                        assert!(
+                            with_exact_dispatch_route(
+                                "provider.second".to_string(),
+                                "model-b".to_string(),
+                                ProviderDispatch::from_ref(&second).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .is_ok()
+                        );
+                    })
+                    .await;
+                let report = scope.take();
+                settle_provider_attempts(report.attempts(), Some(1));
+            })
+            .await;
+
+        let turn_usage = *turn_usage_arc.lock();
+        let cost_from_a = 1_000_000 as f64 / 1_000_000.0 * 1.0;
+        assert!(
+            (turn_usage.cost_usd - cost_from_a).abs() < 1e-12,
+            "turn cost includes rejected A"
+        );
+        assert_eq!(
+            turn_usage.input_tokens, 1_000_000,
+            "turn input_tokens includes rejected A"
+        );
+        assert_eq!(turn_usage.output_tokens, 0);
+    }
+
     struct PricedLeaf {
         alias: &'static str,
     }
@@ -614,6 +703,92 @@ mod tests {
                     output_tokens: Some(0),
                     cached_input_tokens: None,
                 }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    struct FailingWithUsageLeaf {
+        alias: &'static str,
+    }
+
+    impl Attributable for FailingWithUsageLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FailingWithUsageLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("fail".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    struct NoUsageLeaf {
+        alias: &'static str,
+    }
+
+    impl Attributable for NoUsageLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for NoUsageLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
                 reasoning_content: None,
             })
         }

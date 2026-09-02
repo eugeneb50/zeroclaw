@@ -3044,3 +3044,131 @@ async fn usage_identity_updates_on_subsequent_calls_without_usage() {
         "last Usage model must reflect the most recent provider call"
     );
 }
+
+/// Cross-provider boundary: Provider A reports usage → Provider B (different
+/// provider_ref) succeeds without usage. Verifies the final Usage event
+/// identity and ceiling reflect B, not A. This exercises REQ-B2 boundary.
+#[tokio::test]
+async fn usage_identity_crosses_provider_boundary_without_usage() {
+    use zeroclaw_providers::reliable::ReliableModelProvider;
+
+    // Provider A: fails on first call (simulating rejection)
+    struct FailingProvider;
+    #[async_trait]
+    impl ModelProvider for FailingProvider {
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            Err(anyhow::anyhow!("provider A failed"))
+        }
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Err(anyhow::anyhow!("provider A failed"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FailingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FailingProvider"
+        }
+    }
+
+    // Provider B: returns no usage (success without usage)
+    let mut resp_b = text_response("call without usage from B");
+    resp_b.usage = None;
+    let provider_b = ScriptedProvider::new(vec![resp_b]);
+
+    // Wrap in ReliableModelProvider with two different provider_refs
+    let reliable = ReliableModelProvider::new(
+        "test-reliable",
+        vec![
+            (
+                "provider-a".to_string(),
+                Box::new(FailingProvider) as Box<dyn ModelProvider>,
+            ),
+            (
+                "provider-b".to_string(),
+                Box::new(provider_b) as Box<dyn ModelProvider>,
+            ),
+        ],
+        0, // no retries
+        1,
+    );
+
+    let agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(mem_none(std::path::Path::new("/tmp")))
+            .observer(Arc::from(observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_provider_name("test-reliable".into())
+            .model_name("model-a".into()) // initial model
+            .agent_alias("cross-provider-test".into())
+            .build()
+            .expect("agent builder should succeed");
+
+    let (_tracker, cost_ctx) = build_cost_context("provider-a", "model-a", 1.5, 3.0);
+
+    let (tx, mut rx) = mpsc::channel::<TurnEvent>(256);
+    let prompt = "hello".to_string();
+    let mut agent = agent;
+    let handle = zeroclaw_spawn::spawn!(async move {
+        crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_ctx),
+                agent.turn_streamed_with_steering_state(&prompt, tx, None, None),
+            )
+            .await
+    });
+
+    let mut events: Vec<TurnEvent> = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    let _ = handle
+        .await
+        .expect("task join")
+        .expect("turn should succeed");
+
+    // Find the LAST Usage event
+    let last_usage = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            TurnEvent::Usage {
+                provider_ref,
+                model,
+                ..
+            } => Some((provider_ref.as_str(), model.as_str())),
+            _ => None,
+        })
+        .expect("at least one Usage event");
+
+    // Identity MUST reflect the most recent provider call (provider-b)
+    // even though provider-a had usage and provider-b had no usage
+    assert_eq!(
+        last_usage.0, "provider-b",
+        "last Usage provider_ref must reflect the most recent provider call (B), not A"
+    );
+    assert_eq!(
+        last_usage.1, "model-a",
+        "last Usage model must reflect the most recent provider call"
+    );
+}

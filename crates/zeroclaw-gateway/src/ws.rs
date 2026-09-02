@@ -983,6 +983,9 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 }
 
 /// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
+/// Tracks ACCEPTED responses only — does not include rejected Reliable attempts.
+/// The scalar `cost_usd` in the done frame includes ALL billable attempts
+/// (accepted + rejected), while this breakdown only covers accepted responses.
 #[derive(Debug, Clone, Default)]
 struct ProviderUsageEntry {
     provider_ref: String,
@@ -995,6 +998,9 @@ struct ProviderUsageEntry {
 
 /// Scalar inputs to build a done-frame JSON.
 /// `usage_by_provider` is kept as a separate arg (different concern).
+/// `cost_usd` includes ALL billable attempts (accepted + rejected via
+/// `settle_provider_attempts`), while `usage_by_provider` covers accepted
+/// responses only.
 #[derive(Debug, Clone)]
 struct DoneFrameMeta<'a> {
     full_response: &'a str,
@@ -2963,5 +2969,140 @@ data: {\"type\":\"message_stop\"}\n\n",
             assert_eq!(v["last_serving_provider_ref"], live_provider_ref);
             assert_eq!(v["last_serving_model"], "glm-5.2");
         }
+    }
+
+    /// Regression: usage_by_provider correctly accumulates per-(provider_ref, model)
+    /// when the same provider serves multiple models in one turn. This exercises
+    /// the aggregation logic directly (without full WS flow) to ensure the tuple
+    /// key and sorting are correct.
+    #[test]
+    fn usage_by_provider_same_provider_two_models() {
+        use std::collections::HashMap;
+
+        let provider_ref = "openrouter.vertex";
+
+        // Case 1: explicit window on second model
+        let mut usage_by_provider: HashMap<(String, String), ProviderUsageEntry> = HashMap::new();
+        // First call: model-a with usage
+        let key_a = (provider_ref.to_string(), "model-a".to_string());
+        let entry_a = usage_by_provider.entry(key_a).or_default();
+        entry_a.provider_ref = provider_ref.to_string();
+        entry_a.model = "model-a".to_string();
+        entry_a.input_tokens = 1000;
+        entry_a.output_tokens = 500;
+        entry_a.cached_input_tokens = 0;
+        entry_a.cost_usd = 0.01;
+
+        // Second call: model-b with usage (same provider_ref, different model)
+        let key_b = (provider_ref.to_string(), "model-b".to_string());
+        let entry_b = usage_by_provider.entry(key_b).or_default();
+        entry_b.provider_ref = provider_ref.to_string();
+        entry_b.model = "model-b".to_string();
+        entry_b.input_tokens = 2000;
+        entry_b.output_tokens = 1000;
+        entry_b.cached_input_tokens = 100;
+        entry_b.cost_usd = 0.02;
+
+        // Convert to sorted vec (as done in process_chat_message)
+        let mut entries: Vec<ProviderUsageEntry> = usage_by_provider.into_values().collect();
+        entries.sort_by(|a, b| {
+            a.provider_ref
+                .cmp(&b.provider_ref)
+                .then(a.model.cmp(&b.model))
+        });
+
+        // Should have exactly 2 entries, sorted by model name
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].provider_ref, provider_ref);
+        assert_eq!(entries[0].model, "model-a");
+        assert_eq!(entries[0].input_tokens, 1000);
+        assert_eq!(entries[0].output_tokens, 500);
+        assert_eq!(entries[0].cost_usd, 0.01);
+        assert_eq!(entries[1].provider_ref, provider_ref);
+        assert_eq!(entries[1].model, "model-b");
+        assert_eq!(entries[1].input_tokens, 2000);
+        assert_eq!(entries[1].output_tokens, 1000);
+        assert_eq!(entries[1].cached_input_tokens, 100);
+        assert_eq!(entries[1].cost_usd, 0.02);
+
+        // Case 2: second model has NO usage (None), but we still track identity
+        // This simulates B succeeding without usage — the done frame should still
+        // reflect B as the last_serving_model
+        let mut usage_by_provider2: HashMap<(String, String), ProviderUsageEntry> = HashMap::new();
+        let key_a2 = (provider_ref.to_string(), "model-a".to_string());
+        let entry_a2 = usage_by_provider2.entry(key_a2).or_default();
+        entry_a2.provider_ref = provider_ref.to_string();
+        entry_a2.model = "model-a".to_string();
+        entry_a2.input_tokens = 1000;
+        entry_a2.output_tokens = 500;
+        entry_a2.cost_usd = 0.01;
+
+        // model-b has NO usage event — it won't be in usage_by_provider
+        // but done-frame metadata will still show model-b as last_serving_model
+        let mut entries2: Vec<ProviderUsageEntry> = usage_by_provider2.into_values().collect();
+        entries2.sort_by(|a, b| {
+            a.provider_ref
+                .cmp(&b.provider_ref)
+                .then(a.model.cmp(&b.model))
+        });
+        assert_eq!(
+            entries2.len(),
+            1,
+            "only model-a has usage; model-b without usage not in breakdown"
+        );
+        assert_eq!(entries2[0].model, "model-a");
+
+        // Verify done-frame metadata would show model-b as last_serving_model
+        // (this is tested via build_done_frame_json with last_serving_model)
+        let meta = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(3000),
+            output_tokens: Some(1500),
+            tokens_used: Some(4500),
+            cost_usd: Some(0.03),
+            model: "model-b",
+            provider: provider_ref,
+            provider_ref,
+            max_context_tokens: 800_000,
+            model_context_window: Some(2_000_000), // B has explicit window
+            last_input_tokens: Some(2000),
+            last_serving_provider_ref: Some(provider_ref),
+            last_serving_model: Some("model-b"),
+        };
+        let done = build_done_frame_json(&meta, &entries2);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+        assert_eq!(v["model"], "model-b");
+        assert_eq!(v["last_serving_model"], "model-b");
+        assert_eq!(v["model_context_window"], 2_000_000);
+        // usage_by_provider only has model-a entry
+        let ubp = v["usage_by_provider"].as_array().unwrap();
+        assert_eq!(ubp.len(), 1);
+        assert_eq!(ubp[0]["model"], "model-a");
+        assert_eq!(ubp[0]["provider_ref"], provider_ref);
+
+        // Case 3: no explicit window on second model (fallback to max_context_tokens)
+        let meta2 = DoneFrameMeta {
+            full_response: "ok",
+            input_tokens: Some(3000),
+            output_tokens: Some(1500),
+            tokens_used: Some(4500),
+            cost_usd: Some(0.03),
+            model: "model-b",
+            provider: provider_ref,
+            provider_ref,
+            max_context_tokens: 800_000,
+            model_context_window: None, // B has NO explicit window
+            last_input_tokens: Some(2000),
+            last_serving_provider_ref: Some(provider_ref),
+            last_serving_model: Some("model-b"),
+        };
+        let done2 = build_done_frame_json(&meta2, &entries2);
+        let v2: serde_json::Value = serde_json::from_str(&done2.to_string()).unwrap();
+        assert_eq!(v2["model"], "model-b");
+        assert_eq!(v2["last_serving_model"], "model-b");
+        assert!(
+            v2.get("model_context_window").is_none(),
+            "model_context_window must be absent when provider has no context_window"
+        );
     }
 }

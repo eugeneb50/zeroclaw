@@ -195,7 +195,7 @@ impl SgrMouseEventDecoder {
 
     fn replay_candidate(&mut self) -> Vec<Event> {
         self.candidate_started_at = None;
-        self.candidate.drain(..).collect()
+        std::mem::take(&mut self.candidate)
     }
 }
 
@@ -768,6 +768,7 @@ pub async fn run(
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
             chrome_status.clear();
+            dashboard_pane.invalidate_daemon_data();
         } else {
             chrome_status.tick(&rpc);
         }

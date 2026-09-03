@@ -276,15 +276,25 @@ pub(crate) async fn record_accepted_chat_response(
     llm_started_at: Instant,
     iteration: usize,
 ) {
-    // Resolve the actual serving identity: vision routing sets
-    // ctx.serving_provider_name/ctx.serving_model per-iteration; Reliable
-    // fallback and direct providers use the accepted_route tuple passed by
-    // the caller.
-    let effective_provider = ctx
-        .serving_provider_name
-        .as_deref()
-        .unwrap_or(served_provider);
-    let effective_model = ctx.serving_model.as_deref().unwrap_or(model);
+    // The accepted_route tuple (passed as served_provider/model) is the
+    // canonical identity when Reliable wrapping produced an AcceptedRoute.
+    // ctx.serving_provider_name/ctx.serving_model are vision-routing and
+    // hook overrides that apply when vision routing selected a different
+    // provider than the base. They take precedence over the accepted_route
+    // when the accepted_route matches the base provider (indicating the
+    // accounting didn't capture the vision routing switch).
+    let effective_provider = if let Some(ref vision_provider) = ctx.serving_provider_name
+        && vision_provider != ctx.provider_name
+    {
+        vision_provider.as_str()
+    } else {
+        served_provider
+    };
+    let effective_model = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
+        ctx.serving_model.as_deref().unwrap_or(model)
+    } else {
+        model
+    };
 
     let input_tokens = usage.and_then(|usage| usage.input_tokens);
     let output_tokens = usage.and_then(|usage| usage.output_tokens);

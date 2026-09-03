@@ -6734,9 +6734,9 @@ impl ChatState {
                 model_context_window,
                 ..
             } => {
-                if input_tokens.is_some() {
-                    self.context_input_tokens = input_tokens;
-                }
+                // input_tokens=None on the accepted Usage means "unknown" for this
+                // route; don't carry a stale value from a previous route.
+                self.context_input_tokens = input_tokens;
                 // Use model_context_window for display (actual model window),
                 // fall back to max_context_tokens (trim budget) if not provided.
                 if model_context_window.is_some() {

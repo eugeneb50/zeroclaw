@@ -106,17 +106,16 @@ pub enum TurnEvent {
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.
-    /// The `provider_ref` and `model` identify the provider and model that
-    /// actually served this call, accounting for vision routing, reliable
-    /// fallback, and mid-turn provider switches.
+    /// The `provider_ref` and `model` identify the provider and model used
+    /// for cost attribution and context window resolution.
     ///
-    /// **Source-breaking change notice (for downstream crates):**
-    /// Adding required `provider_ref: String` and `model: String` fields to
-    /// this variant breaks construction and field patterns without `..` in
-    /// downstream Rust crates. The `#[non_exhaustive]` attribute also requires
-    /// all `match` expressions on `TurnEvent` to include a wildcard arm (`_ => {}`).
-    /// This is an intentional API evolution to ensure coherent identity tracking
-    /// across provider switches.
+    /// For vision routing and reliable fallback, these carry the actual served
+    /// provider and model. For dynamic routing models (e.g. `openrouter/auto`)
+    /// where the provider selects the concrete model and the `ModelProvider`
+    /// trait cannot expose the response-reported model, `model` carries the
+    /// requested routing model (e.g. `openrouter/auto`) rather than the
+    /// upstream-selected concrete model. This is a known limitation of the
+    /// current provider trait.
     Usage {
         input_tokens: Option<u64>,
         /// Tokens served from the provider's prompt cache (e.g. Anthropic

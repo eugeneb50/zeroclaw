@@ -983,9 +983,9 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 }
 
 /// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
-/// Tracks ACCEPTED responses only — does not include rejected Reliable attempts.
-/// The scalar `cost_usd` in the done frame includes ALL billable attempts
-/// (accepted + rejected), while this breakdown only covers accepted responses.
+/// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
+/// The scalar `cost_usd` in the done frame is the sum of `usage_by_provider[*].cost_usd`,
+/// making the breakdown the single source of truth for both token counts and cost.
 #[derive(Debug, Clone, Default)]
 struct ProviderUsageEntry {
     provider_ref: String,
@@ -998,9 +998,8 @@ struct ProviderUsageEntry {
 
 /// Scalar inputs to build a done-frame JSON.
 /// `usage_by_provider` is kept as a separate arg (different concern).
-/// `cost_usd` includes ALL billable attempts (accepted + rejected via
-/// `settle_provider_attempts`), while `usage_by_provider` covers accepted
-/// responses only.
+/// `cost_usd` is derived as the sum of `usage_by_provider[*].cost_usd`,
+/// which includes ALL billable attempts (accepted + rejected).
 #[derive(Debug, Clone)]
 struct DoneFrameMeta<'a> {
     full_response: &'a str,
@@ -1336,6 +1335,12 @@ async fn process_chat_message(
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
+                            } else {
+                                // Accepted call returned no usage data; clear the previous
+                                // route's input snapshot to prevent stale values from a
+                                // different route being rendered against this route's
+                                // context window.
+                                last_input_tokens = None;
                             }
                             if let Some(ot) = output_tokens {
                                 total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
@@ -1570,11 +1575,13 @@ async fn process_chat_message(
                 (None, Some(o)) => Some(o),
                 (None, None) => None,
             };
-            let cost_usd = turn_usage
-                .as_ref()
-                .map(|usage| *usage.lock())
-                .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
-                .map(|usage| usage.cost_usd);
+            // cost_usd is the sum of all billable attempts' cost_usd from
+            // usage_by_provider (which now includes rejected attempts). This makes
+            // the breakdown the single source of truth.
+            let cost_usd = {
+                let sum: f64 = usage_by_provider.values().map(|e| e.cost_usd).sum();
+                if sum > 0.0 { Some(sum) } else { None }
+            };
 
             // Resolve context_window from the last-served provider's config.
             let model_context_window = if let Some(ref provider_ref) = last_provider_ref {
@@ -3104,5 +3111,76 @@ data: {\"type\":\"message_stop\"}\n\n",
             v2.get("model_context_window").is_none(),
             "model_context_window must be absent when provider has no context_window"
         );
+    }
+
+    /// Regression: two-call route-switch where the final accepted call is usage-less.
+    /// First call reports usage, second (accepted) call has input_tokens=None.
+    /// The done frame must show:
+    /// - last_input_tokens = null (not stale value from first call)
+    /// - model, provider_ref, model_context_window from the second call
+    /// - usage_by_provider contains BOTH calls (rejected + accepted)
+    #[test]
+    fn two_call_route_switch_usage_less_final() {
+        use std::collections::HashMap;
+
+        let provider_ref = "test.provider";
+
+        // Simulate first call: has usage (5000 input tokens)
+        let mut usage_by_provider = HashMap::new();
+        let key_a = (provider_ref.to_string(), "model-a".to_string());
+        let entry_a = ProviderUsageEntry {
+            provider_ref: provider_ref.to_string(),
+            model: "model-a".to_string(),
+            input_tokens: 5000,
+            output_tokens: 100,
+            cost_usd: 0.02,
+            ..Default::default()
+        };
+        usage_by_provider.insert(key_a, entry_a);
+
+        // Simulate second call: ACCEPTED but usage-less (input_tokens = None)
+        // In the real flow, this would emit a Usage event with input_tokens = None,
+        // which the gateway processes and sets last_input_tokens = None
+        // The done-frame metadata shows model-b as the last serving model
+        let entries: Vec<ProviderUsageEntry> = usage_by_provider.into_values().collect();
+
+        let meta = DoneFrameMeta {
+            full_response: "accepted response from model-b",
+            input_tokens: None, // usage-less final call
+            output_tokens: Some(50),
+            tokens_used: Some(50),
+            cost_usd: Some(0.02), // only model-a has cost
+            model: "model-b",
+            provider: provider_ref,
+            provider_ref,
+            max_context_tokens: 128_000,
+            model_context_window: Some(200_000), // model-b has explicit window
+            last_input_tokens: None, // cleared because final call is usage-less
+            last_serving_provider_ref: Some(provider_ref),
+            last_serving_model: Some("model-b"),
+        };
+        let done = build_done_frame_json(&meta, &entries);
+        let v: serde_json::Value = serde_json::from_str(&done.to_string()).unwrap();
+
+        // Identity and ceiling must be from the SECOND (accepted) call
+        assert_eq!(v["model"], "model-b");
+        assert_eq!(v["provider_ref"], provider_ref);
+        assert_eq!(v["last_serving_model"], "model-b");
+        assert_eq!(v["last_serving_provider_ref"], provider_ref);
+        assert_eq!(v["model_context_window"], 200_000);
+
+        // last_input_tokens must be null (not 5000 from first call)
+        assert!(
+            v["last_input_tokens"].is_null(),
+            "last_input_tokens must be null when final call is usage-less, got: {}",
+            v["last_input_tokens"]
+        );
+
+        // usage_by_provider should have only model-a (which had usage)
+        // model-b had no usage so it's not in the breakdown
+        let ubp = v["usage_by_provider"].as_array().unwrap();
+        assert_eq!(ubp.len(), 1);
+        assert_eq!(ubp[0]["model"], "model-a");
+        assert_eq!(ubp[0]["input_tokens"], 5000);
     }
 }

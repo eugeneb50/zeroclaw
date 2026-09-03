@@ -242,15 +242,76 @@ pub fn record_rejected_tool_loop_cost_usage(
 }
 
 /// Record token usage from an accepted LLM response via the task-local cost
-/// tracker. Returns `(total_tokens, cost_usd)` on success, `None` when not
-/// scoped or no usage.
-pub fn record_tool_loop_cost_usage(
-    model_provider_name: &str,
-    model: &str,
-    usage: &zeroclaw_providers::traits::TokenUsage,
-) -> Option<(u64, f64)> {
-    record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
-}
+    /// tracker. Returns `(total_tokens, cost_usd)` on success, `None` when not
+    /// scoped or no usage.
+    pub fn record_tool_loop_cost_usage(
+        model_provider_name: &str,
+        model: &str,
+        usage: &zeroclaw_providers::traits::TokenUsage,
+    ) -> Option<(u64, f64)> {
+        record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
+    }
+
+    /// Compute cost_usd for a provider/model/usage triple using the task-local
+    /// pricing context but WITHOUT updating any accumulators. For emitting
+    /// Usage events for rejected attempts where the cost is already accounted
+    /// via settle_provider_attempts.
+    pub fn compute_cost_usd(
+        model_provider_name: &str,
+        model: &str,
+        usage: &zeroclaw_providers::traits::TokenUsage,
+    ) -> Option<f64> {
+        let input_tokens = usage.input_tokens.unwrap_or(0);
+        let output_tokens = usage.output_tokens.unwrap_or(0);
+        let cached_input_tokens = usage.cached_input_tokens.unwrap_or(0);
+        let total_tokens = input_tokens.saturating_add(output_tokens);
+        if total_tokens == 0 {
+            return None;
+        }
+
+        let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()?;
+        let pricing = provider_pricing(&ctx.model_provider_pricing, model_provider_name);
+        let config_rates = pricing
+            .map(|map| resolve_rates_opt(map, model))
+            .unwrap_or_default();
+
+        let live = (!config_rates.is_complete())
+            .then(|| live_pricing_for(model_provider_name, model))
+            .flatten();
+        let (mut input_rate, mut output_rate, mut cached_rate) =
+            merge_config_and_live_rates(config_rates, live);
+
+        let _priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
+            if let Some((cat_in, cat_out, cat_cached)) =
+                crate::agent::pricing_catalog::global_pricing_rates(model)
+            {
+                input_rate = cat_in;
+                output_rate = cat_out;
+                if cached_rate == 0.0 {
+                    cached_rate = cat_cached;
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let cost_usage = CostTokenUsage::new_with_cache(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            input_rate,
+            cached_rate,
+            output_rate,
+        );
+        Some(cost_usage.cost_usd)
+    }
 
 /// Settle the immutable physical-attempt report exactly once.  Only complete
 /// usage (or a valid lower-bound observation preserved after interruption) is
@@ -651,7 +712,7 @@ mod tests {
             .await;
 
         let turn_usage = *turn_usage_arc.lock();
-        let cost_from_a = 1_000_000 as f64 / 1_000_000.0 * 1.0;
+        let cost_from_a = 1_000_000_f64 / 1_000_000.0 * 1.0;
         assert!(
             (turn_usage.cost_usd - cost_from_a).abs() < 1e-12,
             "turn cost includes rejected A"

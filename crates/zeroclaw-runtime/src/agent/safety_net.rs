@@ -3062,7 +3062,7 @@ async fn usage_identity_crosses_provider_boundary_without_usage() {
             _model: &str,
             _temperature: Option<f64>,
         ) -> Result<ChatResponse> {
-            Err(anyhow::anyhow!("provider A failed"))
+            Err(anyhow::Error::msg("provider A failed"))
         }
         async fn chat_with_system(
             &self,
@@ -3071,7 +3071,7 @@ async fn usage_identity_crosses_provider_boundary_without_usage() {
             _model: &str,
             _temperature: Option<f64>,
         ) -> Result<String> {
-            Err(anyhow::anyhow!("provider A failed"))
+            Err(anyhow::Error::msg("provider A failed"))
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for FailingProvider {

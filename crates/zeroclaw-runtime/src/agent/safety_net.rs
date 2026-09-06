@@ -2756,6 +2756,7 @@ async fn usage_by_provider_breakdown_after_in_turn_model_switch() {
             output_tokens,
             cached_input_tokens,
             cost_usd,
+            ..
         } = event
         {
             let key = (provider_ref.clone(), model.clone());

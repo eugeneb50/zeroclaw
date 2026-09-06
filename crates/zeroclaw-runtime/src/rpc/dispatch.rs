@@ -2211,6 +2211,7 @@ impl RpcDispatcher {
                         Some(store),
                         TurnEvent::Usage {
                             input_tokens: Some(it),
+                            accepted: true,
                             ..
                         },
                     ) = (acp_token_store.as_ref(), &event)
@@ -5360,7 +5361,11 @@ fn notification_for_turn_event(
             kept_turns: *kept_turns,
             reason: reason.clone(),
         },
-        TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
+        TurnEvent::Usage {
+            input_tokens,
+            accepted: true,
+            ..
+        } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
             input_tokens: *input_tokens,
             max_context_tokens,
@@ -8102,6 +8107,7 @@ mod tests {
             cost_usd: Some(0.01),
             provider_ref: String::new(),
             model: String::new(),
+            accepted: true,
         };
         let json =
             notification_for_turn_event("s1", &event, Some(max_ctx), Some(model_ctx)).unwrap();
@@ -8176,6 +8182,7 @@ mod tests {
             cost_usd: None,
             provider_ref: String::new(),
             model: String::new(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event, max_ctx, model_ctx_window).unwrap();
         let v = parse(&json);
@@ -8320,6 +8327,7 @@ mod tests {
             cost_usd: None,
             provider_ref: String::new(),
             model: String::new(),
+            accepted: true,
         };
         let max_ctx = context_usage_max_tokens(&cfg, "test-agent");
         let json =
@@ -8342,6 +8350,7 @@ mod tests {
             cost_usd: None,
             provider_ref: String::new(),
             model: String::new(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event, None, None).unwrap();
         let v = parse(&json);
@@ -8362,6 +8371,7 @@ mod tests {
             cost_usd: None,
             provider_ref: String::new(),
             model: String::new(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event, Some(200_000), None).unwrap();
         let v = parse(&json);
@@ -8383,6 +8393,7 @@ mod tests {
             cost_usd: None,
             provider_ref: String::new(),
             model: String::new(),
+            accepted: true,
         };
         let json = notification_for_turn_event("s1", &event, Some(100_000), None).unwrap();
         let v = parse(&json);

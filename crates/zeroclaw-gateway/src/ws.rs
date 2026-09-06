@@ -1322,14 +1322,15 @@ async fn process_chat_message(
                     event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
-                        TurnEvent::Usage {
-                            input_tokens,
-                            cached_input_tokens,
-                            output_tokens,
-                            cost_usd,
-                            provider_ref,
-                            model: served_model,
-                        } => {
+TurnEvent::Usage {
+                        input_tokens,
+                        cached_input_tokens,
+                        output_tokens,
+                        cost_usd,
+                        provider_ref,
+                        model: served_model,
+                        accepted: _,
+                    } => {
                             last_provider_ref = Some(provider_ref.clone());
                             last_model = Some(served_model.clone());
                             if let Some(it) = input_tokens {
@@ -3155,7 +3156,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             provider_ref,
             max_context_tokens: 128_000,
             model_context_window: Some(200_000), // model-b has explicit window
-            last_input_tokens: None, // cleared because final call is usage-less
+            last_input_tokens: None,             // cleared because final call is usage-less
             last_serving_provider_ref: Some(provider_ref),
             last_serving_model: Some("model-b"),
         };

@@ -904,6 +904,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
+            active_model_provider_name,
             provider_request_model,
             &provider_request_messages,
             request_tools,
@@ -919,9 +920,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .as_ref()
             .map(|route| (route.provider_ref(), route.model()))
             .or_else(|| {
-                ctx.serving_provider_name
-                    .as_deref()
-                    .map(|p| (p, ctx.serving_model.as_deref().unwrap_or(provider_request_model)))
+                ctx.serving_provider_name.as_deref().map(|p| {
+                    (
+                        p,
+                        ctx.serving_model
+                            .as_deref()
+                            .unwrap_or(provider_request_model),
+                    )
+                })
             })
             .unwrap_or((ctx.provider_name, provider_request_model));
 
@@ -1117,6 +1123,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                         cost_usd,
                         provider_ref: billable.attempt.provider_ref().to_string(),
                         model: billable.attempt.model().to_string(),
+                        accepted: false,
                     })
                     .await;
             }
@@ -1132,6 +1139,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &provider_request_messages,
             llm_started_at,
             iteration,
+            accepted_route.as_ref(),
         )
         .await;
 

@@ -152,6 +152,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 pub(crate) async fn call_provider(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
     active_model: &str,
     prepared_messages: &[ChatMessage],
     request_tools: Option<&[ToolSpec]>,
@@ -265,7 +266,7 @@ pub(crate) async fn call_provider(
                             scope.clear_provisional_provider_route();
                             let dispatcher = ProviderDispatch::from_ref(active_model_provider);
                             let recovery = with_exact_dispatch_route(
-                                ctx.provider_name.to_string(),
+                                active_model_provider_name.to_string(),
                                 active_model.to_string(),
                                 dispatcher.chat(
                                 ChatRequest {
@@ -308,7 +309,7 @@ pub(crate) async fn call_provider(
         let dispatcher = ProviderDispatch::from_ref(active_model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let chat_future = scope.scope(Box::pin(with_exact_dispatch_route(
-            ctx.provider_name.to_string(),
+            active_model_provider_name.to_string(),
             active_model.to_string(),
             dispatcher.chat(
                 ChatRequest {
@@ -984,6 +985,7 @@ mod streaming_fallback_tests {
                     call_provider(
                         &ctx,
                         &provider,
+                        "test-provider",
                         "test-model",
                         &[ChatMessage::user("go")],
                         None,
@@ -1053,6 +1055,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1104,6 +1107,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1236,6 +1240,7 @@ mod streaming_fallback_tests {
             let outcome = call_provider(
                 &ctx,
                 &provider,
+                "test-provider",
                 "test-model",
                 &[ChatMessage::user("go")],
                 None,
@@ -1298,6 +1303,7 @@ mod streaming_fallback_tests {
         let error = call_provider(
             &ctx,
             &provider,
+            "test-provider",
             "test-model",
             &[ChatMessage::user("go")],
             None,
@@ -1365,6 +1371,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "requested-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,
@@ -1433,6 +1440,7 @@ mod streaming_fallback_tests {
         let outcome = call_provider(
             &ctx,
             &provider,
+            "requested-provider",
             "requested-model",
             &[ChatMessage::user("go")],
             None,

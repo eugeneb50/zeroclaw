@@ -132,6 +132,11 @@ pub enum TurnEvent {
         /// a reliable fallback selects a different model, this carries the
         /// served model — not the turn-start model.
         model: String,
+        /// Whether this usage event corresponds to the semantically accepted
+        /// response (`true`) or a rejected physical attempt (`false`). Rejected
+        /// attempts are billing-only telemetry; they do not update the accepted
+        /// context snapshot (ACP session token count, context-meter ceiling).
+        accepted: bool,
     },
 }
 

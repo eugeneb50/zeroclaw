@@ -1591,8 +1591,13 @@ impl AcpServer {
         // resume/restart replay the daemon RPC bridge already provides.
         let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
-            if let TurnEvent::Usage { input_tokens, .. } = &event {
-                if let (Some(store), Some(it)) = (&self.store, input_tokens) {
+            if let TurnEvent::Usage {
+                input_tokens: Some(it),
+                accepted: true,
+                ..
+            } = &event
+            {
+                if let Some(store) = &self.store {
                     let store = store.clone();
                     let sid = session_id.clone();
                     let it = *it;
@@ -2655,6 +2660,7 @@ mod tests {
             cost_usd: Some(0.01),
             provider_ref: "stub".into(),
             model: "stub-model".into(),
+            accepted: true,
         };
 
         assert!(notification_for_turn_event("session", &event).is_none());

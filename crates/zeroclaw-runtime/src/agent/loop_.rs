@@ -15197,10 +15197,7 @@ Let me check the result."#;
         }
         // Both the rejected attempt (80 in, 5 out) and the accepted attempt
         // (80 in, 7 out) now emit Usage events.
-        assert_eq!(
-            usage_events,
-            vec![(Some(80), Some(5)), (Some(80), Some(7))]
-        );
+        assert_eq!(usage_events, vec![(Some(80), Some(5)), (Some(80), Some(7))]);
         assert!(
             !history_trimmed,
             "recovered rejected usage must not trim history"

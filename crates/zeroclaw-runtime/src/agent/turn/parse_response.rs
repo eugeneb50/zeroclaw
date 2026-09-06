@@ -261,9 +261,12 @@ pub(crate) async fn interpret_chat_response(
     }
 }
 
+use zeroclaw_providers::dispatch::AcceptedRoute;
+
 /// Emit effects which are valid only after the turn loop accepts the parsed
 /// response. Keeping this separate from interpretation prevents a malformed
 /// transport success from advancing accepted accounting or success telemetry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_accepted_chat_response(
     ctx: &TurnCtx<'_>,
     served_provider: &str,
@@ -275,25 +278,30 @@ pub(crate) async fn record_accepted_chat_response(
     history: &[ChatMessage],
     llm_started_at: Instant,
     iteration: usize,
+    accepted_route: Option<&AcceptedRoute>,
 ) {
-    // The accepted_route tuple (passed as served_provider/model) is the
-    // canonical identity when Reliable wrapping produced an AcceptedRoute.
-    // ctx.serving_provider_name/ctx.serving_model are vision-routing and
-    // hook overrides that apply when vision routing selected a different
-    // provider than the base. They take precedence over the accepted_route
-    // when the accepted_route matches the base provider (indicating the
-    // accounting didn't capture the vision routing switch).
-    let effective_provider = if let Some(ref vision_provider) = ctx.serving_provider_name
-        && vision_provider != ctx.provider_name
-    {
-        vision_provider.as_str()
-    } else {
-        served_provider
-    };
-    let effective_model = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
-        ctx.serving_model.as_deref().unwrap_or(model)
-    } else {
-        model
+    // The accepted_route tuple is the canonical identity when Reliable wrapping
+    // produced an AcceptedRoute. When no AcceptedRoute exists (direct/vision
+    // routing without Reliable), fall back to ctx.serving_* overrides.
+    let (effective_provider, effective_model) = match accepted_route {
+        Some(route) => (route.provider_ref(), route.model()),
+        None => {
+            // Vision routing without Reliable: use ctx.serving_* overrides when
+            // they differ from the base provider.
+            let prov = if let Some(ref vision_provider) = ctx.serving_provider_name
+                && vision_provider != ctx.provider_name
+            {
+                vision_provider.as_str()
+            } else {
+                served_provider
+            };
+            let mdl = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
+                ctx.serving_model.as_deref().unwrap_or(model)
+            } else {
+                model
+            };
+            (prov, mdl)
+        }
     };
 
     let input_tokens = usage.and_then(|usage| usage.input_tokens);
@@ -328,6 +336,7 @@ pub(crate) async fn record_accepted_chat_response(
                 cost_usd,
                 provider_ref: effective_provider.to_string(),
                 model: effective_model.to_string(),
+                accepted: true,
             })
             .await;
     }
@@ -578,6 +587,7 @@ mod cost_usd_regression_tests {
                     &[],
                     now,
                     0,
+                    None,
                 )
                 .await;
             })

@@ -1192,225 +1192,225 @@ async fn process_chat_message(
         let mut cancel_drained = false;
         loop {
             tokio::select! {
-                biased;
-                _ = cancel_token.cancelled(), if !cancel_drained => {
-                    let drained: Vec<_> = pending_approvals.lock().drain().collect();
-                    drop(drained);
-                    cancel_drained = true;
-                    // Fall through; the agent loop will now wake from the
-                    // approval await, see the cancel token, and propagate
-                    // a ToolLoopCancelled error which closes event_rx and
-                    // breaks this loop on the `event_rx.recv()` arm below.
-                }
-                client_msg = receiver.next() => {
-                    let text = match client_msg {
-                        Some(Ok(Message::Text(text))) => text,
-                        Some(Ok(Message::Ping(payload))) => {
-                            if sender.send(Message::Pong(payload)).await.is_err() {
-                                cancel_token.cancel();
-                                break;
+                            biased;
+                            _ = cancel_token.cancelled(), if !cancel_drained => {
+                                let drained: Vec<_> = pending_approvals.lock().drain().collect();
+                                drop(drained);
+                                cancel_drained = true;
+                                // Fall through; the agent loop will now wake from the
+                                // approval await, see the cancel token, and propagate
+                                // a ToolLoopCancelled error which closes event_rx and
+                                // breaks this loop on the `event_rx.recv()` arm below.
                             }
-                            continue;
-                        }
-                        Some(Ok(Message::Pong(_))) => continue,
-                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
-                        }
-                        _ => continue,
-                    };
-                    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
-                        let err = serde_json::json!({
-                            "type": "error",
-                            "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
-                            "code": "INVALID_JSON"
-                        });
-                        let _ = sender.send(Message::Text(err.to_string().into())).await;
-                        continue;
-                    };
-                    match parsed["type"].as_str() {
-                        Some("approval_response") => {
-                            // A SOP-kind frame is a gate resolution (keyed by run_id),
-                            // not a tool-prompt response (keyed by request_id). Resolve
-                            // it here too so it is answered mid-turn instead of being
-                            // silently dropped on the request_id path below.
-                            if handle_ws_sop_frame(
-                                &parsed,
-                                state,
-                                session_id,
-                                auth_subject,
-                                &mut *sender,
-                            )
-                            .await
-                            {
-                                continue;
-                            }
-                            let request_id = parsed["request_id"].as_str().unwrap_or("");
-                            let decision = match parsed["decision"].as_str().unwrap_or("") {
-                                "approve" => Some(ChannelApprovalResponse::Approve),
-                                "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                                "deny" => Some(ChannelApprovalResponse::Deny),
-                                _ => None,
-                            };
-                            if request_id.is_empty() || decision.is_none() {
-                                continue;
-                            }
-                            if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                                let _ = tx.send(decision.expect("checked above"));
-                            } else {
-                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
-                            }
-                        }
-                        Some("message") => {
-                            let content = parsed["content"].as_str().unwrap_or("").to_string();
-                            if content.is_empty() {
-                                let err = serde_json::json!({
-                                    "type": "error",
-                                    "message": "Message content cannot be empty",
-                                    "code": "EMPTY_CONTENT"
-                                });
-                                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                                continue;
-                            }
-                            match steering_tx.try_send(content) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            client_msg = receiver.next() => {
+                                let text = match client_msg {
+                                    Some(Ok(Message::Text(text))) => text,
+                                    Some(Ok(Message::Ping(payload))) => {
+                                        if sender.send(Message::Pong(payload)).await.is_err() {
+                                            cancel_token.cancel();
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    Some(Ok(Message::Pong(_))) => continue,
+                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                                        cancel_token.cancel();
+                                        break;
+                                    }
+                                    _ => continue,
+                                };
+                                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
                                     let err = serde_json::json!({
                                         "type": "error",
-                                        "message": "Steering queue is full for the running turn",
-                                        "code": "STEERING_QUEUE_FULL"
+                                        "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}",
+                                        "code": "INVALID_JSON"
                                     });
                                     let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    continue;
+                                };
+                                match parsed["type"].as_str() {
+                                    Some("approval_response") => {
+                                        // A SOP-kind frame is a gate resolution (keyed by run_id),
+                                        // not a tool-prompt response (keyed by request_id). Resolve
+                                        // it here too so it is answered mid-turn instead of being
+                                        // silently dropped on the request_id path below.
+                                        if handle_ws_sop_frame(
+                                            &parsed,
+                                            state,
+                                            session_id,
+                                            auth_subject,
+                                            &mut *sender,
+                                        )
+                                        .await
+                                        {
+                                            continue;
+                                        }
+                                        let request_id = parsed["request_id"].as_str().unwrap_or("");
+                                        let decision = match parsed["decision"].as_str().unwrap_or("") {
+                                            "approve" => Some(ChannelApprovalResponse::Approve),
+                                            "always" => Some(ChannelApprovalResponse::AlwaysApprove),
+                                            "deny" => Some(ChannelApprovalResponse::Deny),
+                                            _ => None,
+                                        };
+                                        if request_id.is_empty() || decision.is_none() {
+                                            continue;
+                                        }
+                                        if let Some(tx) = pending_approvals.lock().remove(request_id) {
+                                            let _ = tx.send(decision.expect("checked above"));
+                                        } else {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request (mid-turn)");
+                                        }
+                                    }
+                                    Some("message") => {
+                                        let content = parsed["content"].as_str().unwrap_or("").to_string();
+                                        if content.is_empty() {
+                                            let err = serde_json::json!({
+                                                "type": "error",
+                                                "message": "Message content cannot be empty",
+                                                "code": "EMPTY_CONTENT"
+                                            });
+                                            let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            continue;
+                                        }
+                                        match steering_tx.try_send(content) {
+                                            Ok(()) => {}
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Steering queue is full for the running turn",
+                                                    "code": "STEERING_QUEUE_FULL"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                let err = serde_json::json!({
+                                                    "type": "error",
+                                                    "message": "Running turn is no longer accepting steering messages",
+                                                    "code": "STEERING_CLOSED"
+                                                });
+                                                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                    let err = serde_json::json!({
-                                        "type": "error",
-                                        "message": "Running turn is no longer accepting steering messages",
-                                        "code": "STEERING_CLOSED"
+                            }
+                            approval = approval_event_rx.recv() => {
+                                let Some(event) = approval else { continue };
+                                if let TurnEvent::ApprovalRequest {
+                                    request_id,
+                                    tool_name,
+                                    arguments_summary,
+                                    timeout_secs,
+                                } = event {
+                                    let frame = serde_json::json!({
+                                        "type": "approval_request",
+                                        "request_id": request_id,
+                                        "tool": tool_name,
+                                        "arguments_summary": arguments_summary,
+                                        "timeout_secs": timeout_secs,
                                     });
-                                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
                                 }
                             }
-                        }
-                        _ => {}
-                    }
-                }
-                approval = approval_event_rx.recv() => {
-                    let Some(event) = approval else { continue };
-                    if let TurnEvent::ApprovalRequest {
-                        request_id,
-                        tool_name,
-                        arguments_summary,
-                        timeout_secs,
-                    } = event {
-                        let frame = serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        });
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
-                    }
-                }
-                _ = tick_websocket_ping(ping_interval) => {
-                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        cancel_token.cancel();
-                        break;
-                    }
-                }
-                    event_opt = event_rx.recv() => {
-                    let Some(event) = event_opt else { break };
-                    let ws_msg = match event {
-TurnEvent::Usage {
-                        input_tokens,
-                        cached_input_tokens,
-                        output_tokens,
-                        cost_usd,
-                        provider_ref,
-                        model: served_model,
-                        accepted: _,
-                    } => {
-                            last_provider_ref = Some(provider_ref.clone());
-                            last_model = Some(served_model.clone());
-                            if let Some(it) = input_tokens {
-                                total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
-                                last_input_tokens = Some(it);
-                            } else {
-                                // Accepted call returned no usage data; clear the previous
-                                // route's input snapshot to prevent stale values from a
-                                // different route being rendered against this route's
-                                // context window.
-                                last_input_tokens = None;
+                            _ = tick_websocket_ping(ping_interval) => {
+                                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                    cancel_token.cancel();
+                                    break;
+                                }
                             }
-                            if let Some(ot) = output_tokens {
-                                total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                                event_opt = event_rx.recv() => {
+                                let Some(event) = event_opt else { break };
+                                let ws_msg = match event {
+            TurnEvent::Usage {
+                                    input_tokens,
+                                    cached_input_tokens,
+                                    output_tokens,
+                                    cost_usd,
+                                    provider_ref,
+                                    model: served_model,
+                                    accepted: _,
+                                } => {
+                                        last_provider_ref = Some(provider_ref.clone());
+                                        last_model = Some(served_model.clone());
+                                        if let Some(it) = input_tokens {
+                                            total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
+                                            last_input_tokens = Some(it);
+                                        } else {
+                                            // Accepted call returned no usage data; clear the previous
+                                            // route's input snapshot to prevent stale values from a
+                                            // different route being rendered against this route's
+                                            // context window.
+                                            last_input_tokens = None;
+                                        }
+                                        if let Some(ot) = output_tokens {
+                                            total_output_tokens = Some(total_output_tokens.unwrap_or(0) + ot);
+                                        }
+                                        // Per-(provider, model) breakdown accumulation
+                                        let key = (provider_ref.clone(), served_model.clone());
+                                        let entry = usage_by_provider
+                                            .entry(key)
+                                            .or_insert_with(|| ProviderUsageEntry {
+                                                provider_ref: provider_ref.clone(),
+                                                model: served_model.clone(),
+                                                ..Default::default()
+                                            });
+                                        if let Some(it) = input_tokens {
+                                            entry.input_tokens = entry.input_tokens.saturating_add(it);
+                                        }
+                                        if let Some(ot) = output_tokens {
+                                            entry.output_tokens = entry.output_tokens.saturating_add(ot);
+                                        }
+                                        if let Some(ct) = cached_input_tokens {
+                                            entry.cached_input_tokens =
+                                                entry.cached_input_tokens.saturating_add(ct);
+                                        }
+                                        if let Some(cu) = cost_usd {
+                                            entry.cost_usd += cu;
+                                        }
+                                        continue;
+                                    }
+                                    TurnEvent::Chunk { ref delta } => {
+                                        accumulated_text.push_str(delta);
+                                        serde_json::json!({ "type": "chunk", "content": delta })
+                                    }
+                                    TurnEvent::Thinking { delta } => {
+                                        serde_json::json!({ "type": "thinking", "content": delta })
+                                    }
+                                    TurnEvent::ToolCall { id, name, args } => {
+                                        serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
+                                    }
+                                    TurnEvent::ToolResult {
+                                        id, name, output, ..
+                                    } => {
+                                        serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
+                                    }
+                                    TurnEvent::ApprovalRequest {
+                                        request_id,
+                                        tool_name,
+                                        arguments_summary,
+                                        timeout_secs,
+                                    } => serde_json::json!({
+                                        "type": "approval_request",
+                                        "request_id": request_id,
+                                        "tool": tool_name,
+                                        "arguments_summary": arguments_summary,
+                                        "timeout_secs": timeout_secs,
+                                    }),
+                                    TurnEvent::HistoryTrimmed {
+                                        dropped_messages,
+                                        kept_turns,
+                                        reason,
+                                    } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
+                                    TurnEvent::Plan { entries } => serde_json::json!({
+                                        "type": "plan",
+                                        "entries": entries,
+                                    }),
+                                    _ => continue,
+                                };
+                                let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
                             }
-                            // Per-(provider, model) breakdown accumulation
-                            let key = (provider_ref.clone(), served_model.clone());
-                            let entry = usage_by_provider
-                                .entry(key)
-                                .or_insert_with(|| ProviderUsageEntry {
-                                    provider_ref: provider_ref.clone(),
-                                    model: served_model.clone(),
-                                    ..Default::default()
-                                });
-                            if let Some(it) = input_tokens {
-                                entry.input_tokens = entry.input_tokens.saturating_add(it);
-                            }
-                            if let Some(ot) = output_tokens {
-                                entry.output_tokens = entry.output_tokens.saturating_add(ot);
-                            }
-                            if let Some(ct) = cached_input_tokens {
-                                entry.cached_input_tokens =
-                                    entry.cached_input_tokens.saturating_add(ct);
-                            }
-                            if let Some(cu) = cost_usd {
-                                entry.cost_usd += cu;
-                            }
-                            continue;
                         }
-                        TurnEvent::Chunk { ref delta } => {
-                            accumulated_text.push_str(delta);
-                            serde_json::json!({ "type": "chunk", "content": delta })
-                        }
-                        TurnEvent::Thinking { delta } => {
-                            serde_json::json!({ "type": "thinking", "content": delta })
-                        }
-                        TurnEvent::ToolCall { id, name, args } => {
-                            serde_json::json!({ "type": "tool_call", "id": id, "name": name, "args": args })
-                        }
-                        TurnEvent::ToolResult {
-                            id, name, output, ..
-                        } => {
-                            serde_json::json!({ "type": "tool_result", "id": id, "name": name, "output": output })
-                        }
-                        TurnEvent::ApprovalRequest {
-                            request_id,
-                            tool_name,
-                            arguments_summary,
-                            timeout_secs,
-                        } => serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        }),
-                        TurnEvent::HistoryTrimmed {
-                            dropped_messages,
-                            kept_turns,
-                            reason,
-                        } => history_trimmed_ws_frame(dropped_messages, kept_turns, &reason),
-                        TurnEvent::Plan { entries } => serde_json::json!({
-                            "type": "plan",
-                            "entries": entries,
-                        }),
-                        _ => continue,
-                    };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
-                }
-            }
         }
     };
 

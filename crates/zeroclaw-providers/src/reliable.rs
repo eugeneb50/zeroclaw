@@ -2625,7 +2625,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
-        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let _has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
@@ -2928,7 +2928,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
-        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let _has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {

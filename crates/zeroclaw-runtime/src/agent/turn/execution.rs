@@ -620,6 +620,90 @@ mod run_model_query_tests {
     }
 
     #[tokio::test]
+    async fn run_model_query_rejected_cache_write_projection_matches_tracker_record() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            crate::cost::CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(std::collections::HashMap::from([(
+            "custom".to_string(),
+            std::collections::HashMap::from([
+                ("test-model.input".to_string(), 0.27),
+                ("test-model.cached_input".to_string(), 0.027),
+                ("test-model.cache_write".to_string(), 0.54),
+                ("test-model.output".to_string(), 1.10),
+            ]),
+        )]));
+        let ctx = ToolLoopCostTrackingContext::new(tracker, pricing);
+        // A semantically empty terminal response is billed but never
+        // accepted: exactly the rejected-attempt shape under test.
+        let provider = DirectResponseProvider {
+            response: ChatResponse {
+                text: Some(String::new()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(5_000),
+                    output_tokens: Some(200),
+                    cached_input_tokens: Some(4_000),
+                    cache_creation_input_tokens: Some(1_000),
+                }),
+                reasoning_content: None,
+            },
+        };
+        let messages = [ChatMessage::user("hi")];
+        let mut summaries = Vec::new();
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                direct_access(&provider)
+                    .run_model_query(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        &mut summaries,
+                    )
+                    .await
+                    .expect_err("semantic-empty direct response must fail")
+            })
+            .await;
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+        );
+        // The rejected summary's projected cost must equal what settlement
+        // actually wrote to the tracker ledger for the same attempt.
+        assert_eq!(summaries.len(), 1);
+        assert!(!summaries[0].accepted);
+        assert_eq!(summaries[0].input_tokens, Some(5_000));
+        assert_eq!(summaries[0].cached_input_tokens, Some(4_000));
+        assert_eq!(summaries[0].output_tokens, Some(200));
+        let projected = summaries[0].cost_usd.expect("rejected cost is priced");
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let record: zeroclaw_config::cost::types::CostRecord =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert_eq!(record.usage.cache_creation_input_tokens, 1_000);
+        assert!(
+            (projected - record.usage.cost_usd).abs() < 1e-12,
+            "rejected projection must match the settled tracker record"
+        );
+
+        // Both must price the write band at the write premium.
+        let expected = (1_000.0 * 0.54 + 4_000.0 * 0.027 + 200.0 * 1.10) / 1_000_000.0;
+        assert!(
+            (projected - expected).abs() < 1e-12,
+            "projection must price cache writes at the write rate"
+        );
+    }
+
+    #[tokio::test]
     async fn run_model_query_rejects_direct_semantic_empty_text_before_accepted_accounting() {
         let messages = [ChatMessage::user("hi")];
         for text in ["", " \n\t", "<think>internal reasoning</think>"] {

@@ -1545,12 +1545,15 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            serving_provider_name: None,
+            serving_model: None,
         };
 
         let (outcome, notice) = zeroclaw_providers::scope_safeguard_fallback(async {
             let outcome = call_provider(
                 &ctx,
                 &provider,
+                "requested-provider",
                 "requested-model",
                 &[ChatMessage::user("go")],
                 None,

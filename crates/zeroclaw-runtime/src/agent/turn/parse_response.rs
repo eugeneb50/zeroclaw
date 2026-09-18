@@ -571,6 +571,8 @@ mod argument_preservation_tests {
             agent_alias: None,
             draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "argument-preservation",
+            serving_provider_name: None,
+            serving_model: None,
         };
         let name = spec.name.clone();
         let specs = IterationToolSpecs {

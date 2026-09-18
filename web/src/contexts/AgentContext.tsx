@@ -435,7 +435,7 @@ export function AgentProvider({
             },
           ]);
         }
-        // Extract context window info from "done" frame (sent by gateway). See #7311.
+        // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
           // Prefer model_context_window (actual model capacity) for display,
           // fall back to max_context_tokens (trim budget) for backward compat.
